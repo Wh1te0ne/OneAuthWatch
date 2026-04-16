@@ -1,0 +1,318 @@
+import React, { useEffect, useState } from 'react';
+
+interface HeaderProps {
+  isDesktopMode?: boolean;
+  accountCount: number;
+  onAddAccount: () => void;
+  onQuickReadConfig: () => void;
+  onQuickLoginCodex: () => void;
+  onQuickLoginClaude: () => void;
+  onQuickLoginGemini: () => void;
+  onImportBackup: () => void;
+  onExportBackup: () => void;
+  onRefreshAll: () => void | Promise<void>;
+  onOpenSettings: () => void;
+  onSyncServer?: () => void | Promise<void>;
+  isRefreshing: boolean;
+  isSyncing?: boolean;
+  isRefreshingAll: boolean;
+  isLoading: boolean;
+  children?: React.ReactNode;
+}
+
+export const Header: React.FC<HeaderProps> = ({
+  isDesktopMode = true,
+  accountCount,
+  onAddAccount,
+  onQuickReadConfig,
+  onQuickLoginCodex,
+  onQuickLoginClaude,
+  onQuickLoginGemini,
+  onImportBackup,
+  onExportBackup,
+  onRefreshAll,
+  onOpenSettings,
+  onSyncServer,
+  isRefreshing,
+  isSyncing,
+  isRefreshingAll,
+  isLoading,
+  children,
+}) => {
+  const [currentTime, setCurrentTime] = useState(new Date());
+  const [isAddMenuOpen, setIsAddMenuOpen] = useState(false);
+  const [isQuickLoginSubmenuOpen, setIsQuickLoginSubmenuOpen] = useState(false);
+
+  useEffect(() => {
+    const timer = setInterval(() => {
+      setCurrentTime(new Date());
+    }, 1000);
+    return () => clearInterval(timer);
+  }, []);
+
+  const formatTime = (date: Date) =>
+    date.toLocaleTimeString('zh-CN', {
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+      hour12: false,
+    });
+
+  const formatDate = (date: Date) =>
+    date.toLocaleDateString('zh-CN', {
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+      weekday: 'short',
+    });
+
+  const hour = currentTime.getHours();
+  const greeting =
+    hour < 12 ? '早上好' : hour < 18 ? '下午好' : '晚上好';
+
+  const headerBody = (
+    <div className="flex flex-wrap items-center justify-between gap-4">
+      <div>
+        <div className="flex items-center gap-2 text-xs uppercase tracking-[0.2em] text-[var(--dash-text-muted)]">
+          <span>{formatDate(currentTime)}</span>
+          <span className="tabular-nums normal-case tracking-normal">{formatTime(currentTime)}</span>
+        </div>
+        <h1 className="text-2xl md:text-3xl font-semibold text-[var(--dash-text-primary)]">
+          {greeting}，一分白！
+        </h1>
+      </div>
+
+      <div className="flex items-center gap-3 flex-wrap justify-end">
+        {accountCount > 0 && (
+          <button
+            onClick={onRefreshAll}
+            disabled={isLoading || isRefreshing}
+            className="h-10 px-3 rounded-full border border-[var(--dash-border)] text-[var(--dash-text-secondary)] hover:text-[var(--dash-text-primary)] hover:border-stone-300 bg-white/80 transition-colors flex items-center gap-2 disabled:opacity-50"
+          >
+            <svg
+              className={`w-4 h-4 ${isRefreshingAll ? 'animate-spin' : ''}`}
+              fill="none"
+              stroke="currentColor"
+              viewBox="0 0 24 24"
+            >
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+            </svg>
+            <span className="text-sm hidden md:inline">刷新用量</span>
+          </button>
+        )}
+
+        {isDesktopMode && (
+          <div
+            className="relative"
+            onMouseEnter={() => setIsAddMenuOpen(true)}
+            onMouseLeave={() => setIsAddMenuOpen(false)}
+          >
+            <div className="flex items-center">
+              <button
+                onClick={onQuickReadConfig}
+                disabled={isLoading || isSyncing}
+                className="h-10 pl-4 pr-3 rounded-l-full bg-[var(--dash-accent)] text-white text-sm font-medium transition-colors hover:opacity-92 flex items-center gap-2 disabled:opacity-50"
+              >
+                <svg className={`w-4 h-4 ${isSyncing ? 'animate-spin' : ''}`} fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+                </svg>
+                快速读取配置
+              </button>
+              <button
+                type="button"
+                onClick={() => setIsAddMenuOpen((open) => !open)}
+                className="h-10 w-10 rounded-r-full border-l border-white/10 bg-[var(--dash-accent)] text-white transition-colors hover:opacity-92 flex items-center justify-center"
+                aria-label="展开添加账号菜单"
+                aria-expanded={isAddMenuOpen}
+              >
+                <svg
+                  className={`w-4 h-4 transition-transform ${isAddMenuOpen ? 'rotate-180' : ''}`}
+                  fill="none"
+                  stroke="currentColor"
+                  viewBox="0 0 24 24"
+                >
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
+                </svg>
+              </button>
+            </div>
+
+            {isAddMenuOpen && (
+              <div className="absolute right-0 top-full pt-2">
+                <div className="w-52 rounded-2xl border border-[var(--dash-border)] bg-white/95 backdrop-blur shadow-[0_16px_40px_rgba(17,24,39,0.08)] p-1.5">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setIsAddMenuOpen(false);
+                      onAddAccount();
+                    }}
+                    disabled={isLoading}
+                    className="w-full h-10 px-3 rounded-xl text-sm text-left text-[var(--dash-text-primary)] hover:bg-stone-100 disabled:text-stone-400 disabled:hover:bg-transparent flex items-center gap-2"
+                  >
+                    <svg className="w-4 h-4 text-[var(--dash-success)]" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 4v4m0 8v4m8-8h-4M8 12H4m11.314-4.686l-2.828 2.828m0 3.716l2.828 2.828M8.515 8.515l2.828 2.828m0 3.314l-2.828 2.828" />
+                    </svg>
+                    手动导入 auth
+                  </button>
+
+                  <div className="my-1 h-px bg-[var(--dash-border)]" />
+
+                  <div
+                    className="relative"
+                    onMouseEnter={() => setIsQuickLoginSubmenuOpen(true)}
+                    onMouseLeave={() => setIsQuickLoginSubmenuOpen(false)}
+                  >
+                    <button
+                      type="button"
+                      onClick={() => setIsQuickLoginSubmenuOpen((open) => !open)}
+                      disabled={isLoading}
+                      className="w-full h-10 px-3 rounded-xl text-sm text-left text-[var(--dash-text-primary)] hover:bg-stone-100 disabled:text-stone-400 disabled:hover:bg-transparent flex items-center justify-between gap-2"
+                    >
+                      <div className="flex items-center gap-2">
+                        <svg className="w-4 h-4 text-[var(--dash-accent)]" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 4v16m8-8H4" />
+                        </svg>
+                        <span>快速登录</span>
+                      </div>
+                      <svg className="w-4 h-4 text-[var(--dash-text-muted)]" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" />
+                      </svg>
+                    </button>
+
+                    {isQuickLoginSubmenuOpen && (
+                      <div className="absolute left-full top-0 pl-2">
+                        <div className="w-44 rounded-2xl border border-[var(--dash-border)] bg-white/95 backdrop-blur shadow-[0_16px_40px_rgba(17,24,39,0.08)] p-1.5">
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setIsQuickLoginSubmenuOpen(false);
+                              setIsAddMenuOpen(false);
+                              onQuickLoginCodex();
+                            }}
+                            className="w-full h-10 px-3 rounded-xl text-sm text-left text-[var(--dash-text-primary)] hover:bg-stone-100 flex items-center gap-2"
+                          >
+                            <span className="inline-flex h-5 w-5 items-center justify-center rounded-full bg-slate-100 text-[10px] font-semibold text-slate-600">
+                              C
+                            </span>
+                            Codex
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setIsQuickLoginSubmenuOpen(false);
+                              setIsAddMenuOpen(false);
+                              onQuickLoginClaude();
+                            }}
+                            className="w-full h-10 px-3 rounded-xl text-sm text-left text-[var(--dash-text-primary)] hover:bg-stone-100 flex items-center gap-2"
+                          >
+                            <span className="inline-flex h-5 w-5 items-center justify-center rounded-full bg-slate-100 text-[10px] font-semibold text-slate-600">
+                              A
+                            </span>
+                            Claude Code
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setIsQuickLoginSubmenuOpen(false);
+                              setIsAddMenuOpen(false);
+                              onQuickLoginGemini();
+                            }}
+                            className="w-full h-10 px-3 rounded-xl text-sm text-left text-[var(--dash-text-primary)] hover:bg-stone-100 flex items-center gap-2"
+                          >
+                            <span className="inline-flex h-5 w-5 items-center justify-center rounded-full bg-slate-100 text-[10px] font-semibold text-slate-600">
+                              G
+                            </span>
+                            Gemini
+                          </button>
+                        </div>
+                      </div>
+                    )}
+                  </div>
+
+                  {accountCount > 0 && onSyncServer && (
+                    <>
+                      <div className="my-1 h-px bg-[var(--dash-border)]" />
+
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setIsAddMenuOpen(false);
+                          onSyncServer();
+                        }}
+                        disabled={isLoading || isSyncing}
+                        className="w-full h-10 px-3 rounded-xl text-sm text-left text-[var(--dash-text-primary)] hover:bg-stone-100 disabled:text-stone-400 disabled:hover:bg-transparent flex items-center gap-2"
+                      >
+                        <svg className={`w-4 h-4 text-[var(--dash-accent)] ${isSyncing ? 'animate-spin' : ''}`} fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-8l-4-4m0 0L8 8m4-4v12" />
+                        </svg>
+                        同步到服务器
+                      </button>
+                    </>
+                  )}
+
+                  <div className="my-1 h-px bg-[var(--dash-border)]" />
+
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setIsAddMenuOpen(false);
+                      onImportBackup();
+                    }}
+                    className="w-full h-10 px-3 rounded-xl text-sm text-left text-[var(--dash-text-primary)] hover:bg-stone-100 flex items-center gap-2"
+                  >
+                    <svg className="w-4 h-4 text-[var(--dash-text-secondary)]" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-8l-4-4m0 0L8 8m4-4v12" />
+                    </svg>
+                    导入备份
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setIsAddMenuOpen(false);
+                      onExportBackup();
+                    }}
+                    className="w-full h-10 px-3 rounded-xl text-sm text-left text-[var(--dash-text-primary)] hover:bg-stone-100 flex items-center gap-2"
+                  >
+                    <svg className="w-4 h-4 text-[var(--dash-text-secondary)]" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
+                    </svg>
+                    导出备份
+                  </button>
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+
+        {isDesktopMode && (
+          <button
+            onClick={onOpenSettings}
+            className="h-10 w-10 rounded-full border border-[var(--dash-border)] bg-white/80 text-[var(--dash-text-secondary)] hover:text-[var(--dash-text-primary)] hover:border-stone-300 transition-colors flex items-center justify-center"
+            title="设置"
+          >
+            <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" />
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
+            </svg>
+          </button>
+        )}
+      </div>
+    </div>
+  );
+
+  return (
+    <header className="sticky top-0 z-30">
+      <div className="max-w-7xl mx-auto px-6 pt-6">
+        <div className="dash-card-soft px-6 py-5">
+          {headerBody}
+          {children && (
+            <div className="mt-5 pt-5 border-t border-[var(--dash-border)]">
+              {children}
+            </div>
+          )}
+        </div>
+      </div>
+    </header>
+  );
+};
+
+export default Header;

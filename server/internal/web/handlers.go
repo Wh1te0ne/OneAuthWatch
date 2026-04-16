@@ -1,0 +1,11628 @@
+package web
+
+import (
+	"bytes"
+	"context"
+	"encoding/base64"
+	"encoding/json"
+	"fmt"
+	"html/template"
+	"io"
+	"log/slog"
+	"net/http"
+	"os"
+	"path/filepath"
+	"regexp"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/Wh1te0ne/OneAuthWatch/server/internal/agent"
+	"github.com/Wh1te0ne/OneAuthWatch/server/internal/api"
+	"github.com/Wh1te0ne/OneAuthWatch/server/internal/config"
+	"github.com/Wh1te0ne/OneAuthWatch/server/internal/menubar"
+	"github.com/Wh1te0ne/OneAuthWatch/server/internal/notify"
+	"github.com/Wh1te0ne/OneAuthWatch/server/internal/store"
+	"github.com/Wh1te0ne/OneAuthWatch/server/internal/tracker"
+	"github.com/Wh1te0ne/OneAuthWatch/server/internal/update"
+)
+
+// Login error codes for whitelisting - prevents XSS and information leakage
+const (
+	LoginErrorInvalid   = "invalid"
+	LoginErrorExpired   = "expired"
+	LoginErrorRequired  = "required"
+	LoginErrorRateLimit = "ratelimit"
+)
+
+// loginErrors maps whitelisted error codes to user-friendly messages
+var loginErrors = map[string]string{
+	LoginErrorInvalid:   "Invalid username or password",
+	LoginErrorExpired:   "Session expired, please log in again",
+	LoginErrorRequired:  "Authentication required",
+	LoginErrorRateLimit: "Too many login attempts. Please try again later.",
+}
+
+// Notifier defines the interface for the notification engine.
+// The concrete implementation lives in internal/notify.
+type Notifier interface {
+	Reload() error
+	ConfigureSMTP() error
+	ConfigurePush() error
+	SendTestEmail() error
+	SendTestPush() error
+	TestSMTPDiag() (string, error)
+	SetEncryptionKey(key string)
+	GetVAPIDPublicKey() string
+}
+
+// ProviderAgentController controls provider agent runtime lifecycle.
+type ProviderAgentController interface {
+	Start(key string) error
+	Stop(key string)
+	IsRunning(key string) bool
+}
+
+// ProviderStatus represents one provider's runtime/config status.
+type ProviderStatus struct {
+	Key              string `json:"key"`
+	Name             string `json:"name"`
+	Description      string `json:"description"`
+	Configured       bool   `json:"configured"`
+	AutoDetectable   bool   `json:"autoDetectable"`
+	PollingEnabled   bool   `json:"pollingEnabled"`
+	DashboardVisible bool   `json:"dashboardVisible"`
+	IsPolling        bool   `json:"isPolling"`
+}
+
+// MiniMaxAccountReloader is called to hot-reload MiniMax agents after account CRUD.
+type MiniMaxAccountReloader interface {
+	Reload()
+}
+
+// Handler handles HTTP requests for the web dashboard
+type Handler struct {
+	store              *store.Store
+	tracker            *tracker.Tracker
+	zaiTracker         *tracker.ZaiTracker
+	anthropicTracker   *tracker.AnthropicTracker
+	copilotTracker     *tracker.CopilotTracker
+	codexTracker       *tracker.CodexTracker
+	antigravityTracker *tracker.AntigravityTracker
+	minimaxTracker     *tracker.MiniMaxTracker
+	geminiTracker      *tracker.GeminiTracker
+	openrouterTracker  *tracker.OpenRouterTracker
+	updater            *update.Updater
+	notifier           Notifier
+	agentManager       ProviderAgentController
+	minimaxAgentMgr    MiniMaxAccountReloader
+	logger             *slog.Logger
+	dashboardTmpl      *template.Template
+	loginTmpl          *template.Template
+	settingsTmpl       *template.Template
+	sessions           *SessionStore
+	config             *config.Config
+	version            string
+	smtpTestMu         sync.Mutex
+	smtpTestLastSent   time.Time
+	pushTestMu         sync.Mutex
+	pushTestLastSent   time.Time
+	rateLimiter        *LoginRateLimiter // Per-IP rate limiting for login attempts
+}
+
+// DefaultCodexAccountID is the default account ID for single-account setups.
+const DefaultCodexAccountID int64 = 1
+
+// parseCodexAccountID extracts the account ID from query params, defaulting to 1.
+func parseCodexAccountID(r *http.Request) int64 {
+	accountStr := r.URL.Query().Get("account")
+	if accountStr == "" {
+		return DefaultCodexAccountID
+	}
+	accountID, err := strconv.ParseInt(accountStr, 10, 64)
+	if err != nil || accountID <= 0 {
+		return DefaultCodexAccountID
+	}
+	return accountID
+}
+
+// CodexProfile represents a saved Codex credential profile (mirrors agent.CodexProfile).
+type CodexProfile struct {
+	Name      string    `json:"name"`
+	AccountID string    `json:"account_id"`
+	UserID    string    `json:"user_id"`
+	SavedAt   time.Time `json:"saved_at"`
+	Tokens    struct {
+		AccessToken  string `json:"access_token"`
+		RefreshToken string `json:"refresh_token"`
+		IDToken      string `json:"id_token"`
+	} `json:"tokens"`
+	APIKey string `json:"api_key,omitempty"`
+}
+
+type codexRefreshAuthFile struct {
+	AccessToken  string `json:"access_token"`
+	RefreshToken string `json:"refresh_token"`
+	IDToken      string `json:"id_token"`
+	AccountID    string `json:"account_id"`
+	OpenAIAPIKey string `json:"OPENAI_API_KEY"`
+	Tokens       struct {
+		AccessToken  string `json:"access_token"`
+		RefreshToken string `json:"refresh_token"`
+		IDToken      string `json:"id_token"`
+		AccountID    string `json:"account_id"`
+	} `json:"tokens"`
+}
+
+type codexRefreshAuthCredentials struct {
+	AccessToken  string
+	RefreshToken string
+	IDToken      string
+	AccountID    string
+	APIKey       string
+}
+
+// validProfileName checks if a profile name is valid (alphanumeric, hyphen, underscore).
+var validProfileName = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
+
+// codexProfilesDir returns the directory for storing Codex profiles.
+func codexProfilesDir() string {
+	// Docker: use /data
+	if _, err := os.Stat("/.dockerenv"); err == nil {
+		return "/data/codex-profiles"
+	}
+	if os.Getenv("KUBERNETES_SERVICE_HOST") != "" {
+		return "/data/codex-profiles"
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(home, ".oneauthwatch", "data", "codex-profiles")
+}
+
+// codexAuthRefreshPath returns the path to the Codex auth.json file.
+func codexAuthRefreshPath() string {
+	if codexHome := strings.TrimSpace(os.Getenv("CODEX_HOME")); codexHome != "" {
+		return filepath.Join(codexHome, "auth.json")
+	}
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return ""
+	}
+	return filepath.Join(home, ".codex", "auth.json")
+}
+
+// codexCompositeExternalID returns a composite external ID for deduplication.
+func codexCompositeExternalID(accountID, userID string) string {
+	if strings.TrimSpace(accountID) == "" {
+		return ""
+	}
+	creds := &api.CodexCredentials{AccountID: accountID, UserID: userID}
+	return creds.CompositeExternalID()
+}
+
+// codexCredUserID extracts the user ID from Codex credentials.
+func codexCredUserID(creds *api.CodexCredentials) string {
+	if creds == nil {
+		return ""
+	}
+	if strings.TrimSpace(creds.UserID) != "" {
+		return strings.TrimSpace(creds.UserID)
+	}
+	return api.ParseIDTokenUserID(creds.IDToken)
+}
+
+// codexRefreshUserID extracts the user ID from refresh credentials.
+func codexRefreshUserID(creds *codexRefreshAuthCredentials) string {
+	if creds == nil {
+		return ""
+	}
+	return api.ParseIDTokenUserID(creds.IDToken)
+}
+
+// isDuplicateCodexProfile checks if a profile matches the given credentials.
+func isDuplicateCodexProfile(profile CodexProfile, creds *api.CodexCredentials) bool {
+	if strings.TrimSpace(profile.Name) == "" || creds == nil {
+		return false
+	}
+	targetComposite := codexCompositeExternalID(creds.AccountID, codexCredUserID(creds))
+	existingComposite := codexProfileCompositeExternalID(profile)
+	if targetComposite != "" && existingComposite != "" {
+		return existingComposite == targetComposite
+	}
+	existingUser := strings.TrimSpace(profile.UserID)
+	if existingUser == "" {
+		existingUser = api.ParseIDTokenUserID(profile.Tokens.IDToken)
+	}
+	newUser := codexCredUserID(creds)
+	if existingUser == "" && newUser == "" {
+		return false
+	}
+	if existingUser != "" && newUser != "" && existingUser == newUser {
+		return true
+	}
+	return false
+}
+
+func codexProfileCompositeExternalID(profile CodexProfile) string {
+	userID := strings.TrimSpace(profile.UserID)
+	if userID == "" {
+		userID = api.ParseIDTokenUserID(profile.Tokens.IDToken)
+	}
+	return codexCompositeExternalID(profile.AccountID, userID)
+}
+
+// listCodexProfiles returns all saved Codex profiles from disk.
+func listCodexProfiles() ([]CodexProfile, error) {
+	profilesDir := codexProfilesDir()
+	if profilesDir == "" {
+		return nil, fmt.Errorf("could not determine profiles directory")
+	}
+	entries, err := os.ReadDir(profilesDir)
+	if os.IsNotExist(err) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("failed to read profiles directory: %w", err)
+	}
+	var profiles []CodexProfile
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
+			continue
+		}
+		profilePath := filepath.Join(profilesDir, entry.Name())
+		profile, err := loadCodexProfile(profilePath)
+		if err != nil {
+			continue
+		}
+		profiles = append(profiles, *profile)
+	}
+	return profiles, nil
+}
+
+// loadCodexProfile loads a single Codex profile from disk.
+func loadCodexProfile(path string) (*CodexProfile, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var profile CodexProfile
+	if err := json.Unmarshal(data, &profile); err != nil {
+		return nil, err
+	}
+	if profile.Name == "" {
+		base := filepath.Base(path)
+		profile.Name = strings.TrimSuffix(base, ".json")
+	}
+	if strings.TrimSpace(profile.UserID) == "" {
+		profile.UserID = api.ParseIDTokenUserID(profile.Tokens.IDToken)
+	}
+	return &profile, nil
+}
+
+// SyncCredentialsRequest represents the payload for syncing auth credentials from the desktop client.
+type SyncCredentialsRequest struct {
+	CodexToken         string              `json:"codex_token,omitempty"`
+	AnthropicToken     string              `json:"anthropic_token,omitempty"`
+	AntigravityBaseURL string              `json:"antigravity_base_url,omitempty"`
+	AntigravityCSRF    string              `json:"antigravity_csrf,omitempty"`
+	ClientState        json.RawMessage     `json:"client_state,omitempty"`
+	AccountAuths       []SyncedAccountAuth `json:"account_auths,omitempty"`
+}
+
+type SyncedAccountAuth struct {
+	AccountID  string          `json:"account_id"`
+	Alias      string          `json:"alias,omitempty"`
+	AuthConfig json.RawMessage `json:"auth_config"`
+}
+
+// SyncCredentials receives tokens from the OneAuthWatch desktop client and saves them.
+func (h *Handler) SyncCredentials(w http.ResponseWriter, r *http.Request) {
+	applyPublicSyncHeaders(w, r)
+	if r.Method == http.MethodOptions {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+
+	if r.Method != http.MethodPost {
+		respondError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+
+	var req SyncCredentialsRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		respondError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+
+	// Update the runtime config
+	if req.CodexToken != "" {
+		h.config.CodexToken = req.CodexToken
+	}
+	if req.AnthropicToken != "" {
+		h.config.AnthropicToken = req.AnthropicToken
+	}
+	if req.AntigravityBaseURL != "" {
+		h.config.AntigravityBaseURL = req.AntigravityBaseURL
+	}
+	if req.AntigravityCSRF != "" {
+		h.config.AntigravityCSRFToken = req.AntigravityCSRF
+	}
+
+	// Save to DB settings so it persists across restarts
+	if h.store != nil {
+		if req.CodexToken != "" {
+			if err := h.store.SetSetting("provider_codex_token", req.CodexToken); err != nil {
+				h.logger.Error("failed to persist Codex token", "error", err)
+				respondError(w, http.StatusInternalServerError, "failed to persist Codex token")
+				return
+			}
+		}
+		if req.AnthropicToken != "" {
+			if err := h.store.SetSetting("provider_anthropic_token", req.AnthropicToken); err != nil {
+				h.logger.Error("failed to persist Anthropic token", "error", err)
+				respondError(w, http.StatusInternalServerError, "failed to persist Anthropic token")
+				return
+			}
+		}
+		if req.AntigravityBaseURL != "" {
+			if err := h.store.SetSetting("provider_antigravity_base_url", req.AntigravityBaseURL); err != nil {
+				h.logger.Error("failed to persist Antigravity base URL", "error", err)
+				respondError(w, http.StatusInternalServerError, "failed to persist Antigravity base URL")
+				return
+			}
+		}
+		if req.AntigravityCSRF != "" {
+			if err := h.store.SetSetting("provider_antigravity_csrf", req.AntigravityCSRF); err != nil {
+				h.logger.Error("failed to persist Antigravity CSRF token", "error", err)
+				respondError(w, http.StatusInternalServerError, "failed to persist Antigravity CSRF token")
+				return
+			}
+		}
+	}
+
+	if len(bytes.TrimSpace(req.ClientState)) > 0 {
+		if err := h.persistClientStateSnapshot(req.ClientState); err != nil {
+			h.logger.Error("failed to persist client state snapshot", "error", err)
+			respondError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+	}
+
+	if req.AccountAuths != nil {
+		if err := h.syncDesktopCodexProfiles(req.AccountAuths); err != nil {
+			h.logger.Error("failed to sync desktop Codex profiles", "error", err)
+			respondError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+	}
+
+	respondJSON(w, http.StatusOK, map[string]interface{}{
+		"message":         "Credentials synced successfully",
+		"state_synced":    len(bytes.TrimSpace(req.ClientState)) > 0,
+		"profiles_synced": len(req.AccountAuths),
+	})
+}
+
+const clientStateSettingKey = "oneauthwatch_client_state_v1"
+const syncedCodexProfilesSettingKey = "oneauthwatch_synced_codex_profiles_v1"
+
+func applyPublicSyncHeaders(w http.ResponseWriter, r *http.Request) {
+	origin := strings.TrimSpace(r.Header.Get("Origin"))
+	if origin == "" {
+		return
+	}
+	if strings.HasPrefix(origin, "http://127.0.0.1:") || strings.HasPrefix(origin, "http://localhost:") {
+		w.Header().Set("Access-Control-Allow-Origin", origin)
+		w.Header().Set("Vary", "Origin")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, X-Requested-With, Authorization")
+	}
+}
+
+func defaultClientStateSnapshot() string {
+	return `{"version":"1.0.0","accounts":[],"config":{}}`
+}
+
+func normalizeClientStateSnapshot(raw json.RawMessage) (string, error) {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return defaultClientStateSnapshot(), nil
+	}
+
+	var payload map[string]json.RawMessage
+	if err := json.Unmarshal(trimmed, &payload); err != nil {
+		return "", fmt.Errorf("invalid client state JSON")
+	}
+
+	if payload == nil {
+		payload = map[string]json.RawMessage{}
+	}
+
+	if versionRaw, ok := payload["version"]; ok && len(bytes.TrimSpace(versionRaw)) > 0 && !bytes.Equal(bytes.TrimSpace(versionRaw), []byte("null")) {
+		var version string
+		if err := json.Unmarshal(versionRaw, &version); err != nil || strings.TrimSpace(version) == "" {
+			return "", fmt.Errorf("client state version must be a non-empty string")
+		}
+	} else {
+		payload["version"] = json.RawMessage(`"1.0.0"`)
+	}
+
+	if accountsRaw, ok := payload["accounts"]; ok && len(bytes.TrimSpace(accountsRaw)) > 0 && !bytes.Equal(bytes.TrimSpace(accountsRaw), []byte("null")) {
+		var accounts []json.RawMessage
+		if err := json.Unmarshal(accountsRaw, &accounts); err != nil {
+			return "", fmt.Errorf("client state accounts must be an array")
+		}
+	} else {
+		payload["accounts"] = json.RawMessage(`[]`)
+	}
+
+	if configRaw, ok := payload["config"]; ok && len(bytes.TrimSpace(configRaw)) > 0 && !bytes.Equal(bytes.TrimSpace(configRaw), []byte("null")) {
+		var config map[string]interface{}
+		if err := json.Unmarshal(configRaw, &config); err != nil {
+			return "", fmt.Errorf("client state config must be an object")
+		}
+	} else {
+		payload["config"] = json.RawMessage(`{}`)
+	}
+
+	normalized, err := json.Marshal(payload)
+	if err != nil {
+		return "", fmt.Errorf("failed to encode client state")
+	}
+	return string(normalized), nil
+}
+
+func (h *Handler) readClientStateSnapshot() (string, error) {
+	if h.store == nil {
+		return defaultClientStateSnapshot(), nil
+	}
+	value, err := h.store.GetSetting(clientStateSettingKey)
+	if err != nil {
+		return "", err
+	}
+	if strings.TrimSpace(value) == "" {
+		return defaultClientStateSnapshot(), nil
+	}
+	return value, nil
+}
+
+func (h *Handler) persistClientStateSnapshot(raw json.RawMessage) error {
+	if h.store == nil {
+		return fmt.Errorf("store not available")
+	}
+	normalized, err := normalizeClientStateSnapshot(raw)
+	if err != nil {
+		return err
+	}
+	return h.store.SetSetting(clientStateSettingKey, normalized)
+}
+
+func (h *Handler) codexProfilesStorageDir() string {
+	if h.config != nil && strings.TrimSpace(h.config.DBPath) != "" {
+		return filepath.Join(filepath.Dir(h.config.DBPath), "codex-profiles")
+	}
+	return codexProfilesDir()
+}
+
+func sanitizeSyncedProfileName(value string) string {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		return ""
+	}
+	sanitized := make([]rune, 0, len(trimmed))
+	for _, r := range trimmed {
+		switch {
+		case r >= 'a' && r <= 'z':
+			sanitized = append(sanitized, r)
+		case r >= 'A' && r <= 'Z':
+			sanitized = append(sanitized, r)
+		case r >= '0' && r <= '9':
+			sanitized = append(sanitized, r)
+		case r == '-' || r == '_':
+			sanitized = append(sanitized, r)
+		default:
+			sanitized = append(sanitized, '_')
+		}
+	}
+	return strings.Trim(strings.TrimSpace(string(sanitized)), "_-")
+}
+
+func parseSyncedCodexCredentials(raw json.RawMessage) (*api.CodexCredentials, error) {
+	if len(bytes.TrimSpace(raw)) == 0 {
+		return nil, fmt.Errorf("auth_config is required")
+	}
+
+	var auth codexRefreshAuthFile
+	if err := json.Unmarshal(raw, &auth); err != nil {
+		return nil, fmt.Errorf("invalid auth_config JSON")
+	}
+
+	creds := &api.CodexCredentials{
+		AccessToken:  strings.TrimSpace(auth.Tokens.AccessToken),
+		RefreshToken: strings.TrimSpace(auth.Tokens.RefreshToken),
+		IDToken:      strings.TrimSpace(auth.Tokens.IDToken),
+		AccountID:    strings.TrimSpace(auth.Tokens.AccountID),
+		APIKey:       strings.TrimSpace(auth.OpenAIAPIKey),
+	}
+
+	if creds.AccessToken == "" {
+		creds.AccessToken = strings.TrimSpace(auth.AccessToken)
+	}
+	if creds.RefreshToken == "" {
+		creds.RefreshToken = strings.TrimSpace(auth.RefreshToken)
+	}
+	if creds.IDToken == "" {
+		creds.IDToken = strings.TrimSpace(auth.IDToken)
+	}
+	if creds.AccountID == "" {
+		creds.AccountID = strings.TrimSpace(auth.AccountID)
+	}
+
+	if creds.AccessToken == "" && creds.APIKey == "" {
+		return nil, fmt.Errorf("auth_config has no usable Codex credentials")
+	}
+
+	creds.UserID = api.ParseIDTokenUserID(creds.IDToken)
+	creds.ExpiresAt = api.ParseIDTokenExpiry(creds.IDToken)
+	if !creds.ExpiresAt.IsZero() {
+		creds.ExpiresIn = time.Until(creds.ExpiresAt)
+	}
+
+	return creds, nil
+}
+
+func (h *Handler) readSyncedCodexProfileNames() ([]string, error) {
+	if h.store == nil {
+		return nil, nil
+	}
+	raw, err := h.store.GetSetting(syncedCodexProfilesSettingKey)
+	if err != nil {
+		return nil, err
+	}
+	if strings.TrimSpace(raw) == "" {
+		return nil, nil
+	}
+	var names []string
+	if err := json.Unmarshal([]byte(raw), &names); err != nil {
+		return nil, fmt.Errorf("invalid synced profile names setting")
+	}
+	return names, nil
+}
+
+func (h *Handler) writeSyncedCodexProfileNames(names []string) error {
+	if h.store == nil {
+		return nil
+	}
+	payload, err := json.Marshal(names)
+	if err != nil {
+		return err
+	}
+	return h.store.SetSetting(syncedCodexProfilesSettingKey, string(payload))
+}
+
+func (h *Handler) syncDesktopCodexProfiles(accountAuths []SyncedAccountAuth) error {
+	profilesDir := h.codexProfilesStorageDir()
+	if profilesDir == "" {
+		return fmt.Errorf("could not determine Codex profiles directory")
+	}
+	if err := os.MkdirAll(profilesDir, 0o700); err != nil {
+		return fmt.Errorf("failed to create Codex profiles directory: %w", err)
+	}
+
+	nextNames := make([]string, 0, len(accountAuths))
+	nextSet := make(map[string]struct{}, len(accountAuths))
+
+	for _, accountAuth := range accountAuths {
+		profileName := sanitizeSyncedProfileName(accountAuth.AccountID)
+		if profileName == "" {
+			return fmt.Errorf("account_auths contains empty account_id")
+		}
+		if _, exists := nextSet[profileName]; exists {
+			return fmt.Errorf("duplicate synced account id: %s", accountAuth.AccountID)
+		}
+
+		creds, err := parseSyncedCodexCredentials(accountAuth.AuthConfig)
+		if err != nil {
+			return fmt.Errorf("invalid auth for account %s: %w", accountAuth.AccountID, err)
+		}
+
+		profile := CodexProfile{
+			Name:      profileName,
+			AccountID: creds.AccountID,
+			UserID:    codexCredUserID(creds),
+			SavedAt:   time.Now().UTC(),
+			APIKey:    creds.APIKey,
+		}
+		profile.Tokens.AccessToken = creds.AccessToken
+		profile.Tokens.RefreshToken = creds.RefreshToken
+		profile.Tokens.IDToken = creds.IDToken
+
+		profileBytes, err := json.MarshalIndent(profile, "", "  ")
+		if err != nil {
+			return fmt.Errorf("failed to encode profile %s: %w", profileName, err)
+		}
+
+		profilePath := filepath.Join(profilesDir, profileName+".json")
+		if err := os.WriteFile(profilePath, profileBytes, 0o600); err != nil {
+			return fmt.Errorf("failed to write profile %s: %w", profileName, err)
+		}
+
+		if h.store != nil {
+			externalID := codexCompositeExternalID(profile.AccountID, profile.UserID)
+			if externalID == "" {
+				externalID = profile.AccountID
+			}
+			account, err := h.store.GetOrCreateProviderAccountByExternalID("codex", profileName, externalID)
+			if err != nil {
+				return fmt.Errorf("failed to upsert Codex provider account %s: %w", profileName, err)
+			}
+			metadata, _ := json.Marshal(map[string]interface{}{
+				"source":            "desktop_sync",
+				"client_account_id": accountAuth.AccountID,
+				"alias":             strings.TrimSpace(accountAuth.Alias),
+				"profile_name":      profileName,
+			})
+			if len(metadata) > 0 {
+				if err := h.store.UpdateProviderAccountMetadata(account.ID, string(metadata)); err != nil {
+					h.logger.Warn("failed to update synced Codex account metadata", "profile", profileName, "error", err)
+				}
+			}
+		}
+
+		nextNames = append(nextNames, profileName)
+		nextSet[profileName] = struct{}{}
+	}
+
+	previousNames, err := h.readSyncedCodexProfileNames()
+	if err != nil {
+		return err
+	}
+
+	for _, previousName := range previousNames {
+		if _, exists := nextSet[previousName]; exists {
+			continue
+		}
+		profilePath := filepath.Join(profilesDir, previousName+".json")
+		if err := os.Remove(profilePath); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("failed to delete stale profile %s: %w", previousName, err)
+		}
+		if h.store != nil {
+			if err := h.store.MarkProviderAccountDeleted("codex", previousName); err != nil {
+				h.logger.Warn("failed to mark stale Codex account deleted", "profile", previousName, "error", err)
+			}
+		}
+	}
+
+	sort.Strings(nextNames)
+	if err := h.writeSyncedCodexProfileNames(nextNames); err != nil {
+		return fmt.Errorf("failed to persist synced profile names: %w", err)
+	}
+
+	return nil
+}
+
+type clientStateStore struct {
+	Version  string                 `json:"version"`
+	Accounts []clientStateAccount   `json:"accounts"`
+	Config   map[string]interface{} `json:"config"`
+}
+
+type clientStateAccount struct {
+	ID          string                 `json:"id"`
+	Provider    string                 `json:"provider,omitempty"`
+	Alias       string                 `json:"alias"`
+	AccountInfo clientStateAccountInfo `json:"accountInfo"`
+	UsageInfo   *clientStateUsageInfo  `json:"usageInfo,omitempty"`
+	IsActive    bool                   `json:"isActive"`
+	CreatedAt   string                 `json:"createdAt"`
+	UpdatedAt   string                 `json:"updatedAt"`
+}
+
+type clientStateAccountInfo struct {
+	Email                   string                   `json:"email"`
+	PlanType                string                   `json:"planType"`
+	AccountID               string                   `json:"accountId"`
+	UserID                  string                   `json:"userId"`
+	AccountUserID           string                   `json:"accountUserId,omitempty"`
+	AccountStructure        string                   `json:"accountStructure,omitempty"`
+	WorkspaceName           string                   `json:"workspaceName,omitempty"`
+	SubscriptionActiveUntil string                   `json:"subscriptionActiveUntil,omitempty"`
+	Organizations           []map[string]interface{} `json:"organizations,omitempty"`
+}
+
+type clientStateUsageInfo struct {
+	Status             string                 `json:"status,omitempty"`
+	Message            string                 `json:"message,omitempty"`
+	PlanType           string                 `json:"planType,omitempty"`
+	FiveHourLimitLabel string                 `json:"fiveHourLimitLabel,omitempty"`
+	WeeklyLimitLabel   string                 `json:"weeklyLimitLabel,omitempty"`
+	ContextWindow      map[string]interface{} `json:"contextWindow,omitempty"`
+	FiveHourLimit      *clientStateLimit      `json:"fiveHourLimit,omitempty"`
+	WeeklyLimit        *clientStateLimit      `json:"weeklyLimit,omitempty"`
+	LastUpdated        string                 `json:"lastUpdated,omitempty"`
+	SourceFile         string                 `json:"sourceFile,omitempty"`
+}
+
+type clientStateLimit struct {
+	PercentLeft int    `json:"percentLeft"`
+	ResetTime   string `json:"resetTime"`
+}
+
+func clientStateCodexExternalID(account clientStateAccount) string {
+	accountID := strings.TrimSpace(account.AccountInfo.AccountID)
+	if accountID == "" {
+		return ""
+	}
+
+	userID := strings.TrimSpace(account.AccountInfo.UserID)
+	if composite := codexCompositeExternalID(accountID, userID); composite != "" {
+		return composite
+	}
+
+	return accountID
+}
+
+func syncedClientAccountIDFromMetadata(metadata string) string {
+	if strings.TrimSpace(metadata) == "" {
+		return ""
+	}
+
+	var payload map[string]interface{}
+	if err := json.Unmarshal([]byte(metadata), &payload); err != nil {
+		return ""
+	}
+
+	value, _ := payload["client_account_id"].(string)
+	return strings.TrimSpace(value)
+}
+
+func formatClientStateResetTime(ts time.Time, includeDate bool) string {
+	localTime := ts.In(time.Local)
+	if includeDate {
+		return localTime.Format("01-02 15:04")
+	}
+	return localTime.Format("15:04")
+}
+
+func clampClientStatePercentLeft(utilization float64) int {
+	percentLeft := int(100 - utilization + 0.5)
+	if percentLeft < 0 {
+		return 0
+	}
+	if percentLeft > 100 {
+		return 100
+	}
+	return percentLeft
+}
+
+func buildUsageInfoFromCodexSnapshot(snapshot *api.CodexSnapshot) *clientStateUsageInfo {
+	if snapshot == nil {
+		return nil
+	}
+
+	usageInfo := &clientStateUsageInfo{
+		Status:      "ok",
+		PlanType:    snapshot.PlanType,
+		LastUpdated: snapshot.CapturedAt.UTC().Format(time.RFC3339),
+	}
+
+	for _, quota := range snapshot.Quotas {
+		percentLeft := clampClientStatePercentLeft(quota.Utilization)
+
+		switch quota.Name {
+		case "five_hour":
+			limit := &clientStateLimit{PercentLeft: percentLeft}
+			if quota.ResetsAt != nil {
+				limit.ResetTime = formatClientStateResetTime(*quota.ResetsAt, false)
+			}
+			usageInfo.FiveHourLimit = limit
+		case "seven_day":
+			limit := &clientStateLimit{PercentLeft: percentLeft}
+			if quota.ResetsAt != nil {
+				limit.ResetTime = formatClientStateResetTime(*quota.ResetsAt, true)
+			}
+			usageInfo.WeeklyLimit = limit
+		}
+	}
+
+	return usageInfo
+}
+
+func buildUsageInfoFromAnthropicSnapshot(snapshot *api.AnthropicSnapshot) *clientStateUsageInfo {
+	if snapshot == nil {
+		return nil
+	}
+
+	usageInfo := &clientStateUsageInfo{
+		Status:             "ok",
+		PlanType:           "pro",
+		FiveHourLimitLabel: "5h 限额",
+		WeeklyLimitLabel:   "7天限额",
+		LastUpdated:        snapshot.CapturedAt.UTC().Format(time.RFC3339),
+	}
+
+	for _, quota := range snapshot.Quotas {
+		percentLeft := clampClientStatePercentLeft(quota.Utilization)
+
+		switch quota.Name {
+		case "five_hour":
+			limit := &clientStateLimit{PercentLeft: percentLeft}
+			if quota.ResetsAt != nil {
+				limit.ResetTime = formatClientStateResetTime(*quota.ResetsAt, false)
+			}
+			usageInfo.FiveHourLimit = limit
+		case "seven_day":
+			limit := &clientStateLimit{PercentLeft: percentLeft}
+			if quota.ResetsAt != nil {
+				limit.ResetTime = formatClientStateResetTime(*quota.ResetsAt, true)
+			}
+			usageInfo.WeeklyLimit = limit
+		case "seven_day_sonnet":
+			if usageInfo.WeeklyLimit != nil {
+				continue
+			}
+			limit := &clientStateLimit{PercentLeft: percentLeft}
+			if quota.ResetsAt != nil {
+				limit.ResetTime = formatClientStateResetTime(*quota.ResetsAt, true)
+			}
+			usageInfo.WeeklyLimit = limit
+			usageInfo.WeeklyLimitLabel = "7天 Sonnet"
+		}
+	}
+
+	return usageInfo
+}
+
+func buildUsageInfoFromGeminiSnapshot(snapshot *api.GeminiSnapshot) *clientStateUsageInfo {
+	if snapshot == nil {
+		return nil
+	}
+
+	usageInfo := &clientStateUsageInfo{
+		Status:      "ok",
+		LastUpdated: snapshot.CapturedAt.UTC().Format(time.RFC3339),
+	}
+
+	families := api.AggregateGeminiByFamily(snapshot.Quotas)
+	for _, family := range families {
+		limit := &clientStateLimit{
+			PercentLeft: int(family.RemainingFraction*100 + 0.5),
+		}
+		if family.ResetTime != nil {
+			limit.ResetTime = formatClientStateResetTime(*family.ResetTime, true)
+		}
+
+		switch family.FamilyID {
+		case api.GeminiFamilyPro:
+			usageInfo.FiveHourLimit = limit
+			usageInfo.FiveHourLimitLabel = "Pro 配额"
+		case api.GeminiFamilyFlash:
+			usageInfo.WeeklyLimit = limit
+			usageInfo.WeeklyLimitLabel = "Flash 配额"
+		case api.GeminiFamilyFlashLite:
+			if usageInfo.WeeklyLimit == nil {
+				usageInfo.WeeklyLimit = limit
+				usageInfo.WeeklyLimitLabel = "Flash Lite 配额"
+			}
+		default:
+			if usageInfo.FiveHourLimit == nil {
+				usageInfo.FiveHourLimit = limit
+				usageInfo.FiveHourLimitLabel = api.GeminiFamilyDisplayName(family.FamilyID)
+			} else if usageInfo.WeeklyLimit == nil {
+				usageInfo.WeeklyLimit = limit
+				usageInfo.WeeklyLimitLabel = api.GeminiFamilyDisplayName(family.FamilyID)
+			}
+		}
+	}
+
+	return usageInfo
+}
+
+func parseProviderMetadata(metadata string) map[string]interface{} {
+	if strings.TrimSpace(metadata) == "" {
+		return nil
+	}
+
+	var payload map[string]interface{}
+	if err := json.Unmarshal([]byte(metadata), &payload); err != nil {
+		return nil
+	}
+	return payload
+}
+
+func stringMetadataValue(metadata map[string]interface{}, key string) string {
+	if metadata == nil {
+		return ""
+	}
+	value, _ := metadata[key].(string)
+	return strings.TrimSpace(value)
+}
+
+func normalizeSyntheticPlanType(provider, value string) string {
+	lower := strings.ToLower(strings.TrimSpace(value))
+	switch {
+	case lower == "team" || strings.Contains(lower, "enterprise"):
+		return "team"
+	case lower == "plus":
+		return "plus"
+	case lower == "free":
+		return "free"
+	case lower == "pro" || strings.Contains(lower, "max") || strings.Contains(lower, "advanced"):
+		return "pro"
+	}
+
+	switch provider {
+	case "claude":
+		return "pro"
+	case "gemini":
+		return "pro"
+	default:
+		return "free"
+	}
+}
+
+func syntheticProviderDisplayName(provider string) string {
+	switch provider {
+	case "claude":
+		return "Claude Code"
+	case "gemini":
+		return "Gemini"
+	default:
+		return strings.Title(provider)
+	}
+}
+
+type syntheticProviderIdentity struct {
+	Alias         string
+	Email         string
+	AccountID     string
+	UserID        string
+	WorkspaceName string
+}
+
+func defaultSyntheticProviderIdentity(provider string) syntheticProviderIdentity {
+	displayName := syntheticProviderDisplayName(provider)
+	return syntheticProviderIdentity{
+		Alias:         displayName,
+		Email:         strings.ToLower(strings.ReplaceAll(displayName, " ", ".")) + "@local",
+		AccountID:     provider,
+		UserID:        provider + "-local",
+		WorkspaceName: displayName,
+	}
+}
+
+func aliasFromEmail(email string) string {
+	trimmed := strings.TrimSpace(email)
+	if trimmed == "" {
+		return ""
+	}
+	at := strings.Index(trimmed, "@")
+	if at <= 0 {
+		return trimmed
+	}
+	return trimmed[:at]
+}
+
+func readSyntheticProviderIdentity(provider string) syntheticProviderIdentity {
+	switch provider {
+	case "claude":
+		return readClaudeIdentity()
+	case "gemini":
+		return readGeminiIdentity()
+	default:
+		return defaultSyntheticProviderIdentity(provider)
+	}
+}
+
+func readClaudeIdentity() syntheticProviderIdentity {
+	identity := defaultSyntheticProviderIdentity("claude")
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return identity
+	}
+
+	data, err := os.ReadFile(filepath.Join(home, ".claude.json"))
+	if err != nil {
+		return identity
+	}
+
+	var payload struct {
+		OAuthAccount struct {
+			AccountUUID      string `json:"accountUuid"`
+			EmailAddress     string `json:"emailAddress"`
+			DisplayName      string `json:"displayName"`
+			OrganizationName string `json:"organizationName"`
+		} `json:"oauthAccount"`
+	}
+	if err := json.Unmarshal(data, &payload); err != nil {
+		return identity
+	}
+
+	if email := strings.TrimSpace(payload.OAuthAccount.EmailAddress); email != "" {
+		identity.Email = email
+	}
+	if alias := strings.TrimSpace(payload.OAuthAccount.DisplayName); alias != "" {
+		identity.Alias = alias
+	} else if fallbackAlias := aliasFromEmail(identity.Email); fallbackAlias != "" {
+		identity.Alias = fallbackAlias
+	}
+	if accountID := strings.TrimSpace(payload.OAuthAccount.AccountUUID); accountID != "" {
+		identity.AccountID = accountID
+	}
+	if workspaceName := strings.TrimSpace(payload.OAuthAccount.OrganizationName); workspaceName != "" {
+		identity.WorkspaceName = workspaceName
+	}
+	identity.UserID = identity.AccountID
+	return identity
+}
+
+func readGeminiIdentity() syntheticProviderIdentity {
+	identity := defaultSyntheticProviderIdentity("gemini")
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return identity
+	}
+
+	data, err := os.ReadFile(filepath.Join(home, ".gemini", "oauth_creds.json"))
+	if err != nil {
+		return identity
+	}
+
+	var creds struct {
+		IDToken string `json:"id_token"`
+	}
+	if err := json.Unmarshal(data, &creds); err != nil {
+		return identity
+	}
+
+	parts := strings.Split(strings.TrimSpace(creds.IDToken), ".")
+	if len(parts) < 2 {
+		return identity
+	}
+
+	payloadBytes, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return identity
+	}
+
+	var claims struct {
+		Sub   string `json:"sub"`
+		Email string `json:"email"`
+		Name  string `json:"name"`
+	}
+	if err := json.Unmarshal(payloadBytes, &claims); err != nil {
+		return identity
+	}
+
+	if email := strings.TrimSpace(claims.Email); email != "" {
+		identity.Email = email
+	}
+	if alias := strings.TrimSpace(claims.Name); alias != "" {
+		identity.Alias = alias
+	} else if fallbackAlias := aliasFromEmail(identity.Email); fallbackAlias != "" {
+		identity.Alias = fallbackAlias
+	}
+	if sub := strings.TrimSpace(claims.Sub); sub != "" {
+		identity.AccountID = sub
+		identity.UserID = sub
+	}
+	return identity
+}
+
+func buildSyntheticProviderAccount(provider string, account store.ProviderAccount, usage *clientStateUsageInfo, updatedAt string) clientStateAccount {
+	metadata := parseProviderMetadata(account.Metadata)
+	identity := readSyntheticProviderIdentity(provider)
+	alias := stringMetadataValue(metadata, "alias")
+	if alias == "" {
+		alias = strings.TrimSpace(account.Name)
+	}
+	if alias == "" {
+		alias = identity.Alias
+	}
+
+	email := stringMetadataValue(metadata, "email")
+	if email == "" {
+		email = identity.Email
+	}
+
+	planType := normalizeSyntheticPlanType(provider, stringMetadataValue(metadata, "plan_type"))
+	subscriptionActiveUntil := stringMetadataValue(metadata, "subscription_active_until")
+	accountID := stringMetadataValue(metadata, "account_id")
+	if accountID == "" {
+		accountID = identity.AccountID
+	}
+	userID := stringMetadataValue(metadata, "user_id")
+	if userID == "" {
+		userID = identity.UserID
+	}
+	workspaceName := stringMetadataValue(metadata, "workspace_name")
+	if workspaceName == "" {
+		workspaceName = identity.WorkspaceName
+	}
+
+	return clientStateAccount{
+		ID:       fmt.Sprintf("%s:%d", provider, account.ID),
+		Provider: provider,
+		Alias:    alias,
+		AccountInfo: clientStateAccountInfo{
+			Email:                   email,
+			PlanType:                planType,
+			AccountID:               accountID,
+			UserID:                  userID,
+			WorkspaceName:           workspaceName,
+			SubscriptionActiveUntil: subscriptionActiveUntil,
+		},
+		UsageInfo: usage,
+		IsActive:  false,
+		CreatedAt: account.CreatedAt.UTC().Format(time.RFC3339),
+		UpdatedAt: updatedAt,
+	}
+}
+
+func buildFallbackSyntheticProviderAccount(provider string, usage *clientStateUsageInfo, updatedAt string) clientStateAccount {
+	identity := readSyntheticProviderIdentity(provider)
+	planType := normalizeSyntheticPlanType(provider, "")
+	if usage != nil {
+		planType = normalizeSyntheticPlanType(provider, usage.PlanType)
+	}
+	if updatedAt == "" {
+		updatedAt = time.Now().UTC().Format(time.RFC3339)
+	}
+
+	return clientStateAccount{
+		ID:       provider + ":server",
+		Provider: provider,
+		Alias:    identity.Alias,
+		AccountInfo: clientStateAccountInfo{
+			Email:         identity.Email,
+			PlanType:      planType,
+			AccountID:     identity.AccountID,
+			UserID:        identity.UserID,
+			WorkspaceName: identity.WorkspaceName,
+		},
+		UsageInfo: usage,
+		IsActive:  false,
+		CreatedAt: updatedAt,
+		UpdatedAt: updatedAt,
+	}
+}
+
+func readAnthropicStatuslineUsageInfo() (*clientStateUsageInfo, string, error) {
+	path := agent.StatuslineDataPath()
+	if strings.TrimSpace(path) == "" {
+		return nil, "", nil
+	}
+
+	info, err := os.Stat(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, "", nil
+		}
+		return nil, "", err
+	}
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, "", err
+	}
+
+	var payload struct {
+		RateLimits struct {
+			FiveHour *struct {
+				UsedPercentage float64 `json:"used_percentage"`
+				ResetsAt       int64   `json:"resets_at"`
+			} `json:"five_hour"`
+			SevenDay *struct {
+				UsedPercentage float64 `json:"used_percentage"`
+				ResetsAt       int64   `json:"resets_at"`
+			} `json:"seven_day"`
+		} `json:"rate_limits"`
+	}
+	if err := json.Unmarshal(data, &payload); err != nil {
+		return nil, "", err
+	}
+
+	updatedAt := info.ModTime().UTC().Format(time.RFC3339)
+	usageInfo := &clientStateUsageInfo{
+		Status:             "ok",
+		PlanType:           "pro",
+		FiveHourLimitLabel: "5h 限额",
+		WeeklyLimitLabel:   "7天限额",
+		LastUpdated:        updatedAt,
+	}
+
+	if payload.RateLimits.FiveHour != nil {
+		limit := &clientStateLimit{
+			PercentLeft: clampClientStatePercentLeft(payload.RateLimits.FiveHour.UsedPercentage),
+		}
+		if payload.RateLimits.FiveHour.ResetsAt > 0 {
+			limit.ResetTime = formatClientStateResetTime(time.Unix(payload.RateLimits.FiveHour.ResetsAt, 0).UTC(), false)
+		}
+		usageInfo.FiveHourLimit = limit
+	}
+
+	if payload.RateLimits.SevenDay != nil {
+		limit := &clientStateLimit{
+			PercentLeft: clampClientStatePercentLeft(payload.RateLimits.SevenDay.UsedPercentage),
+		}
+		if payload.RateLimits.SevenDay.ResetsAt > 0 {
+			limit.ResetTime = formatClientStateResetTime(time.Unix(payload.RateLimits.SevenDay.ResetsAt, 0).UTC(), true)
+		}
+		usageInfo.WeeklyLimit = limit
+	}
+
+	if usageInfo.FiveHourLimit == nil && usageInfo.WeeklyLimit == nil {
+		return nil, "", nil
+	}
+
+	return usageInfo, updatedAt, nil
+}
+
+func (h *Handler) overlayServerSnapshotsOnClientState(payload string) (string, error) {
+	if h.store == nil || strings.TrimSpace(payload) == "" {
+		return payload, nil
+	}
+
+	var state clientStateStore
+	if err := json.Unmarshal([]byte(payload), &state); err != nil {
+		return payload, nil
+	}
+
+	providerAccounts, err := h.store.QueryActiveProviderAccounts("codex")
+	if err != nil {
+		return "", err
+	}
+
+	byName := make(map[string]store.ProviderAccount, len(providerAccounts))
+	byAlias := make(map[string]store.ProviderAccount, len(providerAccounts))
+	byExternalID := make(map[string]store.ProviderAccount, len(providerAccounts))
+	byClientAccountID := make(map[string]store.ProviderAccount, len(providerAccounts))
+	for _, account := range providerAccounts {
+		if name := strings.TrimSpace(account.Name); name != "" {
+			byName[name] = account
+		}
+		if externalID := strings.TrimSpace(account.ExternalID); externalID != "" {
+			byExternalID[externalID] = account
+		}
+		if clientAccountID := syncedClientAccountIDFromMetadata(account.Metadata); clientAccountID != "" {
+			byClientAccountID[clientAccountID] = account
+		}
+		if strings.TrimSpace(account.Metadata) != "" {
+			var metadata map[string]interface{}
+			if err := json.Unmarshal([]byte(account.Metadata), &metadata); err == nil {
+				if alias, _ := metadata["alias"].(string); strings.TrimSpace(alias) != "" {
+					byAlias[strings.TrimSpace(alias)] = account
+				}
+			}
+		}
+	}
+
+	for idx := range state.Accounts {
+		account := &state.Accounts[idx]
+		if strings.TrimSpace(account.Provider) == "" {
+			account.Provider = "codex"
+		}
+		if account.Provider != "codex" {
+			continue
+		}
+
+		providerAccount, ok := byExternalID[clientStateCodexExternalID(*account)]
+		if !ok {
+			providerAccount, ok = byClientAccountID[account.ID]
+		}
+		if !ok {
+			providerAccount, ok = byAlias[strings.TrimSpace(account.Alias)]
+		}
+		if !ok {
+			providerAccount, ok = byName[strings.TrimSpace(account.Alias)]
+		}
+		if !ok {
+			continue
+		}
+
+		latest, err := h.store.QueryLatestCodex(providerAccount.ID)
+		if err != nil {
+			return "", err
+		}
+		if latest == nil {
+			continue
+		}
+
+		account.UsageInfo = buildUsageInfoFromCodexSnapshot(latest)
+		if strings.TrimSpace(latest.PlanType) != "" {
+			account.AccountInfo.PlanType = latest.PlanType
+		}
+		account.UpdatedAt = latest.CapturedAt.UTC().Format(time.RFC3339)
+	}
+
+	upsertSyntheticAccount := func(next clientStateAccount) {
+		for idx := range state.Accounts {
+			current := &state.Accounts[idx]
+			if current.Provider == next.Provider && (current.ID == next.ID || strings.TrimSpace(current.Alias) == strings.TrimSpace(next.Alias)) {
+				state.Accounts[idx] = next
+				return
+			}
+		}
+		state.Accounts = append(state.Accounts, next)
+	}
+
+	appendProviderSnapshot := func(storeProvider, uiProvider string, buildUsage func() (*clientStateUsageInfo, string, error)) error {
+		usageInfo, updatedAt, err := buildUsage()
+		if err != nil {
+			return err
+		}
+		if usageInfo == nil {
+			return nil
+		}
+
+		accounts, err := h.store.QueryActiveProviderAccounts(storeProvider)
+		if err != nil {
+			return err
+		}
+		if len(accounts) == 0 {
+			upsertSyntheticAccount(buildFallbackSyntheticProviderAccount(uiProvider, usageInfo, updatedAt))
+			return nil
+		}
+
+		upsertSyntheticAccount(buildSyntheticProviderAccount(uiProvider, accounts[0], usageInfo, updatedAt))
+		return nil
+	}
+
+	if err := appendProviderSnapshot("anthropic", "claude", func() (*clientStateUsageInfo, string, error) {
+		latest, err := h.store.QueryLatestAnthropic()
+		if err != nil {
+			return nil, "", err
+		}
+		if latest == nil {
+			return readAnthropicStatuslineUsageInfo()
+		}
+		return buildUsageInfoFromAnthropicSnapshot(latest), latest.CapturedAt.UTC().Format(time.RFC3339), nil
+	}); err != nil {
+		return "", err
+	}
+
+	if err := appendProviderSnapshot("gemini", "gemini", func() (*clientStateUsageInfo, string, error) {
+		latest, err := h.store.QueryLatestGemini()
+		if err != nil {
+			return nil, "", err
+		}
+		if latest == nil {
+			return nil, "", nil
+		}
+		return buildUsageInfoFromGeminiSnapshot(latest), latest.CapturedAt.UTC().Format(time.RFC3339), nil
+	}); err != nil {
+		return "", err
+	}
+
+	merged, err := json.Marshal(state)
+	if err != nil {
+		return "", err
+	}
+	return string(merged), nil
+}
+
+func (h *Handler) ClientState(w http.ResponseWriter, r *http.Request) {
+	applyPublicSyncHeaders(w, r)
+	if r.Method == http.MethodOptions {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+
+	switch r.Method {
+	case http.MethodGet:
+		payload, err := h.readClientStateSnapshot()
+		if err != nil {
+			h.logger.Error("failed to load client state snapshot", "error", err)
+			respondError(w, http.StatusInternalServerError, "failed to load client state")
+			return
+		}
+		mergedPayload, err := h.overlayServerSnapshotsOnClientState(payload)
+		if err != nil {
+			h.logger.Warn("failed to overlay server snapshots on client state", "error", err)
+			mergedPayload = payload
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(mergedPayload))
+	case http.MethodPost, http.MethodPut:
+		r.Body = http.MaxBytesReader(w, r.Body, 5*1024*1024)
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			if err.Error() == "http: request body too large" {
+				respondError(w, http.StatusRequestEntityTooLarge, "request body too large")
+				return
+			}
+			respondError(w, http.StatusBadRequest, "failed to read request body")
+			return
+		}
+		if err := h.persistClientStateSnapshot(body); err != nil {
+			h.logger.Error("failed to persist client state snapshot", "error", err)
+			respondError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		respondJSON(w, http.StatusOK, map[string]interface{}{
+			"message": "Client state synced successfully",
+		})
+	default:
+		respondError(w, http.StatusMethodNotAllowed, "method not allowed")
+	}
+}
+
+// CodexProfiles handles profile management for Codex.
+// GET /api/codex/profiles - list all profiles
+// POST /api/codex/profiles - save current auth as a new profile (body: {name: "xxx"})
+// DELETE /api/codex/profiles?name=xxx - delete a profile
+// POST /api/codex/profiles/refresh?name=xxx - refresh a profile from current auth
+func (h *Handler) CodexProfiles(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		h.codexProfilesList(w, r)
+	case http.MethodPost:
+		// Check if this is a refresh request
+		if r.URL.Query().Get("refresh") != "" {
+			h.codexProfileRefresh(w, r)
+		} else {
+			h.codexProfileSave(w, r)
+		}
+	case http.MethodDelete:
+		h.codexProfileDelete(w, r)
+	default:
+		respondError(w, http.StatusMethodNotAllowed, "method not allowed")
+	}
+}
+
+// codexProfilesList returns all Codex profiles/accounts from the database.
+func (h *Handler) codexProfilesList(w http.ResponseWriter, r *http.Request) {
+	if h.store == nil {
+		respondJSON(w, http.StatusOK, map[string]interface{}{"profiles": []interface{}{}})
+		return
+	}
+
+	accounts, err := h.store.QueryProviderAccounts("codex")
+	if err != nil {
+		h.logger.Error("failed to query Codex profiles", "error", err)
+		respondError(w, http.StatusInternalServerError, "failed to query profiles")
+		return
+	}
+
+	profiles := make([]map[string]interface{}, 0, len(accounts))
+	for _, acc := range accounts {
+		p := map[string]interface{}{
+			"id":        acc.ID,
+			"name":      acc.Name,
+			"createdAt": acc.CreatedAt.Format(time.RFC3339),
+		}
+		if acc.DeletedAt != nil {
+			p["deletedAt"] = acc.DeletedAt.Format(time.RFC3339)
+		}
+		profiles = append(profiles, p)
+	}
+
+	respondJSON(w, http.StatusOK, map[string]interface{}{"profiles": profiles})
+}
+
+// codexProfileSave saves the current Codex auth as a new profile.
+func (h *Handler) codexProfileSave(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Name string `json:"name"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		respondError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if strings.TrimSpace(req.Name) == "" {
+		respondError(w, http.StatusBadRequest, "profile name is required")
+		return
+	}
+	if !validProfileName.MatchString(req.Name) {
+		respondError(w, http.StatusBadRequest, "invalid profile name: use only letters, numbers, hyphens, and underscores")
+		return
+	}
+
+	// Detect current Codex credentials
+	creds := api.DetectCodexCredentials(h.logger)
+	if creds == nil || (creds.AccessToken == "" && creds.APIKey == "") {
+		respondError(w, http.StatusBadRequest, "no Codex credentials found. Run 'codex auth' first to authenticate")
+		return
+	}
+
+	// Determine profiles directory
+	profilesDir := codexProfilesDir()
+	if profilesDir == "" {
+		respondError(w, http.StatusInternalServerError, "could not determine profiles directory")
+		return
+	}
+	if err := os.MkdirAll(profilesDir, 0o700); err != nil {
+		respondError(w, http.StatusInternalServerError, "failed to create profiles directory")
+		return
+	}
+
+	profilePath := filepath.Join(profilesDir, req.Name+".json")
+	if _, err := os.Stat(profilePath); err == nil {
+		respondError(w, http.StatusConflict, "profile already exists")
+		return
+	}
+
+	// Check for duplicate accounts
+	existingProfiles, err := listCodexProfiles()
+	if err != nil {
+		h.logger.Warn("failed to list existing profiles for duplicate check", "error", err)
+	}
+	for _, p := range existingProfiles {
+		if isDuplicateCodexProfile(p, creds) {
+			respondError(w, http.StatusConflict, "account "+creds.AccountID+" is already saved as profile "+p.Name)
+			return
+		}
+	}
+
+	profile := CodexProfile{
+		Name:      req.Name,
+		AccountID: creds.AccountID,
+		UserID:    codexCredUserID(creds),
+		SavedAt:   time.Now().UTC(),
+		APIKey:    creds.APIKey,
+	}
+	profile.Tokens.AccessToken = creds.AccessToken
+	profile.Tokens.RefreshToken = creds.RefreshToken
+	profile.Tokens.IDToken = creds.IDToken
+
+	data, err := json.MarshalIndent(profile, "", "  ")
+	if err != nil {
+		respondError(w, http.StatusInternalServerError, "failed to marshal profile")
+		return
+	}
+	if err := os.WriteFile(profilePath, data, 0o600); err != nil {
+		respondError(w, http.StatusInternalServerError, "failed to write profile")
+		return
+	}
+
+	// Ensure profile is active in the database
+	if h.store != nil {
+		externalID := codexCompositeExternalID(profile.AccountID, profile.UserID)
+		if externalID == "" {
+			externalID = profile.AccountID
+		}
+		h.store.GetOrCreateProviderAccountByExternalID("codex", req.Name, externalID)
+	}
+
+	respondJSON(w, http.StatusCreated, map[string]interface{}{
+		"message":   "profile saved",
+		"name":      req.Name,
+		"accountID": creds.AccountID,
+	})
+}
+
+// codexProfileDelete deletes a Codex profile.
+func (h *Handler) codexProfileDelete(w http.ResponseWriter, r *http.Request) {
+	name := r.URL.Query().Get("name")
+	if name == "" {
+		respondError(w, http.StatusBadRequest, "profile name is required")
+		return
+	}
+	if !validProfileName.MatchString(name) {
+		respondError(w, http.StatusBadRequest, "invalid profile name")
+		return
+	}
+
+	profilesDir := codexProfilesDir()
+	if profilesDir == "" {
+		respondError(w, http.StatusInternalServerError, "could not determine profiles directory")
+		return
+	}
+
+	profilePath := filepath.Join(profilesDir, name+".json")
+	if _, err := os.Stat(profilePath); os.IsNotExist(err) {
+		respondError(w, http.StatusNotFound, "profile not found")
+		return
+	}
+
+	if err := os.Remove(profilePath); err != nil {
+		respondError(w, http.StatusInternalServerError, "failed to delete profile")
+		return
+	}
+
+	// Mark profile as deleted in database
+	if h.store != nil {
+		h.store.MarkProviderAccountDeleted("codex", name)
+	}
+
+	respondJSON(w, http.StatusOK, map[string]interface{}{
+		"message": "profile deleted",
+		"name":    name,
+	})
+}
+
+// codexProfileRefresh refreshes a profile with current Codex auth.
+func (h *Handler) codexProfileRefresh(w http.ResponseWriter, r *http.Request) {
+	// JS sends ?refresh=profileName, fall back to ?name= for direct API callers
+	name := r.URL.Query().Get("refresh")
+	if name == "" {
+		name = r.URL.Query().Get("name")
+	}
+	if name == "" {
+		respondError(w, http.StatusBadRequest, "profile name is required")
+		return
+	}
+	if !validProfileName.MatchString(name) {
+		respondError(w, http.StatusBadRequest, "invalid profile name")
+		return
+	}
+
+	profilesDir := codexProfilesDir()
+	if profilesDir == "" {
+		respondError(w, http.StatusInternalServerError, "could not determine profiles directory")
+		return
+	}
+
+	profilePath := filepath.Join(profilesDir, name+".json")
+	if _, err := os.Stat(profilePath); os.IsNotExist(err) {
+		respondError(w, http.StatusNotFound, "profile not found")
+		return
+	}
+
+	// Load current auth from auth.json
+	authPath := codexAuthRefreshPath()
+	if authPath == "" {
+		respondError(w, http.StatusBadRequest, "cannot determine Codex auth.json path")
+		return
+	}
+	authData, err := os.ReadFile(authPath)
+	if err != nil {
+		respondError(w, http.StatusBadRequest, "cannot read Codex auth.json: run 'codex auth' first")
+		return
+	}
+
+	var auth codexRefreshAuthFile
+	if err := json.Unmarshal(authData, &auth); err != nil {
+		respondError(w, http.StatusBadRequest, "invalid auth.json format")
+		return
+	}
+
+	creds := &codexRefreshAuthCredentials{
+		AccessToken:  strings.TrimSpace(auth.Tokens.AccessToken),
+		RefreshToken: strings.TrimSpace(auth.Tokens.RefreshToken),
+		IDToken:      strings.TrimSpace(auth.Tokens.IDToken),
+		AccountID:    strings.TrimSpace(auth.Tokens.AccountID),
+		APIKey:       strings.TrimSpace(auth.OpenAIAPIKey),
+	}
+	// Backward support for flat auth.json
+	if creds.AccessToken == "" {
+		creds.AccessToken = strings.TrimSpace(auth.AccessToken)
+	}
+	if creds.RefreshToken == "" {
+		creds.RefreshToken = strings.TrimSpace(auth.RefreshToken)
+	}
+	if creds.IDToken == "" {
+		creds.IDToken = strings.TrimSpace(auth.IDToken)
+	}
+	if creds.AccountID == "" {
+		creds.AccountID = strings.TrimSpace(auth.AccountID)
+	}
+
+	if creds.AccessToken == "" {
+		respondError(w, http.StatusBadRequest, "auth.json has no access_token - run 'codex auth' first")
+		return
+	}
+
+	// Load existing profile
+	existing, err := loadCodexProfile(profilePath)
+	if err != nil {
+		respondError(w, http.StatusInternalServerError, "cannot read profile")
+		return
+	}
+
+	// Check account override if account IDs differ
+	if existing.AccountID != "" && creds.AccountID != "" && existing.AccountID != creds.AccountID {
+		respondError(w, http.StatusConflict, "current auth is for account "+creds.AccountID+" but profile is linked to "+existing.AccountID+". Delete and re-save to change accounts.")
+		return
+	}
+
+	// Update profile
+	profile := *existing
+	profile.AccountID = creds.AccountID
+	profile.UserID = codexRefreshUserID(creds)
+	profile.SavedAt = time.Now().UTC()
+	profile.Tokens.AccessToken = creds.AccessToken
+	profile.Tokens.RefreshToken = creds.RefreshToken
+	profile.Tokens.IDToken = creds.IDToken
+	if creds.APIKey != "" {
+		profile.APIKey = creds.APIKey
+	}
+
+	data, err := json.MarshalIndent(profile, "", "  ")
+	if err != nil {
+		respondError(w, http.StatusInternalServerError, "failed to marshal profile")
+		return
+	}
+	if err := os.WriteFile(profilePath, data, 0o600); err != nil {
+		respondError(w, http.StatusInternalServerError, "failed to write profile")
+		return
+	}
+
+	// Ensure the profile is active in the database (undelete if previously deleted)
+	if h.store != nil {
+		externalID := codexCompositeExternalID(profile.AccountID, profile.UserID)
+		if externalID == "" {
+			externalID = profile.AccountID
+		}
+		h.store.GetOrCreateProviderAccountByExternalID("codex", name, externalID)
+	}
+
+	respondJSON(w, http.StatusOK, map[string]interface{}{
+		"message":   "profile refreshed",
+		"name":      name,
+		"accountID": creds.AccountID,
+	})
+}
+
+func (h *Handler) codexUsageAccounts() []map[string]interface{} {
+	if h.store == nil {
+		return []map[string]interface{}{}
+	}
+
+	// Only return active (non-deleted) accounts for dashboard rendering
+	accounts, err := h.store.QueryActiveProviderAccounts("codex")
+	if err != nil {
+		h.logger.Error("failed to query Codex accounts", "error", err)
+		return []map[string]interface{}{}
+	}
+	if len(accounts) == 0 {
+		accounts = []store.ProviderAccount{
+			{ID: DefaultCodexAccountID, Name: "default"},
+		}
+	}
+
+	usages := make([]map[string]interface{}, 0, len(accounts))
+	for _, acc := range accounts {
+		usage := h.buildCodexCurrent(acc.ID)
+		usage["accountId"] = acc.ID
+		usage["accountName"] = acc.Name
+		usage["id"] = acc.ID
+		usage["name"] = acc.Name
+		usages = append(usages, usage)
+	}
+	return usages
+}
+
+func codexUsageAccountID(usage map[string]interface{}) int64 {
+	if usage == nil {
+		return DefaultCodexAccountID
+	}
+	switch v := usage["accountId"].(type) {
+	case int64:
+		if v > 0 {
+			return v
+		}
+	case int:
+		if v > 0 {
+			return int64(v)
+		}
+	case float64:
+		if v > 0 {
+			return int64(v)
+		}
+	}
+	return DefaultCodexAccountID
+}
+
+func codexUsageAccountName(usage map[string]interface{}) string {
+	if usage == nil {
+		return ""
+	}
+	name, _ := usage["accountName"].(string)
+	return name
+}
+
+func codexIsFreePlan(planType string) bool {
+	return strings.EqualFold(strings.TrimSpace(planType), "free")
+}
+
+func codexNormalizedQuotaName(planType, quotaName string) string {
+	if codexIsFreePlan(planType) && quotaName == "five_hour" {
+		return "seven_day"
+	}
+	return quotaName
+}
+
+func codexNormalizeQuotasForPlan(planType string, quotas []api.CodexQuota) []api.CodexQuota {
+	if len(quotas) == 0 {
+		return quotas
+	}
+	out := make([]api.CodexQuota, 0, len(quotas))
+	indexByName := make(map[string]int, len(quotas))
+	for _, q := range quotas {
+		normalized := q
+		normalized.Name = codexNormalizedQuotaName(planType, q.Name)
+		if idx, exists := indexByName[normalized.Name]; exists {
+			// Keep the stronger sample if a legacy + normalized key collide.
+			if normalized.Utilization >= out[idx].Utilization {
+				out[idx] = normalized
+			}
+			continue
+		}
+		indexByName[normalized.Name] = len(out)
+		out = append(out, normalized)
+	}
+	return out
+}
+
+// CodexUsage returns Codex usage for a single account by default, or all accounts with ?all=true.
+func (h *Handler) CodexUsage(w http.ResponseWriter, r *http.Request) {
+	all := strings.EqualFold(r.URL.Query().Get("all"), "true")
+	if all {
+		respondJSON(w, http.StatusOK, map[string]interface{}{
+			"accounts": h.codexUsageAccounts(),
+		})
+		return
+	}
+
+	accountID := parseCodexAccountID(r)
+	response := h.buildCodexCurrent(accountID)
+	response["accountId"] = accountID
+	respondJSON(w, http.StatusOK, response)
+}
+
+// CodexAccountsUsage returns Codex usage across all configured accounts.
+func (h *Handler) CodexAccountsUsage(w http.ResponseWriter, r *http.Request) {
+	respondJSON(w, http.StatusOK, map[string]interface{}{
+		"accounts": h.codexUsageAccounts(),
+	})
+}
+
+// NewHandler creates a new Handler instance
+func NewHandler(store *store.Store, tracker *tracker.Tracker, logger *slog.Logger, sessions *SessionStore, cfg *config.Config, zaiTracker ...*tracker.ZaiTracker) *Handler {
+	if logger == nil {
+		logger = slog.Default()
+	}
+
+	// Parse dashboard template (layout + dashboard)
+	dashboardTmpl, err := template.New("").ParseFS(templatesFS, "templates/layout.html", "templates/dashboard.html")
+	if err != nil {
+		logger.Error("failed to parse dashboard template", "error", err)
+		dashboardTmpl = template.New("empty")
+	}
+
+	// Parse login template (layout + login)
+	loginTmpl, err := template.New("").ParseFS(templatesFS, "templates/layout.html", "templates/login.html")
+	if err != nil {
+		logger.Error("failed to parse login template", "error", err)
+		loginTmpl = template.New("empty")
+	}
+
+	// Parse settings template (layout + settings)
+	settingsTmpl, err := template.New("").ParseFS(templatesFS, "templates/layout.html", "templates/settings.html")
+	if err != nil {
+		logger.Error("failed to parse settings template", "error", err)
+		settingsTmpl = template.New("empty")
+	}
+
+	h := &Handler{
+		store:         store,
+		tracker:       tracker,
+		logger:        logger,
+		dashboardTmpl: dashboardTmpl,
+		loginTmpl:     loginTmpl,
+		settingsTmpl:  settingsTmpl,
+		sessions:      sessions,
+		config:        cfg,
+	}
+	if len(zaiTracker) > 0 && zaiTracker[0] != nil {
+		h.zaiTracker = zaiTracker[0]
+	}
+	return h
+}
+
+// SetVersion sets the version string for display in the dashboard.
+func (h *Handler) SetVersion(v string) {
+	h.version = v
+}
+
+// SetAnthropicTracker sets the Anthropic tracker for usage summary enrichment.
+func (h *Handler) SetAnthropicTracker(t *tracker.AnthropicTracker) {
+	h.anthropicTracker = t
+}
+
+// SetCopilotTracker sets the Copilot tracker for usage summary enrichment.
+func (h *Handler) SetCopilotTracker(t *tracker.CopilotTracker) {
+	h.copilotTracker = t
+}
+
+// SetCodexTracker sets the Codex tracker for usage summary enrichment.
+func (h *Handler) SetCodexTracker(t *tracker.CodexTracker) {
+	h.codexTracker = t
+}
+
+// SetAntigravityTracker sets the Antigravity tracker for usage summary enrichment.
+func (h *Handler) SetAntigravityTracker(t *tracker.AntigravityTracker) {
+	h.antigravityTracker = t
+}
+
+// SetMiniMaxTracker sets the MiniMax tracker for usage summary enrichment.
+func (h *Handler) SetMiniMaxTracker(t *tracker.MiniMaxTracker) {
+	h.minimaxTracker = t
+}
+
+// SetGeminiTracker sets the Gemini tracker for usage summary enrichment.
+func (h *Handler) SetGeminiTracker(t *tracker.GeminiTracker) {
+	h.geminiTracker = t
+}
+
+// SetOpenRouterTracker sets the OpenRouter tracker for usage summary enrichment.
+func (h *Handler) SetOpenRouterTracker(t *tracker.OpenRouterTracker) {
+	h.openrouterTracker = t
+}
+
+// SetAgentManager sets provider agent lifecycle controller.
+func (h *Handler) SetAgentManager(m ProviderAgentController) {
+	h.agentManager = m
+}
+
+// SetUpdater sets the updater for self-update functionality.
+func (h *Handler) SetUpdater(u *update.Updater) {
+	h.updater = u
+}
+
+// SetNotifier sets the notification engine for alert management.
+func (h *Handler) SetNotifier(n Notifier) {
+	h.notifier = n
+}
+
+// getBasePath returns the configured base path, or empty string if not configured.
+func (h *Handler) getBasePath() string {
+	if h.config != nil {
+		return h.config.BasePath
+	}
+	return ""
+}
+
+// getPollIntervalSec returns the poll interval in seconds, defaulting to 120 if not configured.
+func (h *Handler) getPollIntervalSec() int {
+	if h.config != nil && h.config.PollInterval > 0 {
+		return int(h.config.PollInterval.Seconds())
+	}
+	return 120
+}
+
+// GetSessionStore returns the session store for token eviction.
+func (h *Handler) GetSessionStore() *SessionStore {
+	return h.sessions
+}
+
+// SetRateLimiter sets the login rate limiter for brute force protection.
+func (h *Handler) SetRateLimiter(l *LoginRateLimiter) {
+	h.rateLimiter = l
+}
+
+// SetMiniMaxAgentManager sets the MiniMax agent manager for hot-reload on account changes.
+func (h *Handler) SetMiniMaxAgentManager(m MiniMaxAccountReloader) {
+	h.minimaxAgentMgr = m
+}
+
+func (h *Handler) triggerMenubarRefresh() {
+	if h == nil {
+		return
+	}
+	testMode := false
+	if h.config != nil {
+		testMode = h.config.TestMode
+	}
+	if err := menubar.TriggerRefresh(testMode); err != nil {
+		h.logger.Debug("menubar refresh trigger failed", "error", err)
+	}
+}
+
+// SettingsPage renders the settings page.
+func (h *Handler) SettingsPage(w http.ResponseWriter, r *http.Request) {
+	data := map[string]interface{}{
+		"Title":    "Settings",
+		"Version":  h.version,
+		"BasePath": h.getBasePath(),
+	}
+
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	if err := h.settingsTmpl.ExecuteTemplate(w, "layout.html", data); err != nil {
+		h.logger.Error("failed to render settings template", "error", err)
+		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+	}
+}
+
+// respondJSON sends a JSON response
+func respondJSON(w http.ResponseWriter, status int, data interface{}) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	json.NewEncoder(w).Encode(data)
+}
+
+// respondError sends an error response
+func respondError(w http.ResponseWriter, status int, message string) {
+	respondJSON(w, status, map[string]string{"error": message})
+}
+
+// isMaxBytesError checks if an error is from http.MaxBytesReader
+func isMaxBytesError(err error) bool {
+	if err == nil {
+		return false
+	}
+	// MaxBytesReader returns an error with a specific message
+	return strings.Contains(err.Error(), "http: request body too large")
+}
+
+// sanitizeSMTPError classifies SMTP errors into user-friendly categories
+// to prevent information leakage about internal system details
+func sanitizeSMTPError(err error) string {
+	if err == nil {
+		return "SMTP test failed"
+	}
+	errStr := strings.ToLower(err.Error())
+
+	// Classify errors by type
+	switch {
+	case strings.Contains(errStr, "select none to allow unencrypted smtp authentication") ||
+		strings.Contains(errStr, "server does not offer tls"):
+		return "Server requires plaintext SMTP auth. Choose None only if you trust the server and network."
+	case strings.Contains(errStr, "authentication") || strings.Contains(errStr, "auth") ||
+		strings.Contains(errStr, "username") || strings.Contains(errStr, "password") ||
+		strings.Contains(errStr, "535") || strings.Contains(errStr, "530"):
+		return "Authentication failed: check username/password"
+	case strings.Contains(errStr, "connection") || strings.Contains(errStr, "refused") ||
+		strings.Contains(errStr, "timeout") || strings.Contains(errStr, "no such host") ||
+		strings.Contains(errStr, "i/o timeout"):
+		return "Connection failed: unable to reach SMTP server"
+	case strings.Contains(errStr, "tls") || strings.Contains(errStr, "ssl") ||
+		strings.Contains(errStr, "certificate") || strings.Contains(errStr, "x509"):
+		return "TLS error: try STARTTLS on port 587 or SSL/TLS on port 465"
+	default:
+		return "SMTP test failed"
+	}
+}
+
+// parseTimeRange parses a time range string (1h, 6h, 24h, 1d, 7d, 30d)
+func parseTimeRange(rangeStr string) (time.Duration, error) {
+	if rangeStr == "" {
+		return 6 * time.Hour, nil
+	}
+
+	switch rangeStr {
+	case "1h":
+		return time.Hour, nil
+	case "6h":
+		return 6 * time.Hour, nil
+	case "24h", "1d":
+		return 24 * time.Hour, nil
+	case "7d":
+		return 7 * 24 * time.Hour, nil
+	case "30d":
+		return 30 * 24 * time.Hour, nil
+	default:
+		return 0, fmt.Errorf("invalid range: %s", rangeStr)
+	}
+}
+
+// maxChartPoints is the target number of data points for chart responses.
+// Charts beyond this density add no visual value on typical displays (~1000px wide)
+// but increase JSON size and browser rendering time.
+const maxChartPoints = 500
+
+// downsampleStep returns the step size to reduce n items to at most max items.
+// Returns 1 if no downsampling is needed.
+func downsampleStep(n, max int) int {
+	if n <= max || max <= 0 {
+		return 1
+	}
+	return (n + max - 1) / max // ceil division
+}
+
+// parseInsightsRange parses the insights range param, defaulting to 7d.
+func parseInsightsRange(rangeStr string) time.Duration {
+	switch rangeStr {
+	case "1d":
+		return 24 * time.Hour
+	case "30d":
+		return 30 * 24 * time.Hour
+	default:
+		return 7 * 24 * time.Hour // default "7d"
+	}
+}
+
+// formatDuration formats a duration as a human-readable string (e.g., "4d 11h" or "3h 16m")
+func formatDuration(d time.Duration) string {
+	if d < 0 {
+		return "Resetting..."
+	}
+
+	totalHours := int(d.Hours())
+	days := totalHours / 24
+	hours := totalHours % 24
+	minutes := int(d.Minutes()) % 60
+
+	if days > 0 && hours > 0 {
+		return fmt.Sprintf("%dd %dh", days, hours)
+	} else if days > 0 {
+		return fmt.Sprintf("%dd %dm", days, minutes)
+	} else if hours > 0 && minutes > 0 {
+		return fmt.Sprintf("%dh %dm", hours, minutes)
+	} else if hours > 0 {
+		return fmt.Sprintf("%dh", hours)
+	} else {
+		return fmt.Sprintf("%dm", minutes)
+	}
+}
+
+// getProviderFromRequest extracts and validates the provider from the request
+func (h *Handler) getProviderFromRequest(r *http.Request) (string, error) {
+	if h.config == nil {
+		return "", fmt.Errorf("configuration not available")
+	}
+
+	providers := h.config.AvailableProviders()
+	if len(providers) == 0 {
+		return "", fmt.Errorf("no providers configured")
+	}
+
+	provider := r.URL.Query().Get("provider")
+	if provider == "" {
+		// Default to first available provider
+		return providers[0], nil
+	}
+
+	// Normalize provider name
+	provider = strings.ToLower(provider)
+
+	// "both" is a virtual provider - allowed when multiple are configured
+	if provider == "both" {
+		if h.config.HasMultipleProviders() {
+			return "both", nil
+		}
+		return "", fmt.Errorf("'both' requires multiple providers to be configured")
+	}
+
+	// Validate provider is available
+	if !h.config.HasProvider(provider) {
+		return "", fmt.Errorf("provider '%s' is not configured", provider)
+	}
+
+	return provider, nil
+}
+
+func (h *Handler) providerVisibilitySettings() map[string]interface{} {
+	if h.store == nil {
+		return map[string]interface{}{}
+	}
+	visJSON, err := h.store.GetSetting("provider_visibility")
+	if err != nil || visJSON == "" {
+		return map[string]interface{}{}
+	}
+	var vis map[string]interface{}
+	if err := json.Unmarshal([]byte(visJSON), &vis); err != nil {
+		return map[string]interface{}{}
+	}
+	return vis
+}
+
+func providerPollingValue(entry interface{}) (bool, bool) {
+	switch v := entry.(type) {
+	case map[string]interface{}:
+		raw, exists := v["polling"]
+		if !exists {
+			return true, false
+		}
+		b, ok := raw.(bool)
+		return b, ok
+	case map[string]bool:
+		b, exists := v["polling"]
+		return b, exists
+	}
+	return true, false
+}
+
+func providerTelemetryEnabled(visibility map[string]interface{}, providerKey string) bool {
+	if visibility == nil {
+		return true
+	}
+	if polling, exists := providerPollingValue(visibility[providerKey]); exists {
+		return polling
+	}
+	return true
+}
+
+func codexAccountTelemetryEnabled(visibility map[string]interface{}, accountID int64) bool {
+	accountKey := fmt.Sprintf("codex:%d", accountID)
+	if polling, exists := providerPollingValue(visibility[accountKey]); exists {
+		return polling
+	}
+	return providerTelemetryEnabled(visibility, "codex")
+}
+
+type providerCatalogItem struct {
+	Key            string
+	Name           string
+	Description    string
+	AutoDetectable bool
+}
+
+func providerCatalog() []providerCatalogItem {
+	return []providerCatalogItem{
+		{Key: "anthropic", Name: "Anthropic", Description: "Claude Code usage tracking", AutoDetectable: true},
+		{Key: "synthetic", Name: "Synthetic", Description: "Synthetic API quota monitoring"},
+		{Key: "zai", Name: "Z.ai", Description: "Z.ai API usage tracking"},
+		{Key: "copilot", Name: "Copilot", Description: "GitHub Copilot premium request tracking"},
+		{Key: "codex", Name: "Codex", Description: "OpenAI Codex usage tracking", AutoDetectable: true},
+		{Key: "antigravity", Name: "Antigravity", Description: "Antigravity model usage tracking", AutoDetectable: true},
+		{Key: "minimax", Name: "MiniMax", Description: "MiniMax Coding Plan usage tracking"},
+		{Key: "openrouter", Name: "OpenRouter", Description: "OpenRouter credits usage tracking"},
+		{Key: "gemini", Name: "Gemini", Description: "Google Gemini CLI quota tracking", AutoDetectable: true},
+	}
+}
+
+func (h *Handler) providerVisibilityMap() map[string]map[string]bool {
+	if h.store == nil {
+		return map[string]map[string]bool{}
+	}
+	raw, err := h.store.GetSetting("provider_visibility")
+	if err != nil || raw == "" {
+		return map[string]map[string]bool{}
+	}
+	var vis map[string]map[string]bool
+	if err := json.Unmarshal([]byte(raw), &vis); err != nil {
+		return map[string]map[string]bool{}
+	}
+	return vis
+}
+
+func (h *Handler) isProviderConfigured(provider string) bool {
+	if h.config == nil {
+		return false
+	}
+	switch provider {
+	case "anthropic":
+		return strings.TrimSpace(h.config.AnthropicToken) != "" || strings.TrimSpace(api.DetectAnthropicToken(h.logger)) != ""
+	case "synthetic":
+		return strings.TrimSpace(h.config.SyntheticAPIKey) != ""
+	case "zai":
+		return strings.TrimSpace(h.config.ZaiAPIKey) != ""
+	case "copilot":
+		return strings.TrimSpace(h.config.CopilotToken) != ""
+	case "codex":
+		return strings.TrimSpace(h.config.CodexToken) != "" || strings.TrimSpace(api.DetectCodexToken(h.logger)) != ""
+	case "antigravity":
+		if h.config.AntigravityEnabled {
+			return true
+		}
+		return h.detectAntigravityConnection() != nil
+	case "minimax":
+		// Configured if any active MiniMax accounts have API keys, or legacy env var is set
+		if strings.TrimSpace(h.config.MiniMaxAPIKey) != "" {
+			return true
+		}
+		if h.store != nil {
+			if accounts, err := h.store.QueryActiveProviderAccounts("minimax"); err == nil {
+				for _, acc := range accounts {
+					if acc.Metadata != "" && strings.Contains(acc.Metadata, "api_key") {
+						return true
+					}
+				}
+			}
+		}
+		return false
+	case "openrouter":
+		return strings.TrimSpace(h.config.OpenRouterAPIKey) != ""
+	case "gemini":
+		return h.config.GeminiEnabled
+	default:
+		return false
+	}
+}
+
+func (h *Handler) providerPollingEnabled(provider string, vis map[string]map[string]bool) bool {
+	if pv, ok := vis[provider]; ok {
+		if polling, exists := pv["polling"]; exists {
+			return polling
+		}
+	}
+	return true
+}
+
+func (h *Handler) providerDashboardVisible(provider string, vis map[string]map[string]bool) bool {
+	if pv, ok := vis[provider]; ok {
+		if dashboard, exists := pv["dashboard"]; exists {
+			return dashboard
+		}
+	}
+	return true
+}
+
+func (h *Handler) saveProviderVisibility(vis map[string]map[string]bool) error {
+	if h.store == nil {
+		return fmt.Errorf("store not available")
+	}
+	data, err := json.Marshal(vis)
+	if err != nil {
+		return err
+	}
+	return h.store.SetSetting("provider_visibility", string(data))
+}
+
+func (h *Handler) setProviderVisibility(provider string, polling, dashboard *bool) error {
+	vis := h.providerVisibilityMap()
+	if _, ok := vis[provider]; !ok {
+		vis[provider] = map[string]bool{
+			"polling":   true,
+			"dashboard": true,
+		}
+	}
+	if polling != nil {
+		vis[provider]["polling"] = *polling
+	}
+	if dashboard != nil {
+		vis[provider]["dashboard"] = *dashboard
+	}
+	return h.saveProviderVisibility(vis)
+}
+
+func (h *Handler) tryAutoDetect(provider string) bool {
+	if h.config == nil {
+		return false
+	}
+	switch provider {
+	case "anthropic":
+		if token := strings.TrimSpace(api.DetectAnthropicToken(h.logger)); token != "" {
+			h.config.AnthropicToken = token
+			h.config.AnthropicAutoToken = true
+			return true
+		}
+	case "codex":
+		if token := strings.TrimSpace(api.DetectCodexToken(h.logger)); token != "" {
+			h.config.CodexToken = token
+			h.config.CodexAutoToken = true
+			return true
+		}
+	case "antigravity":
+		if conn := h.detectAntigravityConnection(); conn != nil {
+			h.config.AntigravityEnabled = true
+			if h.config.AntigravityBaseURL == "" {
+				h.config.AntigravityBaseURL = conn.BaseURL
+			}
+			if h.config.AntigravityCSRFToken == "" {
+				h.config.AntigravityCSRFToken = conn.CSRFToken
+			}
+			return true
+		}
+	case "gemini":
+		if token := strings.TrimSpace(api.DetectGeminiToken(h.logger)); token != "" {
+			h.config.GeminiEnabled = true
+			h.config.GeminiAutoToken = true
+			return true
+		}
+	}
+	return false
+}
+
+func (h *Handler) detectAntigravityConnection() *api.AntigravityConnection {
+	client := api.NewAntigravityClient(h.logger)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	conn, err := client.Detect(ctx)
+	if err != nil {
+		return nil
+	}
+	return conn
+}
+
+func providerKeyBase(provider string) string {
+	if strings.HasPrefix(provider, "codex:") {
+		return "codex"
+	}
+	if strings.HasPrefix(provider, "minimax:") {
+		return "minimax"
+	}
+	return provider
+}
+
+func applyProviderConfig(dst, src *config.Config) {
+	if dst == nil || src == nil {
+		return
+	}
+	dst.SyntheticAPIKey = src.SyntheticAPIKey
+	dst.ZaiAPIKey = src.ZaiAPIKey
+	dst.ZaiBaseURL = src.ZaiBaseURL
+	dst.AnthropicToken = src.AnthropicToken
+	dst.AnthropicAutoToken = src.AnthropicAutoToken
+	dst.CopilotToken = src.CopilotToken
+	dst.CodexToken = src.CodexToken
+	dst.CodexAutoToken = src.CodexAutoToken
+	dst.AntigravityBaseURL = src.AntigravityBaseURL
+	dst.AntigravityCSRFToken = src.AntigravityCSRFToken
+	dst.AntigravityEnabled = src.AntigravityEnabled
+	dst.MiniMaxAPIKey = src.MiniMaxAPIKey
+	dst.OpenRouterAPIKey = src.OpenRouterAPIKey
+	dst.GeminiEnabled = src.GeminiEnabled
+	dst.GeminiAutoToken = src.GeminiAutoToken
+	dst.ZaiRegion = src.ZaiRegion
+	dst.MiniMaxRegion = src.MiniMaxRegion
+}
+
+// providerSecretKeys lists the provider_settings field names that contain
+// sensitive values (API keys, tokens). These are stripped from GET responses
+// and replaced with a "{key}_set: true" flag so the UI can show status
+// without exposing the actual values.
+var providerSecretKeys = map[string]bool{
+	"api_key":    true,
+	"token":      true,
+	"csrf_token": true,
+}
+
+// stripProviderSecrets removes sensitive field values from provider_settings
+// and replaces them with "{field}_set: true" flags for the UI.
+func stripProviderSecrets(providers map[string]interface{}) {
+	for _, provMap := range providers {
+		m, ok := provMap.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		for k, v := range m {
+			if !providerSecretKeys[k] {
+				continue
+			}
+			if str, ok := v.(string); ok && str != "" {
+				m[k] = ""          // Don't send actual value
+				m[k+"_set"] = true // Signal that it's configured
+			}
+		}
+	}
+}
+
+// providerEnumFields defines valid values for enum-type provider settings.
+// Fields not listed here pass through unvalidated (free-form strings, numbers).
+var providerEnumFields = map[string]map[string][]string{
+	"codex": {
+		"display_mode": {"usage", "available"},
+	},
+	"anthropic": {
+		"source":       {"auto", "statusline", "api"},
+		"cc_detection": {"on", "off"},
+	},
+	"zai": {
+		"region": {"global", "cn"},
+	},
+	"minimax": {
+		"region": {"global", "cn"},
+	},
+}
+
+// sanitizeProviderSettings validates enum fields and resets invalid values
+// to their defaults before persisting to DB.
+func sanitizeProviderSettings(providers map[string]interface{}) {
+	for provKey, enumFields := range providerEnumFields {
+		provMap, ok := providers[provKey].(map[string]interface{})
+		if !ok {
+			continue
+		}
+		for field, validValues := range enumFields {
+			val, ok := provMap[field].(string)
+			if !ok || val == "" {
+				continue
+			}
+			valid := false
+			for _, v := range validValues {
+				if val == v {
+					valid = true
+					break
+				}
+			}
+			if !valid {
+				// Reset to first valid value (the default)
+				provMap[field] = validValues[0]
+			}
+		}
+	}
+}
+
+// ApplyProviderSettingsFromDB loads provider_settings from the DB and applies
+// API keys, tokens, and region overrides to the runtime config. This allows
+// the UI to override .env values without requiring a daemon restart.
+func ApplyProviderSettingsFromDB(st *store.Store, cfg *config.Config, logger *slog.Logger) {
+	provJSON, err := st.GetSetting("provider_settings")
+	if err != nil || provJSON == "" {
+		return
+	}
+	var provSettings map[string]map[string]interface{}
+	if json.Unmarshal([]byte(provJSON), &provSettings) != nil {
+		return
+	}
+
+	if s := provSettings["synthetic"]; s != nil {
+		if key, _ := s["api_key"].(string); key != "" {
+			cfg.SyntheticAPIKey = key
+		}
+	}
+	if s := provSettings["zai"]; s != nil {
+		if key, _ := s["api_key"].(string); key != "" {
+			cfg.ZaiAPIKey = key
+		}
+		if region, _ := s["region"].(string); region != "" {
+			cfg.ZaiRegion = region
+			if region == "cn" {
+				cfg.ZaiBaseURL = "https://open.bigmodel.cn/api"
+			} else {
+				cfg.ZaiBaseURL = "https://api.z.ai/api"
+			}
+		}
+	}
+	if s := provSettings["copilot"]; s != nil {
+		if token, _ := s["token"].(string); token != "" {
+			cfg.CopilotToken = token
+		}
+	}
+	if s := provSettings["minimax"]; s != nil {
+		if key, _ := s["api_key"].(string); key != "" {
+			cfg.MiniMaxAPIKey = key
+		}
+		if region, _ := s["region"].(string); region != "" {
+			cfg.MiniMaxRegion = region
+		}
+	}
+	if s := provSettings["openrouter"]; s != nil {
+		if key, _ := s["api_key"].(string); key != "" {
+			cfg.OpenRouterAPIKey = key
+		}
+	}
+	if s := provSettings["antigravity"]; s != nil {
+		if url, _ := s["base_url"].(string); url != "" {
+			cfg.AntigravityBaseURL = url
+			cfg.AntigravityEnabled = true
+		}
+		if token, _ := s["csrf_token"].(string); token != "" {
+			cfg.AntigravityCSRFToken = token
+		}
+	}
+
+	if logger != nil {
+		logger.Debug("Applied provider_settings from DB")
+	}
+}
+
+func (h *Handler) providerStatuses() []ProviderStatus {
+	vis := h.providerVisibilityMap()
+	catalog := providerCatalog()
+	statuses := make([]ProviderStatus, 0, len(catalog))
+	for _, p := range catalog {
+		status := ProviderStatus{
+			Key:              p.Key,
+			Name:             p.Name,
+			Description:      p.Description,
+			AutoDetectable:   p.AutoDetectable,
+			Configured:       h.isProviderConfigured(p.Key),
+			PollingEnabled:   h.providerPollingEnabled(p.Key, vis),
+			DashboardVisible: h.providerDashboardVisible(p.Key, vis),
+		}
+		if h.agentManager != nil {
+			status.IsPolling = h.agentManager.IsRunning(p.Key)
+		}
+		statuses = append(statuses, status)
+	}
+	return statuses
+}
+
+// ProvidersStatus returns status for all providers.
+func (h *Handler) ProvidersStatus(w http.ResponseWriter, r *http.Request) {
+	respondJSON(w, http.StatusOK, map[string]interface{}{
+		"providers": h.providerStatuses(),
+	})
+}
+
+// ToggleProvider updates provider polling/dashboard settings and reconciles agent state.
+func (h *Handler) ToggleProvider(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		respondError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+
+	var req struct {
+		Provider  string `json:"provider"`
+		Polling   *bool  `json:"polling,omitempty"`
+		Dashboard *bool  `json:"dashboard,omitempty"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		respondError(w, http.StatusBadRequest, "invalid request")
+		return
+	}
+
+	baseProvider := strings.TrimSpace(strings.ToLower(providerKeyBase(req.Provider)))
+	if baseProvider == "" {
+		respondError(w, http.StatusBadRequest, "provider is required")
+		return
+	}
+
+	valid := false
+	for _, p := range providerCatalog() {
+		if p.Key == baseProvider {
+			valid = true
+			break
+		}
+	}
+	if !valid {
+		respondError(w, http.StatusBadRequest, "unknown provider")
+		return
+	}
+
+	if req.Polling != nil && *req.Polling {
+		if !h.isProviderConfigured(baseProvider) && !h.tryAutoDetect(baseProvider) {
+			respondJSON(w, http.StatusOK, map[string]interface{}{
+				"success":        false,
+				"error":          "credentials_required",
+				"message":        "Provider requires configuration. Add credentials to ~/.oneauthwatch/.env",
+				"autoDetectable": baseProvider == "anthropic" || baseProvider == "codex" || baseProvider == "antigravity",
+			})
+			return
+		}
+	}
+
+	if err := h.setProviderVisibility(req.Provider, req.Polling, req.Dashboard); err != nil {
+		h.logger.Error("failed to save provider visibility", "provider", req.Provider, "error", err)
+		respondError(w, http.StatusInternalServerError, "failed to save provider settings")
+		return
+	}
+
+	if h.agentManager != nil && req.Polling != nil {
+		if *req.Polling {
+			if err := h.agentManager.Start(baseProvider); err != nil {
+				h.logger.Warn("failed to start provider agent", "provider", baseProvider, "error", err)
+			}
+		} else {
+			h.agentManager.Stop(baseProvider)
+		}
+	}
+
+	respondJSON(w, http.StatusOK, map[string]interface{}{
+		"success":    true,
+		"provider":   req.Provider,
+		"isPolling":  h.agentManager != nil && h.agentManager.IsRunning(baseProvider),
+		"configured": h.isProviderConfigured(baseProvider),
+	})
+}
+
+// ReloadProviders reloads provider configuration from env and reconciles runtime polling.
+func (h *Handler) ReloadProviders(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		respondError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	if h.config == nil {
+		respondError(w, http.StatusInternalServerError, "configuration not available")
+		return
+	}
+	cfg, err := config.Load()
+	if err != nil {
+		respondError(w, http.StatusInternalServerError, "failed to reload config")
+		return
+	}
+	applyProviderConfig(h.config, cfg)
+
+	// Apply provider_settings from DB (keys/regions set via UI override .env)
+	if h.store != nil {
+		ApplyProviderSettingsFromDB(h.store, h.config, h.logger)
+	}
+
+	if h.agentManager != nil {
+		vis := h.providerVisibilityMap()
+		for _, p := range providerCatalog() {
+			enabled := h.providerPollingEnabled(p.Key, vis)
+			if enabled && h.isProviderConfigured(p.Key) {
+				if err := h.agentManager.Start(p.Key); err != nil {
+					h.logger.Warn("provider start skipped after reload", "provider", p.Key, "error", err)
+				}
+			} else {
+				h.agentManager.Stop(p.Key)
+			}
+		}
+	}
+
+	respondJSON(w, http.StatusOK, map[string]interface{}{
+		"success":   true,
+		"providers": h.providerStatuses(),
+	})
+}
+
+// Providers returns available providers configuration
+func (h *Handler) Providers(w http.ResponseWriter, r *http.Request) {
+	if h.config == nil {
+		respondError(w, http.StatusInternalServerError, "configuration not available")
+		return
+	}
+
+	providers := h.config.AvailableProviders()
+
+	// Filter by provider_visibility dashboard flag
+	if h.store != nil {
+		if visJSON, _ := h.store.GetSetting("provider_visibility"); visJSON != "" {
+			var vis map[string]map[string]bool
+			if json.Unmarshal([]byte(visJSON), &vis) == nil {
+				filtered := make([]string, 0, len(providers))
+				for _, p := range providers {
+					if pv, ok := vis[p]; ok && !pv["dashboard"] {
+						continue
+					}
+					filtered = append(filtered, p)
+				}
+				providers = filtered
+			}
+		}
+	}
+
+	if h.config.HasMultipleProviders() {
+		providers = append(providers, "both")
+	}
+	current := ""
+	if len(providers) > 0 {
+		current = providers[0]
+	}
+
+	// Check if a specific provider was requested
+	if reqProvider := r.URL.Query().Get("provider"); reqProvider != "" {
+		reqProvider = strings.ToLower(reqProvider)
+		for _, p := range providers {
+			if p == reqProvider {
+				current = p
+				break
+			}
+		}
+	}
+
+	respondJSON(w, http.StatusOK, map[string]interface{}{
+		"providers": providers,
+		"current":   current,
+	})
+}
+
+// Dashboard renders the main dashboard page
+func (h *Handler) Dashboard(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != "/" {
+		http.NotFound(w, r)
+		return
+	}
+
+	data, err := staticFS.ReadFile("static/ui/index.html")
+	if err != nil {
+		h.logger.Error("failed to read React index.html", "error", err)
+		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Write(data)
+}
+
+// Current returns current quota status (API endpoint)
+func (h *Handler) Current(w http.ResponseWriter, r *http.Request) {
+	provider, err := h.getProviderFromRequest(r)
+	if err != nil {
+		respondError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	switch provider {
+	case "both":
+		h.currentBoth(w, r)
+	case "zai":
+		h.currentZai(w, r)
+	case "synthetic":
+		h.currentSynthetic(w, r)
+	case "anthropic":
+		h.currentAnthropic(w, r)
+	case "copilot":
+		h.currentCopilot(w, r)
+	case "codex":
+		h.currentCodex(w, r)
+	case "antigravity":
+		h.currentAntigravity(w, r)
+	case "minimax":
+		h.currentMiniMax(w, r)
+	case "openrouter":
+		h.currentOpenRouter(w, r)
+	case "gemini":
+		h.currentGemini(w, r)
+	default:
+		respondError(w, http.StatusBadRequest, fmt.Sprintf("unknown provider: %s", provider))
+	}
+}
+
+// currentBoth returns combined quota status for all configured providers.
+func (h *Handler) currentBoth(w http.ResponseWriter, r *http.Request) {
+	response := map[string]interface{}{}
+	visibility := h.providerVisibilitySettings()
+
+	if h.config.HasProvider("synthetic") && providerTelemetryEnabled(visibility, "synthetic") {
+		response["synthetic"] = h.buildSyntheticCurrent()
+	}
+	if h.config.HasProvider("zai") && providerTelemetryEnabled(visibility, "zai") {
+		response["zai"] = h.buildZaiCurrent()
+	}
+	if h.config.HasProvider("anthropic") && providerTelemetryEnabled(visibility, "anthropic") {
+		response["anthropic"] = h.buildAnthropicCurrent()
+	}
+	if h.config.HasProvider("copilot") && providerTelemetryEnabled(visibility, "copilot") {
+		response["copilot"] = h.buildCopilotCurrent()
+	}
+	if h.config.HasProvider("codex") && providerTelemetryEnabled(visibility, "codex") {
+		codexAccounts := h.codexUsageAccounts()
+		originalAccountCount := len(codexAccounts)
+		filteredAccounts := make([]map[string]interface{}, 0, len(codexAccounts))
+		for _, acc := range codexAccounts {
+			accountID := codexUsageAccountID(acc)
+			if codexAccountTelemetryEnabled(visibility, accountID) {
+				filteredAccounts = append(filteredAccounts, acc)
+			}
+		}
+		codexAccounts = filteredAccounts
+		if len(codexAccounts) > 1 {
+			response["codexAccounts"] = codexAccounts
+		} else if len(codexAccounts) == 1 {
+			response["codex"] = codexAccounts[0]
+		} else if originalAccountCount == 0 {
+			response["codex"] = h.buildCodexCurrent(DefaultCodexAccountID)
+		}
+	}
+	if h.config.HasProvider("antigravity") && providerTelemetryEnabled(visibility, "antigravity") {
+		response["antigravity"] = h.buildAntigravityCurrent()
+	}
+	if h.config.HasProvider("minimax") && providerTelemetryEnabled(visibility, "minimax") {
+		minimaxAccounts := h.minimaxUsageAccounts()
+		originalCount := len(minimaxAccounts)
+		filtered := make([]map[string]interface{}, 0, len(minimaxAccounts))
+		for _, acc := range minimaxAccounts {
+			accountID := minimaxUsageAccountID(acc)
+			if minimaxAccountTelemetryEnabled(visibility, accountID) {
+				filtered = append(filtered, acc)
+			}
+		}
+		minimaxAccounts = filtered
+		if len(minimaxAccounts) > 1 {
+			response["minimaxAccounts"] = minimaxAccounts
+		} else if len(minimaxAccounts) == 1 {
+			response["minimax"] = minimaxAccounts[0]
+		} else if originalCount == 0 {
+			response["minimax"] = h.buildMiniMaxCurrent(h.defaultMiniMaxAccountID())
+		}
+	}
+	if h.config.HasProvider("openrouter") && providerTelemetryEnabled(visibility, "openrouter") {
+		response["openrouter"] = h.buildOpenRouterCurrent()
+	}
+	if h.config.HasProvider("gemini") && providerTelemetryEnabled(visibility, "gemini") {
+		response["gemini"] = h.buildGeminiCurrent()
+	}
+	respondJSON(w, http.StatusOK, response)
+}
+
+// currentSynthetic returns Synthetic quota status
+func (h *Handler) currentSynthetic(w http.ResponseWriter, r *http.Request) {
+	respondJSON(w, http.StatusOK, h.buildSyntheticCurrent())
+}
+
+// buildSyntheticCurrent builds the Synthetic current quota response map.
+func (h *Handler) buildSyntheticCurrent() map[string]interface{} {
+	now := time.Now().UTC()
+	response := map[string]interface{}{
+		"capturedAt":   now.Format(time.RFC3339),
+		"subscription": buildEmptyQuotaResponse("Subscription", "Main API request quota for your plan"),
+		"search":       buildEmptyQuotaResponse("Search (Hourly)", "Search endpoint calls, resets every hour"),
+		"toolCalls":    buildEmptyQuotaResponse("Tool Call Discounts", "Discounted tool call requests"),
+	}
+
+	if h.store != nil && h.tracker != nil {
+		latest, err := h.store.QueryLatest()
+		if err != nil {
+			h.logger.Error("failed to query latest snapshot", "error", err)
+			return response
+		}
+
+		if latest != nil {
+			response["capturedAt"] = latest.CapturedAt.Format(time.RFC3339)
+			response["subscription"] = buildQuotaResponse("Subscription", "Main API request quota for your plan", latest.Sub, h.tracker, "subscription")
+			response["search"] = buildQuotaResponse("Search (Hourly)", "Search endpoint calls, resets every hour", latest.Search, h.tracker, "search")
+			response["toolCalls"] = buildQuotaResponse("Tool Call Discounts", "Discounted tool call requests", latest.ToolCall, h.tracker, "toolcall")
+		}
+	}
+
+	return response
+}
+
+// currentZai returns Z.ai quota status
+func (h *Handler) currentZai(w http.ResponseWriter, r *http.Request) {
+	respondJSON(w, http.StatusOK, h.buildZaiCurrent())
+}
+
+// buildZaiCurrent builds the Z.ai current quota response map.
+func (h *Handler) buildZaiCurrent() map[string]interface{} {
+	now := time.Now().UTC()
+	response := map[string]interface{}{
+		"capturedAt":  now.Format(time.RFC3339),
+		"tokensLimit": buildEmptyZaiQuotaResponse("Tokens Limit", "Token consumption budget"),
+		"timeLimit":   buildEmptyZaiQuotaResponse("Time Limit", "Tool call time budget"),
+		"toolCalls":   buildEmptyZaiQuotaResponse("Tool Calls", "Individual tool call breakdown"),
+	}
+
+	if h.store != nil {
+		latest, err := h.store.QueryLatestZai()
+		if err != nil {
+			h.logger.Error("failed to query latest Z.ai snapshot", "error", err)
+			return response
+		}
+
+		if latest != nil {
+			response["capturedAt"] = latest.CapturedAt.Format(time.RFC3339)
+			tokensResp := buildZaiTokensQuotaResponse(latest)
+			timeResp := buildZaiTimeQuotaResponse(latest)
+
+			// Enrich with tracker data (rate, projection)
+			if h.zaiTracker != nil {
+				if tokensSummary, err := h.zaiTracker.UsageSummary("tokens"); err == nil && tokensSummary != nil {
+					tokensResp["currentRate"] = tokensSummary.CurrentRate
+					tokensResp["projectedUsage"] = tokensSummary.ProjectedUsage
+				}
+				if timeSummary, err := h.zaiTracker.UsageSummary("time"); err == nil && timeSummary != nil {
+					timeResp["currentRate"] = timeSummary.CurrentRate
+					timeResp["projectedUsage"] = timeSummary.ProjectedUsage
+				}
+			}
+
+			response["tokensLimit"] = tokensResp
+			response["timeLimit"] = timeResp
+			response["toolCalls"] = buildZaiToolCallsResponse(latest)
+		}
+	}
+
+	return response
+}
+
+func buildEmptyQuotaResponse(name, description string) map[string]interface{} {
+	return map[string]interface{}{
+		"name":                  name,
+		"description":           description,
+		"usage":                 0.0,
+		"limit":                 0.0,
+		"percent":               0.0,
+		"status":                "healthy",
+		"renewsAt":              time.Now().UTC().Format(time.RFC3339),
+		"timeUntilReset":        "0m",
+		"timeUntilResetSeconds": 0,
+		"currentRate":           0.0,
+		"projectedUsage":        0.0,
+		"insight":               "No data available.",
+	}
+}
+
+func buildEmptyZaiQuotaResponse(name, description string) map[string]interface{} {
+	return map[string]interface{}{
+		"name":                  name,
+		"description":           description,
+		"usage":                 0.0,
+		"limit":                 0.0,
+		"percent":               0.0,
+		"status":                "healthy",
+		"renewsAt":              time.Now().UTC().Format(time.RFC3339),
+		"timeUntilReset":        "0m",
+		"timeUntilResetSeconds": 0,
+	}
+}
+
+func buildZaiTokensQuotaResponse(snapshot *api.ZaiSnapshot) map[string]interface{} {
+	// Z.ai API: "usage" = total budget/capacity, "currentValue" = actual usage
+	budget := snapshot.TokensUsage              // API's "usage" = total budget
+	currentUsage := snapshot.TokensCurrentValue // API's "currentValue" = actual usage
+	percent := float64(snapshot.TokensPercentage)
+
+	status := "healthy"
+	if percent >= 95 {
+		status = "critical"
+	} else if percent >= 80 {
+		status = "danger"
+	} else if percent >= 50 {
+		status = "warning"
+	}
+
+	result := map[string]interface{}{
+		"name":        "Tokens Limit",
+		"description": "Token consumption budget",
+		"usage":       currentUsage,
+		"limit":       budget,
+		"percent":     percent,
+		"status":      status,
+	}
+
+	if snapshot.TokensNextResetTime != nil {
+		timeUntilReset := time.Until(*snapshot.TokensNextResetTime)
+		result["renewsAt"] = snapshot.TokensNextResetTime.Format(time.RFC3339)
+		result["timeUntilReset"] = formatDuration(timeUntilReset)
+		result["timeUntilResetSeconds"] = int64(timeUntilReset.Seconds())
+	} else {
+		result["renewsAt"] = time.Now().UTC().Format(time.RFC3339)
+		result["timeUntilReset"] = "N/A"
+		result["timeUntilResetSeconds"] = 0
+	}
+
+	return result
+}
+
+func buildZaiTimeQuotaResponse(snapshot *api.ZaiSnapshot) map[string]interface{} {
+	// Z.ai API: "usage" = total budget/capacity, "currentValue" = actual usage
+	budget := snapshot.TimeUsage              // API's "usage" = total budget
+	currentUsage := snapshot.TimeCurrentValue // API's "currentValue" = actual usage
+	percent := float64(snapshot.TimePercentage)
+
+	status := "healthy"
+	if percent >= 95 {
+		status = "critical"
+	} else if percent >= 80 {
+		status = "danger"
+	} else if percent >= 50 {
+		status = "warning"
+	}
+
+	return map[string]interface{}{
+		"name":                  "Time Limit",
+		"description":           "Tool call time budget",
+		"usage":                 currentUsage,
+		"limit":                 budget,
+		"percent":               percent,
+		"status":                status,
+		"renewsAt":              time.Now().UTC().Format(time.RFC3339),
+		"timeUntilReset":        "N/A",
+		"timeUntilResetSeconds": 0,
+	}
+}
+
+func buildZaiToolCallsResponse(snapshot *api.ZaiSnapshot) map[string]interface{} {
+	var totalCalls float64
+	var details []api.ZaiUsageDetail
+
+	if snapshot.TimeUsageDetails != "" {
+		if err := json.Unmarshal([]byte(snapshot.TimeUsageDetails), &details); err == nil {
+			for _, d := range details {
+				totalCalls += d.Usage
+			}
+		}
+	}
+
+	budget := snapshot.TimeUsage // tool calls draw from the time budget
+	percent := 0.0
+	if budget > 0 {
+		percent = (totalCalls / budget) * 100
+	}
+
+	status := "healthy"
+	if percent >= 95 {
+		status = "critical"
+	} else if percent >= 80 {
+		status = "danger"
+	} else if percent >= 50 {
+		status = "warning"
+	}
+
+	result := map[string]interface{}{
+		"name":                  "Tool Calls",
+		"description":           "Individual tool call breakdown",
+		"usage":                 totalCalls,
+		"limit":                 budget,
+		"percent":               percent,
+		"status":                status,
+		"renewsAt":              time.Now().UTC().Format(time.RFC3339),
+		"timeUntilReset":        "N/A",
+		"timeUntilResetSeconds": 0,
+	}
+
+	if len(details) > 0 {
+		result["usageDetails"] = details
+	}
+
+	return result
+}
+
+// zaiToolCallsPercent computes the tool calls utilization from a Z.ai snapshot's time_usage_details.
+func zaiToolCallsPercent(snapshot *api.ZaiSnapshot) float64 {
+	if snapshot.TimeUsageDetails == "" || snapshot.TimeUsage <= 0 {
+		return 0
+	}
+	var details []api.ZaiUsageDetail
+	if err := json.Unmarshal([]byte(snapshot.TimeUsageDetails), &details); err != nil {
+		return 0
+	}
+	var totalCalls float64
+	for _, d := range details {
+		totalCalls += d.Usage
+	}
+	return (totalCalls / snapshot.TimeUsage) * 100
+}
+
+func buildQuotaResponse(name, description string, info api.QuotaInfo, tr *tracker.Tracker, quotaType string) map[string]interface{} {
+	timeUntilReset := time.Until(info.RenewsAt)
+
+	percent := 0.0
+	if info.Limit > 0 {
+		percent = (info.Requests / info.Limit) * 100
+	}
+
+	status := "healthy"
+	if percent >= 95 {
+		status = "critical"
+	} else if percent >= 80 {
+		status = "danger"
+	} else if percent >= 50 {
+		status = "warning"
+	}
+
+	result := map[string]interface{}{
+		"name":                  name,
+		"description":           description,
+		"usage":                 info.Requests,
+		"limit":                 info.Limit,
+		"percent":               percent,
+		"status":                status,
+		"renewsAt":              info.RenewsAt.Format(time.RFC3339),
+		"timeUntilReset":        formatDuration(timeUntilReset),
+		"timeUntilResetSeconds": int64(timeUntilReset.Seconds()),
+	}
+
+	// Get summary for rate and projection
+	if tr != nil {
+		summary, err := tr.UsageSummary(quotaType)
+		if err == nil && summary != nil {
+			result["currentRate"] = summary.CurrentRate
+			result["projectedUsage"] = summary.ProjectedUsage
+			result["insight"] = buildInsight(name, info, percent, summary)
+		}
+	}
+
+	// Ensure defaults if summary failed
+	if _, ok := result["currentRate"]; !ok {
+		result["currentRate"] = 0.0
+		result["projectedUsage"] = 0.0
+		result["insight"] = buildInsight(name, info, percent, nil)
+	}
+
+	return result
+}
+
+func buildInsight(name string, info api.QuotaInfo, percent float64, summary *tracker.Summary) string {
+	if info.Limit == 0 {
+		return "No data available."
+	}
+
+	if percent == 0 {
+		return fmt.Sprintf("No %s requests in this cycle.", strings.ToLower(name))
+	}
+
+	if summary != nil && summary.ProjectedUsage > 0 {
+		return fmt.Sprintf("You've used %.1f%% of your %.0f request quota. At current rate, projected %.0f before reset (%.1f%% of limit).",
+			percent, info.Limit, summary.ProjectedUsage, (summary.ProjectedUsage/info.Limit)*100)
+	}
+
+	return fmt.Sprintf("You've used %.1f%% of your %.0f request quota.", percent, info.Limit)
+}
+
+// History returns usage history (API endpoint)
+func (h *Handler) History(w http.ResponseWriter, r *http.Request) {
+	provider, err := h.getProviderFromRequest(r)
+	if err != nil {
+		respondError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	switch provider {
+	case "both":
+		h.historyBoth(w, r)
+	case "zai":
+		h.historyZai(w, r)
+	case "synthetic":
+		h.historySynthetic(w, r)
+	case "anthropic":
+		h.historyAnthropic(w, r)
+	case "copilot":
+		h.historyCopilot(w, r)
+	case "codex":
+		h.historyCodex(w, r)
+	case "antigravity":
+		h.historyAntigravity(w, r)
+	case "minimax":
+		h.historyMiniMax(w, r)
+	case "openrouter":
+		h.historyOpenRouter(w, r)
+	case "gemini":
+		h.historyGemini(w, r)
+	default:
+		respondError(w, http.StatusBadRequest, fmt.Sprintf("unknown provider: %s", provider))
+	}
+}
+
+// historyBoth returns both providers' history.
+func (h *Handler) historyBoth(w http.ResponseWriter, r *http.Request) {
+	response := map[string]interface{}{}
+	visibility := h.providerVisibilitySettings()
+
+	rangeStr := r.URL.Query().Get("range")
+	duration, err := parseTimeRange(rangeStr)
+	if err != nil {
+		respondError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	now := time.Now().UTC()
+	start := now.Add(-duration)
+
+	if h.config.HasProvider("synthetic") && providerTelemetryEnabled(visibility, "synthetic") && h.store != nil {
+		snapshots, err := h.store.QueryRange(start, now)
+		if err == nil {
+			step := downsampleStep(len(snapshots), maxChartPoints)
+			last := len(snapshots) - 1
+			synData := make([]map[string]interface{}, 0, min(len(snapshots), maxChartPoints))
+			for i, s := range snapshots {
+				if step > 1 && i != 0 && i != last && i%step != 0 {
+					continue
+				}
+				subPct, searchPct, toolPct := 0.0, 0.0, 0.0
+				if s.Sub.Limit > 0 {
+					subPct = (s.Sub.Requests / s.Sub.Limit) * 100
+				}
+				if s.Search.Limit > 0 {
+					searchPct = (s.Search.Requests / s.Search.Limit) * 100
+				}
+				if s.ToolCall.Limit > 0 {
+					toolPct = (s.ToolCall.Requests / s.ToolCall.Limit) * 100
+				}
+				synData = append(synData, map[string]interface{}{
+					"capturedAt":          s.CapturedAt.Format(time.RFC3339),
+					"subscription":        s.Sub.Requests,
+					"subscriptionLimit":   s.Sub.Limit,
+					"subscriptionPercent": subPct,
+					"search":              s.Search.Requests,
+					"searchLimit":         s.Search.Limit,
+					"searchPercent":       searchPct,
+					"toolCalls":           s.ToolCall.Requests,
+					"toolCallsLimit":      s.ToolCall.Limit,
+					"toolCallsPercent":    toolPct,
+				})
+			}
+			response["synthetic"] = synData
+		}
+	}
+
+	if h.config.HasProvider("zai") && providerTelemetryEnabled(visibility, "zai") && h.store != nil {
+		snapshots, err := h.store.QueryZaiRange(start, now)
+		if err == nil {
+			step := downsampleStep(len(snapshots), maxChartPoints)
+			last := len(snapshots) - 1
+			zaiData := make([]map[string]interface{}, 0, min(len(snapshots), maxChartPoints))
+			for i, s := range snapshots {
+				if step > 1 && i != 0 && i != last && i%step != 0 {
+					continue
+				}
+				zaiData = append(zaiData, map[string]interface{}{
+					"capturedAt":       s.CapturedAt.Format(time.RFC3339),
+					"tokensLimit":      s.TokensUsage,
+					"tokensUsage":      s.TokensCurrentValue,
+					"tokensPercent":    float64(s.TokensPercentage),
+					"timeLimit":        s.TimeUsage,
+					"timeUsage":        s.TimeCurrentValue,
+					"timePercent":      float64(s.TimePercentage),
+					"toolCallsPercent": zaiToolCallsPercent(s),
+				})
+			}
+			response["zai"] = zaiData
+		}
+	}
+
+	if h.config.HasProvider("anthropic") && providerTelemetryEnabled(visibility, "anthropic") && h.store != nil {
+		snapshots, err := h.store.QueryAnthropicRange(start, now)
+		if err == nil {
+			step := downsampleStep(len(snapshots), maxChartPoints)
+			last := len(snapshots) - 1
+			anthData := make([]map[string]interface{}, 0, min(len(snapshots), maxChartPoints))
+			for i, snap := range snapshots {
+				if step > 1 && i != 0 && i != last && i%step != 0 {
+					continue
+				}
+				entry := map[string]interface{}{
+					"capturedAt": snap.CapturedAt.Format(time.RFC3339),
+				}
+				for _, q := range snap.Quotas {
+					entry[q.Name] = q.Utilization
+				}
+				anthData = append(anthData, entry)
+			}
+			response["anthropic"] = anthData
+		}
+	}
+
+	if h.config.HasProvider("copilot") && providerTelemetryEnabled(visibility, "copilot") && h.store != nil {
+		snapshots, err := h.store.QueryCopilotRange(start, now)
+		if err == nil {
+			step := downsampleStep(len(snapshots), maxChartPoints)
+			last := len(snapshots) - 1
+			copData := make([]map[string]interface{}, 0, min(len(snapshots), maxChartPoints))
+			for i, snap := range snapshots {
+				if step > 1 && i != 0 && i != last && i%step != 0 {
+					continue
+				}
+				entry := map[string]interface{}{
+					"capturedAt": snap.CapturedAt.Format(time.RFC3339),
+				}
+				for _, q := range snap.Quotas {
+					if q.Entitlement > 0 {
+						entry[q.Name] = float64(q.Entitlement-q.Remaining) / float64(q.Entitlement) * 100
+					}
+				}
+				copData = append(copData, entry)
+			}
+			response["copilot"] = copData
+		}
+	}
+
+	if h.config.HasProvider("codex") && providerTelemetryEnabled(visibility, "codex") && h.store != nil {
+		codexAccounts := h.codexUsageAccounts()
+		codexHistories := make([]map[string]interface{}, 0, len(codexAccounts))
+		for _, acc := range codexAccounts {
+			accountID := codexUsageAccountID(acc)
+			if !codexAccountTelemetryEnabled(visibility, accountID) {
+				continue
+			}
+			snapshots, err := h.store.QueryCodexRange(accountID, start, now)
+			if err != nil {
+				continue
+			}
+			step := downsampleStep(len(snapshots), maxChartPoints)
+			last := len(snapshots) - 1
+			codexData := make([]map[string]interface{}, 0, min(len(snapshots), maxChartPoints))
+			for i, snap := range snapshots {
+				if step > 1 && i != 0 && i != last && i%step != 0 {
+					continue
+				}
+				entry := map[string]interface{}{
+					"capturedAt": snap.CapturedAt.Format(time.RFC3339),
+				}
+				for _, q := range snap.Quotas {
+					name := codexNormalizedQuotaName(snap.PlanType, q.Name)
+					entry[name] = q.Utilization
+				}
+				codexData = append(codexData, entry)
+			}
+			codexHistories = append(codexHistories, map[string]interface{}{
+				"accountId":   accountID,
+				"accountName": codexUsageAccountName(acc),
+				"history":     codexData,
+			})
+		}
+
+		if len(codexHistories) == 1 {
+			if single, ok := codexHistories[0]["history"]; ok {
+				response["codex"] = single
+			}
+		}
+		if len(codexHistories) > 0 {
+			response["codexAccounts"] = codexHistories
+		}
+	}
+
+	if h.config.HasProvider("antigravity") && providerTelemetryEnabled(visibility, "antigravity") && h.store != nil {
+		snapshots, err := h.store.QueryAntigravityRange(start, now)
+		if err == nil {
+			step := downsampleStep(len(snapshots), maxChartPoints)
+			last := len(snapshots) - 1
+			antData := make([]map[string]interface{}, 0, min(len(snapshots), maxChartPoints))
+			for i, snap := range snapshots {
+				if step > 1 && i != 0 && i != last && i%step != 0 {
+					continue
+				}
+				entry := map[string]interface{}{
+					"capturedAt": snap.CapturedAt.Format(time.RFC3339),
+				}
+				for _, model := range snap.Models {
+					entry[model.ModelID] = 100 - model.RemainingPercent
+				}
+				antData = append(antData, entry)
+			}
+			response["antigravity"] = antData
+		}
+	}
+
+	if h.config.HasProvider("minimax") && providerTelemetryEnabled(visibility, "minimax") && h.store != nil {
+		minimaxAccounts := h.minimaxUsageAccounts()
+		minimaxHistories := make([]map[string]interface{}, 0, len(minimaxAccounts))
+		for _, acc := range minimaxAccounts {
+			accountID := minimaxUsageAccountID(acc)
+			if !minimaxAccountTelemetryEnabled(visibility, accountID) {
+				continue
+			}
+			snapshots, err := h.store.QueryMiniMaxRange(start, now, accountID)
+			if err != nil {
+				continue
+			}
+			step := downsampleStep(len(snapshots), maxChartPoints)
+			last := len(snapshots) - 1
+			mmData := make([]map[string]interface{}, 0, min(len(snapshots), maxChartPoints))
+			for i, snap := range snapshots {
+				if step > 1 && i != 0 && i != last && i%step != 0 {
+					continue
+				}
+				entry := map[string]interface{}{
+					"capturedAt": snap.CapturedAt.Format(time.RFC3339),
+				}
+				for _, g := range snap.GroupByPool() {
+					entry[api.MiniMaxGroupDisplayName(g.ModelNames)] = g.Quota.UsedPercent
+				}
+				mmData = append(mmData, entry)
+			}
+			minimaxHistories = append(minimaxHistories, map[string]interface{}{
+				"accountId":   accountID,
+				"accountName": minimaxUsageAccountName(acc),
+				"history":     mmData,
+			})
+		}
+
+		if len(minimaxHistories) == 1 {
+			if single, ok := minimaxHistories[0]["history"]; ok {
+				response["minimax"] = single
+			}
+		}
+		if len(minimaxHistories) > 0 {
+			response["minimaxAccounts"] = minimaxHistories
+		}
+	}
+
+	if h.config.HasProvider("openrouter") && providerTelemetryEnabled(visibility, "openrouter") && h.store != nil {
+		snapshots, err := h.store.QueryOpenRouterRange(start, now)
+		if err == nil {
+			step := downsampleStep(len(snapshots), maxChartPoints)
+			last := len(snapshots) - 1
+			orData := make([]map[string]interface{}, 0, min(len(snapshots), maxChartPoints))
+			for i, s := range snapshots {
+				if step > 1 && i != 0 && i != last && i%step != 0 {
+					continue
+				}
+				entry := map[string]interface{}{
+					"capturedAt": s.CapturedAt.Format(time.RFC3339),
+					"usage":      s.Usage,
+					"usageDaily": s.UsageDaily,
+					"isFreeTier": s.IsFreeTier,
+				}
+				if s.Limit != nil {
+					entry["limit"] = *s.Limit
+					if *s.Limit > 0 {
+						entry["percent"] = (s.Usage / *s.Limit) * 100
+					}
+				}
+				orData = append(orData, entry)
+			}
+			response["openrouter"] = orData
+		}
+	}
+
+	if h.config.HasProvider("gemini") && providerTelemetryEnabled(visibility, "gemini") && h.store != nil {
+		snapshots, err := h.store.QueryGeminiRange(start, now)
+		if err == nil {
+			// Filter empty snapshots and aggregate by family
+			var valid []*api.GeminiSnapshot
+			for _, s := range snapshots {
+				if len(s.Quotas) > 0 {
+					valid = append(valid, s)
+				}
+			}
+			step := downsampleStep(len(valid), maxChartPoints)
+			last := len(valid) - 1
+			gemData := make([]map[string]interface{}, 0, min(len(valid), maxChartPoints))
+			for i, snap := range valid {
+				if step > 1 && i != 0 && i != last && i%step != 0 {
+					continue
+				}
+				entry := map[string]interface{}{"capturedAt": snap.CapturedAt.Format(time.RFC3339)}
+				families := api.AggregateGeminiByFamily(snap.Quotas)
+				for _, fq := range families {
+					entry[fq.FamilyID] = fq.UsagePercent
+				}
+				gemData = append(gemData, entry)
+			}
+			response["gemini"] = gemData
+		}
+	}
+
+	respondJSON(w, http.StatusOK, response)
+}
+
+// historySynthetic returns Synthetic usage history
+func (h *Handler) historySynthetic(w http.ResponseWriter, r *http.Request) {
+	if h.store == nil {
+		respondJSON(w, http.StatusOK, []interface{}{})
+		return
+	}
+
+	rangeStr := r.URL.Query().Get("range")
+	duration, err := parseTimeRange(rangeStr)
+	if err != nil {
+		respondError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	now := time.Now().UTC()
+	start := now.Add(-duration)
+	end := now
+
+	snapshots, err := h.store.QueryRange(start, end)
+	if err != nil {
+		h.logger.Error("failed to query history", "error", err)
+		respondError(w, http.StatusInternalServerError, "failed to query history")
+		return
+	}
+
+	step := downsampleStep(len(snapshots), maxChartPoints)
+	last := len(snapshots) - 1
+	response := make([]map[string]interface{}, 0, min(len(snapshots), maxChartPoints))
+	for i, snapshot := range snapshots {
+		if step > 1 && i != 0 && i != last && i%step != 0 {
+			continue
+		}
+
+		subPercent := 0.0
+		if snapshot.Sub.Limit > 0 {
+			subPercent = (snapshot.Sub.Requests / snapshot.Sub.Limit) * 100
+		}
+
+		searchPercent := 0.0
+		if snapshot.Search.Limit > 0 {
+			searchPercent = (snapshot.Search.Requests / snapshot.Search.Limit) * 100
+		}
+
+		toolPercent := 0.0
+		if snapshot.ToolCall.Limit > 0 {
+			toolPercent = (snapshot.ToolCall.Requests / snapshot.ToolCall.Limit) * 100
+		}
+
+		response = append(response, map[string]interface{}{
+			"capturedAt":          snapshot.CapturedAt.Format(time.RFC3339),
+			"subscription":        snapshot.Sub.Requests,
+			"subscriptionLimit":   snapshot.Sub.Limit,
+			"subscriptionPercent": subPercent,
+			"search":              snapshot.Search.Requests,
+			"searchLimit":         snapshot.Search.Limit,
+			"searchPercent":       searchPercent,
+			"toolCalls":           snapshot.ToolCall.Requests,
+			"toolCallsLimit":      snapshot.ToolCall.Limit,
+			"toolCallsPercent":    toolPercent,
+		})
+	}
+
+	respondJSON(w, http.StatusOK, response)
+}
+
+// historyZai returns Z.ai usage history
+func (h *Handler) historyZai(w http.ResponseWriter, r *http.Request) {
+	if h.store == nil {
+		respondJSON(w, http.StatusOK, []interface{}{})
+		return
+	}
+
+	rangeStr := r.URL.Query().Get("range")
+	duration, err := parseTimeRange(rangeStr)
+	if err != nil {
+		respondError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	now := time.Now().UTC()
+	start := now.Add(-duration)
+	end := now
+
+	snapshots, err := h.store.QueryZaiRange(start, end)
+	if err != nil {
+		h.logger.Error("failed to query Z.ai history", "error", err)
+		respondError(w, http.StatusInternalServerError, "failed to query history")
+		return
+	}
+
+	step := downsampleStep(len(snapshots), maxChartPoints)
+	last := len(snapshots) - 1
+	response := make([]map[string]interface{}, 0, min(len(snapshots), maxChartPoints))
+	for i, snapshot := range snapshots {
+		if step > 1 && i != 0 && i != last && i%step != 0 {
+			continue
+		}
+		// Z.ai API: "usage" = budget, "currentValue" = actual usage, "percentage" = server %
+		response = append(response, map[string]interface{}{
+			"capturedAt":       snapshot.CapturedAt.Format(time.RFC3339),
+			"tokensLimit":      snapshot.TokensUsage,        // budget
+			"tokensUsage":      snapshot.TokensCurrentValue, // actual usage
+			"tokensPercent":    float64(snapshot.TokensPercentage),
+			"timeLimit":        snapshot.TimeUsage,        // budget
+			"timeUsage":        snapshot.TimeCurrentValue, // actual usage
+			"timePercent":      float64(snapshot.TimePercentage),
+			"toolCallsPercent": zaiToolCallsPercent(snapshot),
+		})
+	}
+
+	respondJSON(w, http.StatusOK, response)
+}
+
+// currentOpenRouter returns OpenRouter credits status
+func (h *Handler) currentOpenRouter(w http.ResponseWriter, r *http.Request) {
+	respondJSON(w, http.StatusOK, h.buildOpenRouterCurrent())
+}
+
+// buildOpenRouterCurrent builds the OpenRouter current credits response map.
+func (h *Handler) buildOpenRouterCurrent() map[string]interface{} {
+	now := time.Now().UTC()
+	response := map[string]interface{}{
+		"capturedAt": now.Format(time.RFC3339),
+		"credits": map[string]interface{}{
+			"name":        "Credits",
+			"description": "OpenRouter API credits usage",
+			"usage":       0.0,
+			"limit":       nil,
+			"remaining":   nil,
+			"percent":     0.0,
+			"isFreeTier":  false,
+			"rate":        0.0,
+			"projected":   0.0,
+		},
+	}
+
+	if h.store != nil {
+		latest, err := h.store.QueryLatestOpenRouter()
+		if err != nil {
+			h.logger.Error("failed to query latest OpenRouter snapshot", "error", err)
+			return response
+		}
+
+		if latest != nil {
+			response["capturedAt"] = latest.CapturedAt.Format(time.RFC3339)
+			credits := map[string]interface{}{
+				"name":        "Credits",
+				"description": "OpenRouter API credits usage",
+				"usage":       latest.Usage,
+				"usageDaily":  latest.UsageDaily,
+				"limit":       nil,
+				"remaining":   nil,
+				"percent":     0.0,
+				"isFreeTier":  latest.IsFreeTier,
+				"rate":        0.0,
+				"projected":   0.0,
+			}
+			if latest.Limit != nil && *latest.Limit > 0 {
+				credits["limit"] = *latest.Limit
+				credits["percent"] = (latest.Usage / *latest.Limit) * 100
+			}
+			if latest.LimitRemaining != nil {
+				credits["remaining"] = *latest.LimitRemaining
+			}
+
+			// Enrich with tracker data
+			if h.openrouterTracker != nil {
+				if summary, err := h.openrouterTracker.UsageSummary(); err == nil && summary != nil {
+					credits["rate"] = summary.CurrentRate
+					credits["projected"] = summary.ProjectedUsage
+					credits["completedCycles"] = summary.CompletedCycles
+					credits["avgPerCycle"] = summary.AvgPerCycle
+					credits["peakCycle"] = summary.PeakCycle
+					credits["totalTracked"] = summary.TotalTracked
+					if !summary.TrackingSince.IsZero() {
+						credits["trackingSince"] = summary.TrackingSince.Format(time.RFC3339)
+					}
+				}
+			}
+
+			response["credits"] = credits
+		}
+	}
+
+	return response
+}
+
+// historyOpenRouter returns OpenRouter usage history
+func (h *Handler) historyOpenRouter(w http.ResponseWriter, r *http.Request) {
+	if h.store == nil {
+		respondJSON(w, http.StatusOK, []interface{}{})
+		return
+	}
+
+	rangeStr := r.URL.Query().Get("range")
+	duration, err := parseTimeRange(rangeStr)
+	if err != nil {
+		respondError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	now := time.Now().UTC()
+	start := now.Add(-duration)
+	end := now
+
+	snapshots, err := h.store.QueryOpenRouterRange(start, end)
+	if err != nil {
+		h.logger.Error("failed to query OpenRouter history", "error", err)
+		respondError(w, http.StatusInternalServerError, "failed to query history")
+		return
+	}
+
+	step := downsampleStep(len(snapshots), maxChartPoints)
+	last := len(snapshots) - 1
+	histResp := make([]map[string]interface{}, 0, min(len(snapshots), maxChartPoints))
+	for i, snapshot := range snapshots {
+		if step > 1 && i != 0 && i != last && i%step != 0 {
+			continue
+		}
+		entry := map[string]interface{}{
+			"capturedAt": snapshot.CapturedAt.Format(time.RFC3339),
+			"usage":      snapshot.Usage,
+			"usageDaily": snapshot.UsageDaily,
+		}
+		if snapshot.Limit != nil && *snapshot.Limit > 0 {
+			entry["percent"] = (snapshot.Usage / *snapshot.Limit) * 100
+		}
+		histResp = append(histResp, entry)
+	}
+
+	respondJSON(w, http.StatusOK, histResp)
+}
+
+// cyclesOpenRouter returns OpenRouter cycle data
+func (h *Handler) cyclesOpenRouter(w http.ResponseWriter, r *http.Request) {
+	if h.store == nil {
+		respondJSON(w, http.StatusOK, []interface{}{})
+		return
+	}
+
+	quotaType := "credits"
+	response := make([]map[string]interface{}, 0)
+
+	active, err := h.store.QueryActiveOpenRouterCycle(quotaType)
+	if err != nil {
+		h.logger.Error("failed to query active OpenRouter cycle", "error", err)
+		respondError(w, http.StatusInternalServerError, "failed to query cycles")
+		return
+	}
+
+	if active != nil {
+		response = append(response, openrouterCycleToMap(active))
+	}
+
+	history, err := h.store.QueryOpenRouterCycleHistory(quotaType, 200)
+	if err != nil {
+		h.logger.Error("failed to query OpenRouter cycle history", "error", err)
+		respondError(w, http.StatusInternalServerError, "failed to query cycles")
+		return
+	}
+
+	for _, cycle := range history {
+		response = append(response, openrouterCycleToMap(cycle))
+	}
+
+	respondJSON(w, http.StatusOK, response)
+}
+
+func openrouterCycleToMap(cycle *store.OpenRouterResetCycle) map[string]interface{} {
+	result := map[string]interface{}{
+		"id":           cycle.ID,
+		"quotaType":    cycle.QuotaType,
+		"cycleStart":   cycle.CycleStart.Format(time.RFC3339),
+		"cycleEnd":     nil,
+		"peakRequests": cycle.PeakUsage,
+		"totalDelta":   cycle.TotalDelta,
+	}
+
+	if cycle.CycleEnd != nil {
+		result["cycleEnd"] = cycle.CycleEnd.Format(time.RFC3339)
+	}
+
+	return result
+}
+
+// summaryOpenRouter returns OpenRouter usage summary
+func (h *Handler) summaryOpenRouter(w http.ResponseWriter, r *http.Request) {
+	respondJSON(w, http.StatusOK, h.buildOpenRouterSummaryMap())
+}
+
+// buildOpenRouterSummaryMap builds the OpenRouter summary response.
+func (h *Handler) buildOpenRouterSummaryMap() map[string]interface{} {
+	response := map[string]interface{}{
+		"credits": map[string]interface{}{
+			"quotaType":       "credits",
+			"currentUsage":    0.0,
+			"currentLimit":    0.0,
+			"usagePercent":    0.0,
+			"currentRate":     0.0,
+			"projectedUsage":  0.0,
+			"completedCycles": 0,
+			"avgPerCycle":     0.0,
+			"peakCycle":       0.0,
+			"totalTracked":    0.0,
+			"trackingSince":   nil,
+		},
+	}
+
+	if h.openrouterTracker != nil {
+		if summary, err := h.openrouterTracker.UsageSummary(); err == nil && summary != nil {
+			response["credits"] = map[string]interface{}{
+				"quotaType":       summary.QuotaType,
+				"currentUsage":    summary.CurrentUsage,
+				"currentLimit":    summary.CurrentLimit,
+				"usagePercent":    summary.UsagePercent,
+				"currentRate":     summary.CurrentRate,
+				"projectedUsage":  summary.ProjectedUsage,
+				"completedCycles": summary.CompletedCycles,
+				"avgPerCycle":     summary.AvgPerCycle,
+				"peakCycle":       summary.PeakCycle,
+				"totalTracked":    summary.TotalTracked,
+				"trackingSince":   nil,
+				"isFreeTier":      summary.IsFreeTier,
+			}
+			if !summary.TrackingSince.IsZero() {
+				response["credits"].(map[string]interface{})["trackingSince"] = summary.TrackingSince.Format(time.RFC3339)
+			}
+		}
+		return response
+	}
+
+	// Fallback to snapshot-only summary
+	if h.store != nil {
+		latest, err := h.store.QueryLatestOpenRouter()
+		if err != nil {
+			h.logger.Error("failed to query latest OpenRouter snapshot", "error", err)
+			return response
+		}
+		if latest != nil {
+			creditsMap := response["credits"].(map[string]interface{})
+			creditsMap["currentUsage"] = latest.Usage
+			if latest.Limit != nil && *latest.Limit > 0 {
+				creditsMap["currentLimit"] = *latest.Limit
+				creditsMap["usagePercent"] = (latest.Usage / *latest.Limit) * 100
+			}
+		}
+	}
+
+	return response
+}
+
+// insightsOpenRouter returns OpenRouter insights
+func (h *Handler) insightsOpenRouter(w http.ResponseWriter, r *http.Request, rangeDur time.Duration) {
+	hidden := h.getHiddenInsightKeys()
+	respondJSON(w, http.StatusOK, h.buildOpenRouterInsights(hidden))
+}
+
+// buildOpenRouterInsights builds the OpenRouter insights response.
+func (h *Handler) buildOpenRouterInsights(hidden map[string]bool) insightsResponse {
+	resp := insightsResponse{Stats: []insightStat{}, Insights: []insightItem{}}
+
+	if h.store == nil {
+		return resp
+	}
+
+	latest, err := h.store.QueryLatestOpenRouter()
+	if err != nil {
+		h.logger.Error("failed to query OpenRouter data for insights", "error", err)
+		return resp
+	}
+
+	if latest == nil {
+		resp.Insights = append(resp.Insights, insightItem{
+			Type: "info", Severity: "info",
+			Title: "Getting Started",
+			Desc:  "Keep onWatch running to collect OpenRouter usage data. Insights appear after a few snapshots.",
+		})
+		return resp
+	}
+
+	now := time.Now().UTC()
+
+	// Stats cards
+	if !hidden["usage"] {
+		usageLabel := fmt.Sprintf("$%.4f", latest.Usage)
+		resp.Stats = append(resp.Stats, insightStat{
+			Label: "Total Usage", Value: usageLabel, Sublabel: "credits consumed",
+		})
+	}
+
+	if !hidden["daily_usage"] {
+		dailyLabel := fmt.Sprintf("$%.4f", latest.UsageDaily)
+		resp.Stats = append(resp.Stats, insightStat{
+			Label: "Daily Usage", Value: dailyLabel, Sublabel: "today",
+		})
+	}
+
+	if latest.Limit != nil && *latest.Limit > 0 && !hidden["remaining"] {
+		remaining := *latest.Limit - latest.Usage
+		if remaining < 0 {
+			remaining = 0
+		}
+		pct := (latest.Usage / *latest.Limit) * 100
+		resp.Stats = append(resp.Stats, insightStat{
+			Label: "Remaining", Value: fmt.Sprintf("$%.4f", remaining), Sublabel: fmt.Sprintf("%.1f%% used", pct),
+		})
+	}
+
+	if h.openrouterTracker != nil {
+		if summary, err := h.openrouterTracker.UsageSummary(); err == nil && summary != nil {
+			if !hidden["rate"] && summary.CurrentRate > 0 {
+				resp.Stats = append(resp.Stats, insightStat{
+					Label: "Usage Rate", Value: fmt.Sprintf("$%.4f/hr", summary.CurrentRate), Sublabel: "current rate",
+				})
+			}
+		}
+	}
+
+	// Insights
+	if latest.IsFreeTier && !hidden["free_tier"] {
+		resp.Insights = append(resp.Insights, insightItem{
+			Type: "info", Severity: "info",
+			Title: "Free Tier",
+			Desc:  "You're on the OpenRouter free tier. Some models may have limited access.",
+		})
+	}
+
+	if latest.Limit != nil && *latest.Limit > 0 {
+		pct := (latest.Usage / *latest.Limit) * 100
+		if pct >= 90 && !hidden["high_usage"] {
+			resp.Insights = append(resp.Insights, insightItem{
+				Type: "warning", Severity: "high",
+				Title: "High Credit Usage",
+				Desc:  fmt.Sprintf("You've used %.1f%% of your $%.2f credit limit.", pct, *latest.Limit),
+			})
+		} else if pct >= 75 && !hidden["moderate_usage"] {
+			resp.Insights = append(resp.Insights, insightItem{
+				Type: "info", Severity: "medium",
+				Title: "Moderate Credit Usage",
+				Desc:  fmt.Sprintf("You've used %.1f%% of your $%.2f credit limit.", pct, *latest.Limit),
+			})
+		}
+	}
+
+	_ = now // for potential future time-based insights
+
+	return resp
+}
+
+// cycleOverviewOpenRouter returns OpenRouter cycle overview.
+func (h *Handler) cycleOverviewOpenRouter(w http.ResponseWriter, r *http.Request) {
+	if h.store == nil {
+		respondJSON(w, http.StatusOK, map[string]interface{}{"cycles": []interface{}{}})
+		return
+	}
+
+	quotaType := "credits"
+	var cycles []map[string]interface{}
+
+	if active, err := h.store.QueryActiveOpenRouterCycle(quotaType); err == nil && active != nil {
+		cycles = append(cycles, openrouterCycleToMap(active))
+	}
+	if history, err := h.store.QueryOpenRouterCycleHistory(quotaType, 50); err == nil {
+		for _, c := range history {
+			cycles = append(cycles, openrouterCycleToMap(c))
+		}
+	}
+
+	respondJSON(w, http.StatusOK, map[string]interface{}{
+		"groupBy":    quotaType,
+		"provider":   "openrouter",
+		"quotaNames": []string{"credits"},
+		"cycles":     cycles,
+	})
+}
+
+// loggingHistoryOpenRouter returns OpenRouter polling history.
+func (h *Handler) loggingHistoryOpenRouter(w http.ResponseWriter, r *http.Request) {
+	if h.store == nil {
+		respondJSON(w, http.StatusOK, map[string]interface{}{"provider": "openrouter", "quotaNames": []string{}, "logs": []interface{}{}})
+		return
+	}
+
+	start, end, limit := h.loggingHistoryRangeAndLimit(r)
+
+	snapshots, err := h.store.QueryOpenRouterRange(start, end, limit)
+	if err != nil {
+		h.logger.Error("failed to query OpenRouter logging history", "error", err)
+		respondError(w, http.StatusInternalServerError, "failed to query history")
+		return
+	}
+
+	quotaNames := []string{"credits"}
+	type quotaVal struct {
+		Name     string
+		Value    float64
+		Limit    float64
+		Percent  float64
+		HasValue bool
+		HasLimit bool
+	}
+
+	capturedAt := make([]string, 0, len(snapshots))
+	ids := make([]int64, 0, len(snapshots))
+	series := make([]map[string]quotaVal, 0, len(snapshots))
+
+	for _, snap := range snapshots {
+		capturedAt = append(capturedAt, snap.CapturedAt.Format(time.RFC3339))
+		ids = append(ids, snap.ID)
+
+		limitVal := 0.0
+		pct := 0.0
+		hasLimit := false
+		if snap.Limit != nil && *snap.Limit > 0 {
+			limitVal = *snap.Limit
+			pct = (snap.Usage / *snap.Limit) * 100
+			hasLimit = true
+		}
+
+		row := map[string]quotaVal{
+			"credits": {
+				Name:     "credits",
+				Value:    snap.Usage,
+				Limit:    limitVal,
+				Percent:  pct,
+				HasValue: true,
+				HasLimit: hasLimit,
+			},
+		}
+		series = append(series, row)
+	}
+
+	// Build logs manually since loggingHistoryRowsFromSnapshots expects specific types
+	logs := make([]map[string]interface{}, 0, len(snapshots))
+	for i := range snapshots {
+		entry := map[string]interface{}{
+			"capturedAt": capturedAt[i],
+			"id":         ids[i],
+			"quotas":     map[string]interface{}{},
+		}
+		quotas := map[string]interface{}{}
+		for _, qn := range quotaNames {
+			if qv, ok := series[i][qn]; ok {
+				quotas[qn] = map[string]interface{}{
+					"name":     qv.Name,
+					"value":    qv.Value,
+					"limit":    qv.Limit,
+					"percent":  qv.Percent,
+					"hasValue": qv.HasValue,
+					"hasLimit": qv.HasLimit,
+				}
+			}
+		}
+		entry["quotas"] = quotas
+		logs = append(logs, entry)
+	}
+
+	respondJSON(w, http.StatusOK, map[string]interface{}{
+		"provider":   "openrouter",
+		"quotaNames": quotaNames,
+		"logs":       logs,
+	})
+}
+
+// Cycles returns reset cycle data (API endpoint)
+func (h *Handler) Cycles(w http.ResponseWriter, r *http.Request) {
+	provider, err := h.getProviderFromRequest(r)
+	if err != nil {
+		respondError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	switch provider {
+	case "both":
+		h.cyclesBoth(w, r)
+	case "zai":
+		h.cyclesZai(w, r)
+	case "synthetic":
+		h.cyclesSynthetic(w, r)
+	case "anthropic":
+		h.cyclesAnthropic(w, r)
+	case "copilot":
+		h.cyclesCopilot(w, r)
+	case "codex":
+		h.cyclesCodex(w, r)
+	case "antigravity":
+		h.cyclesAntigravity(w, r)
+	case "minimax":
+		h.cyclesMiniMax(w, r)
+	case "openrouter":
+		h.cyclesOpenRouter(w, r)
+	case "gemini":
+		h.cyclesGemini(w, r)
+	default:
+		respondError(w, http.StatusBadRequest, fmt.Sprintf("unknown provider: %s", provider))
+	}
+}
+
+// cyclesBoth returns combined cycles from all configured providers.
+func (h *Handler) cyclesBoth(w http.ResponseWriter, r *http.Request) {
+	response := map[string]interface{}{}
+	if h.store == nil {
+		respondJSON(w, http.StatusOK, response)
+		return
+	}
+
+	if h.config.HasProvider("synthetic") {
+		quotaType := r.URL.Query().Get("type")
+		if quotaType == "" {
+			quotaType = "subscription"
+		}
+		var synCycles []map[string]interface{}
+		if active, err := h.store.QueryActiveCycle(quotaType); err == nil && active != nil {
+			synCycles = append(synCycles, cycleToMap(active))
+		}
+		if history, err := h.store.QueryCycleHistory(quotaType, 50); err == nil {
+			for _, c := range history {
+				synCycles = append(synCycles, cycleToMap(c))
+			}
+		}
+		response["synthetic"] = synCycles
+	}
+
+	if h.config.HasProvider("zai") {
+		zaiType := r.URL.Query().Get("zaiType")
+		if zaiType == "" {
+			zaiType = "tokens"
+		}
+		var zaiCycles []map[string]interface{}
+		if active, err := h.store.QueryActiveZaiCycle(zaiType); err == nil && active != nil {
+			zaiCycles = append(zaiCycles, zaiCycleToMap(active))
+		}
+		if history, err := h.store.QueryZaiCycleHistory(zaiType, 50); err == nil {
+			for _, c := range history {
+				zaiCycles = append(zaiCycles, zaiCycleToMap(c))
+			}
+		}
+		response["zai"] = zaiCycles
+	}
+
+	if h.config.HasProvider("anthropic") {
+		anthType := r.URL.Query().Get("anthropicType")
+		if anthType == "" {
+			anthType = "five_hour"
+		}
+		var anthCycles []map[string]interface{}
+		if active, err := h.store.QueryActiveAnthropicCycle(anthType); err == nil && active != nil {
+			anthCycles = append(anthCycles, anthropicCycleToMap(active))
+		}
+		if history, err := h.store.QueryAnthropicCycleHistory(anthType, 200); err == nil {
+			for _, c := range history {
+				anthCycles = append(anthCycles, anthropicCycleToMap(c))
+			}
+		}
+		response["anthropic"] = anthCycles
+	}
+
+	if h.config.HasProvider("codex") {
+		codexType := r.URL.Query().Get("codexType")
+		if codexType == "" {
+			codexType = r.URL.Query().Get("type")
+		}
+		if codexType == "" {
+			codexType = "five_hour"
+		}
+		var codexCycles []map[string]interface{}
+		if active, err := h.store.QueryActiveCodexCycle(DefaultCodexAccountID, codexType); err == nil && active != nil {
+			codexCycles = append(codexCycles, codexCycleToMap(active))
+		}
+		if history, err := h.store.QueryCodexCycleHistory(DefaultCodexAccountID, codexType, 200); err == nil {
+			for _, c := range history {
+				codexCycles = append(codexCycles, codexCycleToMap(c))
+			}
+		}
+		response["codex"] = codexCycles
+	}
+
+	if h.config.HasProvider("antigravity") {
+		modelIDs, err := h.store.QueryAllAntigravityModelIDs()
+		if err == nil {
+			var antigravityCycles []map[string]interface{}
+			for _, modelID := range modelIDs {
+				if active, err := h.store.QueryActiveAntigravityCycle(modelID); err == nil && active != nil {
+					antigravityCycles = append(antigravityCycles, antigravityCycleToMap(active))
+				}
+				if history, err := h.store.QueryAntigravityCycleHistory(modelID, 50); err == nil {
+					for _, c := range history {
+						antigravityCycles = append(antigravityCycles, antigravityCycleToMap(c))
+					}
+				}
+			}
+			response["antigravity"] = antigravityCycles
+		}
+	}
+	if h.config.HasProvider("minimax") {
+		minimaxAccID := h.parseMiniMaxAccountID(r)
+		modelNames, err := h.store.QueryAllMiniMaxModelNames(minimaxAccID)
+		if err == nil {
+			var minimaxCycles []map[string]interface{}
+			for _, modelName := range modelNames {
+				if active, err := h.store.QueryActiveMiniMaxCycle(modelName, minimaxAccID); err == nil && active != nil {
+					minimaxCycles = append(minimaxCycles, minimaxCycleToMap(active))
+				}
+				if history, err := h.store.QueryMiniMaxCycleHistory(modelName, minimaxAccID, 50); err == nil {
+					for _, c := range history {
+						minimaxCycles = append(minimaxCycles, minimaxCycleToMap(c))
+					}
+				}
+			}
+			response["minimax"] = minimaxCycles
+		}
+	}
+	if h.config.HasProvider("openrouter") {
+		quotaType := "credits"
+		var orCycles []map[string]interface{}
+		if active, err := h.store.QueryActiveOpenRouterCycle(quotaType); err == nil && active != nil {
+			orCycles = append(orCycles, openrouterCycleToMap(active))
+		}
+		if history, err := h.store.QueryOpenRouterCycleHistory(quotaType, 50); err == nil {
+			for _, c := range history {
+				orCycles = append(orCycles, openrouterCycleToMap(c))
+			}
+		}
+		response["openrouter"] = map[string]interface{}{
+			"groupBy":    quotaType,
+			"provider":   "openrouter",
+			"quotaNames": []string{"credits"},
+			"cycles":     orCycles,
+		}
+	}
+
+	if h.config.HasProvider("gemini") {
+		response["gemini"] = []interface{}{}
+	}
+
+	respondJSON(w, http.StatusOK, response)
+}
+
+// cyclesSynthetic returns Synthetic reset cycles
+func (h *Handler) cyclesSynthetic(w http.ResponseWriter, r *http.Request) {
+	if h.store == nil {
+		respondJSON(w, http.StatusOK, []interface{}{})
+		return
+	}
+
+	quotaType := r.URL.Query().Get("type")
+	if quotaType == "" {
+		quotaType = "subscription"
+	}
+
+	validTypes := map[string]bool{
+		"subscription": true,
+		"search":       true,
+		"toolcall":     true,
+	}
+
+	if !validTypes[quotaType] {
+		respondError(w, http.StatusBadRequest, fmt.Sprintf("invalid quota type: %s", quotaType))
+		return
+	}
+
+	// Get both active and completed cycles
+	response := []map[string]interface{}{}
+
+	active, err := h.store.QueryActiveCycle(quotaType)
+	if err != nil {
+		h.logger.Error("failed to query active cycle", "error", err)
+		respondError(w, http.StatusInternalServerError, "failed to query cycles")
+		return
+	}
+
+	if active != nil {
+		response = append(response, cycleToMap(active))
+	}
+
+	history, err := h.store.QueryCycleHistory(quotaType, 200)
+	if err != nil {
+		h.logger.Error("failed to query cycle history", "error", err)
+		respondError(w, http.StatusInternalServerError, "failed to query cycles")
+		return
+	}
+
+	for _, cycle := range history {
+		response = append(response, cycleToMap(cycle))
+	}
+
+	respondJSON(w, http.StatusOK, response)
+}
+
+// cyclesZai returns Z.ai reset cycles
+func (h *Handler) cyclesZai(w http.ResponseWriter, r *http.Request) {
+	if h.store == nil {
+		respondJSON(w, http.StatusOK, []interface{}{})
+		return
+	}
+
+	quotaType := r.URL.Query().Get("type")
+	if quotaType == "" {
+		quotaType = "tokens"
+	}
+
+	validTypes := map[string]bool{
+		"tokens": true,
+		"time":   true,
+	}
+
+	if !validTypes[quotaType] {
+		respondError(w, http.StatusBadRequest, fmt.Sprintf("invalid quota type: %s", quotaType))
+		return
+	}
+
+	// Get both active and completed cycles
+	response := []map[string]interface{}{}
+
+	active, err := h.store.QueryActiveZaiCycle(quotaType)
+	if err != nil {
+		h.logger.Error("failed to query active Z.ai cycle", "error", err)
+		respondError(w, http.StatusInternalServerError, "failed to query cycles")
+		return
+	}
+
+	if active != nil {
+		response = append(response, zaiCycleToMap(active))
+	}
+
+	history, err := h.store.QueryZaiCycleHistory(quotaType, 200)
+	if err != nil {
+		h.logger.Error("failed to query Z.ai cycle history", "error", err)
+		respondError(w, http.StatusInternalServerError, "failed to query cycles")
+		return
+	}
+
+	for _, cycle := range history {
+		response = append(response, zaiCycleToMap(cycle))
+	}
+
+	respondJSON(w, http.StatusOK, response)
+}
+
+func cycleToMap(cycle *store.ResetCycle) map[string]interface{} {
+	result := map[string]interface{}{
+		"id":           cycle.ID,
+		"quotaType":    cycle.QuotaType,
+		"cycleStart":   cycle.CycleStart.Format(time.RFC3339),
+		"cycleEnd":     nil,
+		"renewsAt":     cycle.RenewsAt.Format(time.RFC3339),
+		"peakRequests": cycle.PeakRequests,
+		"totalDelta":   cycle.TotalDelta,
+	}
+
+	if cycle.CycleEnd != nil {
+		result["cycleEnd"] = cycle.CycleEnd.Format(time.RFC3339)
+	}
+
+	return result
+}
+
+func zaiCycleToMap(cycle *store.ZaiResetCycle) map[string]interface{} {
+	result := map[string]interface{}{
+		"id":           cycle.ID,
+		"quotaType":    cycle.QuotaType,
+		"cycleStart":   cycle.CycleStart.Format(time.RFC3339),
+		"cycleEnd":     nil,
+		"peakRequests": cycle.PeakValue, // normalized to match Synthetic field name for frontend
+		"totalDelta":   cycle.TotalDelta,
+	}
+
+	if cycle.CycleEnd != nil {
+		result["cycleEnd"] = cycle.CycleEnd.Format(time.RFC3339)
+	}
+
+	if cycle.NextReset != nil {
+		result["renewsAt"] = cycle.NextReset.Format(time.RFC3339)
+	}
+
+	return result
+}
+
+// Summary returns usage summary (API endpoint)
+func (h *Handler) Summary(w http.ResponseWriter, r *http.Request) {
+	provider, err := h.getProviderFromRequest(r)
+	if err != nil {
+		respondError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	switch provider {
+	case "both":
+		h.summaryBoth(w, r)
+	case "zai":
+		h.summaryZai(w, r)
+	case "synthetic":
+		h.summarySynthetic(w, r)
+	case "anthropic":
+		h.summaryAnthropic(w, r)
+	case "copilot":
+		h.summaryCopilot(w, r)
+	case "codex":
+		h.summaryCodex(w, r)
+	case "antigravity":
+		h.summaryAntigravity(w, r)
+	case "minimax":
+		h.summaryMiniMax(w, r)
+	case "openrouter":
+		h.summaryOpenRouter(w, r)
+	case "gemini":
+		h.summaryGemini(w, r)
+	default:
+		respondError(w, http.StatusBadRequest, fmt.Sprintf("unknown provider: %s", provider))
+	}
+}
+
+// summaryBoth returns combined summaries from all configured providers.
+func (h *Handler) summaryBoth(w http.ResponseWriter, r *http.Request) {
+	response := map[string]interface{}{}
+	if h.config.HasProvider("synthetic") {
+		synResp := map[string]interface{}{
+			"subscription": buildEmptySummaryResponse("subscription"),
+			"search":       buildEmptySummaryResponse("search"),
+			"toolCalls":    buildEmptySummaryResponse("toolcall"),
+		}
+		if h.store != nil && h.tracker != nil {
+			for _, qt := range []string{"subscription", "search", "toolcall"} {
+				if s, err := h.tracker.UsageSummary(qt); err == nil && s != nil {
+					key := qt
+					if qt == "toolcall" {
+						key = "toolCalls"
+					}
+					synResp[key] = buildSummaryResponse(s)
+				}
+			}
+		}
+		response["synthetic"] = synResp
+	}
+	if h.config.HasProvider("zai") {
+		response["zai"] = h.buildZaiSummaryMap()
+	}
+	if h.config.HasProvider("openrouter") {
+		response["openrouter"] = h.buildOpenRouterSummaryMap()
+	}
+	if h.config.HasProvider("anthropic") {
+		response["anthropic"] = h.buildAnthropicSummaryMap()
+	}
+	if h.config.HasProvider("copilot") {
+		response["copilot"] = h.buildCopilotSummaryMap()
+	}
+	if h.config.HasProvider("codex") {
+		response["codex"] = h.buildCodexSummaryMap(DefaultCodexAccountID)
+	}
+	if h.config.HasProvider("antigravity") {
+		response["antigravity"] = h.buildAntigravitySummaryMap()
+	}
+	if h.config.HasProvider("minimax") {
+		response["minimax"] = h.buildMiniMaxSummaryMap(h.defaultMiniMaxAccountID())
+	}
+	if h.config.HasProvider("gemini") && h.geminiTracker != nil {
+		modelIDs, _ := h.store.QueryAllGeminiModelIDs()
+		var geminiSummaries []map[string]interface{}
+		for _, modelID := range modelIDs {
+			if summary, err := h.geminiTracker.UsageSummary(modelID); err == nil && summary != nil {
+				s := map[string]interface{}{
+					"modelId":           summary.ModelID,
+					"remainingFraction": summary.RemainingFraction,
+					"usagePercent":      summary.UsagePercent,
+					"currentRate":       summary.CurrentRate,
+				}
+				if summary.ResetTime != nil {
+					s["resetTime"] = summary.ResetTime.Format(time.RFC3339)
+				}
+				geminiSummaries = append(geminiSummaries, s)
+			}
+		}
+		response["gemini"] = geminiSummaries
+	}
+	respondJSON(w, http.StatusOK, response)
+}
+
+// summarySynthetic returns Synthetic usage summary
+func (h *Handler) summarySynthetic(w http.ResponseWriter, r *http.Request) {
+	response := map[string]interface{}{
+		"subscription": buildEmptySummaryResponse("subscription"),
+		"search":       buildEmptySummaryResponse("search"),
+		"toolCalls":    buildEmptySummaryResponse("toolcall"),
+	}
+
+	if h.store != nil && h.tracker != nil {
+		for _, quotaType := range []string{"subscription", "search", "toolcall"} {
+			summary, err := h.tracker.UsageSummary(quotaType)
+			if err == nil && summary != nil {
+				key := quotaType
+				if quotaType == "toolcall" {
+					key = "toolCalls"
+				}
+				response[key] = buildSummaryResponse(summary)
+			}
+		}
+	}
+
+	respondJSON(w, http.StatusOK, response)
+}
+
+// summaryAntigravity returns Antigravity usage summary.
+func (h *Handler) summaryAntigravity(w http.ResponseWriter, r *http.Request) {
+	respondJSON(w, http.StatusOK, h.buildAntigravitySummaryMap())
+}
+
+func (h *Handler) buildAntigravitySummaryMap() map[string]interface{} {
+	response := map[string]interface{}{}
+	if h.store == nil {
+		return response
+	}
+
+	latest, err := h.store.QueryLatestAntigravity()
+	if err != nil {
+		h.logger.Error("failed to query latest Antigravity snapshot", "error", err)
+		return response
+	}
+	if latest == nil {
+		return response
+	}
+
+	groups := api.GroupAntigravityModelsByLogicalQuota(latest.Models)
+	for _, group := range groups {
+		item := map[string]interface{}{
+			"quotaGroup":        group.GroupKey,
+			"displayName":       group.DisplayName,
+			"remainingFraction": group.RemainingFraction,
+			"remainingPercent":  group.RemainingPercent,
+			"usagePercent":      group.UsagePercent,
+			"isExhausted":       group.IsExhausted,
+			"models":            group.ModelIDs,
+			"modelLabels":       group.Labels,
+			"currentRate":       0.0,
+			"projectedUsage":    0.0,
+			"completedCycles":   0,
+			"avgPerCycle":       0.0,
+			"peakCycle":         0.0,
+			"totalTracked":      0.0,
+			"trackingSince":     nil,
+		}
+		if group.ResetTime != nil {
+			item["resetTime"] = group.ResetTime.Format(time.RFC3339)
+			item["timeUntilReset"] = formatDuration(group.TimeUntilReset)
+		}
+
+		if h.antigravityTracker != nil {
+			currentRate := 0.0
+			projectedUsage := 0.0
+			completedCycles := 0
+			avgPerCycleTotal := 0.0
+			avgPerCycleCount := 0
+			peakCycle := 0.0
+			totalTracked := 0.0
+			var trackingSince *time.Time
+
+			for _, modelID := range group.ModelIDs {
+				summary, err := h.antigravityTracker.UsageSummary(modelID)
+				if err != nil || summary == nil {
+					continue
+				}
+				currentRate += summary.CurrentRate
+				projectedUsage += summary.ProjectedUsage
+				completedCycles += summary.CompletedCycles
+				totalTracked += summary.TotalTracked
+				if summary.PeakCycle > peakCycle {
+					peakCycle = summary.PeakCycle
+				}
+				if summary.AvgPerCycle > 0 {
+					avgPerCycleTotal += summary.AvgPerCycle
+					avgPerCycleCount++
+				}
+				if !summary.TrackingSince.IsZero() && (trackingSince == nil || summary.TrackingSince.Before(*trackingSince)) {
+					ts := summary.TrackingSince
+					trackingSince = &ts
+				}
+			}
+
+			item["currentRate"] = currentRate
+			item["projectedUsage"] = projectedUsage
+			item["completedCycles"] = completedCycles
+			item["peakCycle"] = peakCycle
+			item["totalTracked"] = totalTracked
+			if avgPerCycleCount > 0 {
+				item["avgPerCycle"] = avgPerCycleTotal / float64(avgPerCycleCount)
+			}
+			if trackingSince != nil {
+				item["trackingSince"] = trackingSince.Format(time.RFC3339)
+			}
+		}
+
+		response[group.GroupKey] = item
+	}
+
+	return response
+}
+
+// summaryZai returns Z.ai usage summary
+func (h *Handler) summaryZai(w http.ResponseWriter, r *http.Request) {
+	respondJSON(w, http.StatusOK, h.buildZaiSummaryMap())
+}
+
+// buildZaiSummaryMap builds the Z.ai summary response.
+func (h *Handler) buildZaiSummaryMap() map[string]interface{} {
+	response := map[string]interface{}{
+		"tokensLimit": buildEmptyZaiSummaryResponse("tokens"),
+		"timeLimit":   buildEmptyZaiSummaryResponse("time"),
+	}
+
+	// Try tracker-based summary first (has cycle data)
+	if h.zaiTracker != nil {
+		if tokensSummary, err := h.zaiTracker.UsageSummary("tokens"); err == nil && tokensSummary != nil {
+			response["tokensLimit"] = buildZaiTrackerSummaryResponse(tokensSummary)
+		}
+		if timeSummary, err := h.zaiTracker.UsageSummary("time"); err == nil && timeSummary != nil {
+			response["timeLimit"] = buildZaiTrackerSummaryResponse(timeSummary)
+		}
+		return response
+	}
+
+	// Fallback to snapshot-only summary
+	if h.store != nil {
+		latest, err := h.store.QueryLatestZai()
+		if err != nil {
+			h.logger.Error("failed to query latest Z.ai snapshot", "error", err)
+			return response
+		}
+		if latest != nil {
+			response["tokensLimit"] = buildZaiTokensSummary(latest)
+			response["timeLimit"] = buildZaiTimeSummary(latest)
+		}
+	}
+
+	return response
+}
+
+func buildEmptySummaryResponse(quotaType string) map[string]interface{} {
+	return map[string]interface{}{
+		"quotaType":       quotaType,
+		"currentUsage":    0.0,
+		"currentLimit":    0.0,
+		"usagePercent":    0.0,
+		"renewsAt":        time.Now().UTC().Format(time.RFC3339),
+		"timeUntilReset":  "0m",
+		"currentRate":     0.0,
+		"projectedUsage":  0.0,
+		"completedCycles": 0,
+		"avgPerCycle":     0.0,
+		"peakCycle":       0.0,
+		"totalTracked":    0.0,
+		"trackingSince":   nil,
+	}
+}
+
+func buildSummaryResponse(summary *tracker.Summary) map[string]interface{} {
+	result := map[string]interface{}{
+		"quotaType":       summary.QuotaType,
+		"currentUsage":    summary.CurrentUsage,
+		"currentLimit":    summary.CurrentLimit,
+		"usagePercent":    summary.UsagePercent,
+		"renewsAt":        summary.RenewsAt.Format(time.RFC3339),
+		"timeUntilReset":  formatDuration(summary.TimeUntilReset),
+		"currentRate":     summary.CurrentRate,
+		"projectedUsage":  summary.ProjectedUsage,
+		"completedCycles": summary.CompletedCycles,
+		"avgPerCycle":     summary.AvgPerCycle,
+		"peakCycle":       summary.PeakCycle,
+		"totalTracked":    summary.TotalTracked,
+		"trackingSince":   nil,
+	}
+
+	if !summary.TrackingSince.IsZero() {
+		result["trackingSince"] = summary.TrackingSince.Format(time.RFC3339)
+	}
+
+	return result
+}
+
+func buildEmptyZaiSummaryResponse(quotaType string) map[string]interface{} {
+	return map[string]interface{}{
+		"quotaType":       quotaType,
+		"currentUsage":    0.0,
+		"currentLimit":    0.0,
+		"usagePercent":    0.0,
+		"renewsAt":        time.Now().UTC().Format(time.RFC3339),
+		"timeUntilReset":  "0m",
+		"completedCycles": 0,
+		"avgPerCycle":     0.0,
+		"peakCycle":       0.0,
+		"totalTracked":    0.0,
+		"trackingSince":   nil,
+	}
+}
+
+func buildZaiTokensSummary(snapshot *api.ZaiSnapshot) map[string]interface{} {
+	// Z.ai API: "usage" = total budget, "currentValue" = actual usage
+	budget := snapshot.TokensUsage
+	currentUsage := snapshot.TokensCurrentValue
+
+	result := map[string]interface{}{
+		"quotaType":       "tokens",
+		"currentUsage":    currentUsage,
+		"currentLimit":    budget,
+		"usagePercent":    float64(snapshot.TokensPercentage),
+		"currentRate":     0.0,
+		"projectedUsage":  0.0,
+		"completedCycles": 0,
+		"avgPerCycle":     0.0,
+		"peakCycle":       0.0,
+		"totalTracked":    0.0,
+		"trackingSince":   nil,
+	}
+
+	if snapshot.TokensNextResetTime != nil {
+		timeUntilReset := time.Until(*snapshot.TokensNextResetTime)
+		result["renewsAt"] = snapshot.TokensNextResetTime.Format(time.RFC3339)
+		result["timeUntilReset"] = formatDuration(timeUntilReset)
+	} else {
+		result["renewsAt"] = time.Now().UTC().Format(time.RFC3339)
+		result["timeUntilReset"] = "N/A"
+	}
+
+	return result
+}
+
+func buildZaiTimeSummary(snapshot *api.ZaiSnapshot) map[string]interface{} {
+	// Z.ai API: "usage" = total budget, "currentValue" = actual usage
+	budget := snapshot.TimeUsage
+	currentUsage := snapshot.TimeCurrentValue
+
+	return map[string]interface{}{
+		"quotaType":       "time",
+		"currentUsage":    currentUsage,
+		"currentLimit":    budget,
+		"usagePercent":    float64(snapshot.TimePercentage),
+		"renewsAt":        time.Now().UTC().Format(time.RFC3339),
+		"timeUntilReset":  "N/A",
+		"currentRate":     0.0,
+		"projectedUsage":  0.0,
+		"completedCycles": 0,
+		"avgPerCycle":     0.0,
+		"peakCycle":       0.0,
+		"totalTracked":    0.0,
+		"trackingSince":   nil,
+	}
+}
+
+// buildZaiTrackerSummaryResponse builds a summary response from ZaiTracker data.
+func buildZaiTrackerSummaryResponse(summary *tracker.ZaiSummary) map[string]interface{} {
+	result := map[string]interface{}{
+		"quotaType":       summary.QuotaType,
+		"currentUsage":    summary.CurrentUsage,
+		"currentLimit":    summary.CurrentLimit,
+		"usagePercent":    summary.UsagePercent,
+		"currentRate":     summary.CurrentRate,
+		"projectedUsage":  summary.ProjectedUsage,
+		"completedCycles": summary.CompletedCycles,
+		"avgPerCycle":     summary.AvgPerCycle,
+		"peakCycle":       summary.PeakCycle,
+		"totalTracked":    summary.TotalTracked,
+		"trackingSince":   nil,
+	}
+
+	if summary.RenewsAt != nil {
+		result["renewsAt"] = summary.RenewsAt.Format(time.RFC3339)
+		result["timeUntilReset"] = formatDuration(summary.TimeUntilReset)
+	} else {
+		result["renewsAt"] = time.Now().UTC().Format(time.RFC3339)
+		result["timeUntilReset"] = "N/A"
+	}
+
+	if !summary.TrackingSince.IsZero() {
+		result["trackingSince"] = summary.TrackingSince.Format(time.RFC3339)
+	}
+
+	return result
+}
+
+// Sessions returns session data (API endpoint)
+func (h *Handler) Sessions(w http.ResponseWriter, r *http.Request) {
+	provider, err := h.getProviderFromRequest(r)
+	if err != nil {
+		respondError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	if h.store == nil {
+		respondJSON(w, http.StatusOK, []interface{}{})
+		return
+	}
+
+	if provider == "both" {
+		h.sessionsBoth(w, r)
+		return
+	}
+
+	var (
+		sessions []*store.Session
+		queryErr error
+	)
+	if provider == "codex" {
+		accountID := parseCodexAccountID(r)
+		sessions, queryErr = h.queryCodexSessionsByAccount(accountID)
+	} else if provider == "minimax" {
+		sessions, queryErr = h.queryMiniMaxSessions(h.parseMiniMaxAccountID(r))
+	} else {
+		sessions, queryErr = h.store.QuerySessionHistory(provider)
+	}
+	if queryErr != nil {
+		h.logger.Error("failed to query sessions", "error", queryErr)
+		respondError(w, http.StatusInternalServerError, "failed to query sessions")
+		return
+	}
+
+	response := []map[string]interface{}{}
+	for _, session := range sessions {
+		sessionMap := map[string]interface{}{
+			"id":                  session.ID,
+			"startedAt":           session.StartedAt.Format(time.RFC3339),
+			"endedAt":             nil,
+			"pollInterval":        session.PollInterval,
+			"maxSubRequests":      session.MaxSubRequests,
+			"maxSearchRequests":   session.MaxSearchRequests,
+			"maxToolRequests":     session.MaxToolRequests,
+			"startSubRequests":    session.StartSubRequests,
+			"startSearchRequests": session.StartSearchRequests,
+			"startToolRequests":   session.StartToolRequests,
+			"snapshotCount":       session.SnapshotCount,
+		}
+
+		if session.EndedAt != nil {
+			sessionMap["endedAt"] = session.EndedAt.Format(time.RFC3339)
+		}
+
+		response = append(response, sessionMap)
+	}
+
+	respondJSON(w, http.StatusOK, response)
+}
+
+func minimaxSessionTimeChanged(a, b *time.Time) bool {
+	switch {
+	case a == nil && b == nil:
+		return false
+	case a == nil || b == nil:
+		return true
+	default:
+		return a.Sub(*b).Abs() > time.Second
+	}
+}
+
+func (h *Handler) queryMiniMaxSessions(accountID int64) ([]*store.Session, error) {
+	if h.store == nil {
+		return []*store.Session{}, nil
+	}
+
+	now := time.Now().UTC()
+	minimaxAccID := accountID
+	if minimaxAccID == 0 {
+		minimaxAccID = h.defaultMiniMaxAccountID()
+	}
+	snapshots, err := h.store.QueryMiniMaxRange(now.Add(-30*24*time.Hour), now, minimaxAccID, minimaxInsightSampleLimit)
+	if err != nil {
+		return nil, err
+	}
+	if len(snapshots) == 0 {
+		return []*store.Session{}, nil
+	}
+
+	latest := snapshots[len(snapshots)-1]
+	if latest == nil || !latest.IsSharedQuota() {
+		return h.store.QuerySessionHistory("minimax")
+	}
+
+	samples := minimaxMergedSamplesFromSnapshots(snapshots)
+	if len(samples) == 0 {
+		return []*store.Session{}, nil
+	}
+
+	pollInterval := 5 * time.Minute
+	if h.config != nil && h.config.PollInterval > 0 {
+		pollInterval = h.config.PollInterval
+	}
+	idleGap := 2 * pollInterval
+	if idleGap < 10*time.Minute {
+		idleGap = 10 * time.Minute
+	}
+
+	buildSession := func(group []minimaxMergedSample, active bool) *store.Session {
+		first := group[0]
+		last := group[len(group)-1]
+		peakUsed := first.Used
+		peakWeeklyUsed := first.WeeklyUsed
+		for _, sample := range group[1:] {
+			if sample.Used > peakUsed {
+				peakUsed = sample.Used
+			}
+			if sample.WeeklyUsed > peakWeeklyUsed {
+				peakWeeklyUsed = sample.WeeklyUsed
+			}
+		}
+
+		session := &store.Session{
+			ID:                  fmt.Sprintf("minimax-%d", first.CapturedAt.UnixNano()),
+			StartedAt:           first.CapturedAt,
+			PollInterval:        int(pollInterval / time.Millisecond),
+			MaxSubRequests:      float64(peakUsed),
+			StartSubRequests:    float64(first.Used),
+			MaxSearchRequests:   float64(peakWeeklyUsed),
+			StartSearchRequests: float64(first.WeeklyUsed),
+			MaxToolRequests:     float64(first.WeeklyTotal),
+			SnapshotCount:       len(group),
+		}
+		if !active {
+			endedAt := last.CapturedAt
+			session.EndedAt = &endedAt
+		}
+		return session
+	}
+
+	shouldSplit := func(prev, curr minimaxMergedSample) bool {
+		if curr.CapturedAt.Sub(prev.CapturedAt) > idleGap {
+			return true
+		}
+		if curr.Used < prev.Used {
+			return true
+		}
+		if minimaxSessionTimeChanged(prev.ResetAt, curr.ResetAt) {
+			return true
+		}
+		if minimaxSessionTimeChanged(prev.WindowStart, curr.WindowStart) {
+			return true
+		}
+		if minimaxSessionTimeChanged(prev.WindowEnd, curr.WindowEnd) {
+			return true
+		}
+		return false
+	}
+
+	groups := make([][]minimaxMergedSample, 0, 4)
+	currentGroup := []minimaxMergedSample{samples[0]}
+	for i := 1; i < len(samples); i++ {
+		prev := samples[i-1]
+		curr := samples[i]
+		if shouldSplit(prev, curr) {
+			groups = append(groups, currentGroup)
+			currentGroup = []minimaxMergedSample{curr}
+			continue
+		}
+		currentGroup = append(currentGroup, curr)
+	}
+	groups = append(groups, currentGroup)
+
+	sessions := make([]*store.Session, 0, len(groups))
+	for _, group := range groups {
+		if len(group) == 0 {
+			continue
+		}
+		active := now.Sub(group[len(group)-1].CapturedAt) <= idleGap
+		sessions = append(sessions, buildSession(group, active))
+	}
+
+	sort.Slice(sessions, func(i, j int) bool {
+		return sessions[i].StartedAt.After(sessions[j].StartedAt)
+	})
+
+	return sessions, nil
+}
+
+// sessionsBoth returns sessions from both providers.
+func (h *Handler) sessionsBoth(w http.ResponseWriter, r *http.Request) {
+	response := map[string]interface{}{}
+	codexAccountID := parseCodexAccountID(r)
+
+	buildSessionList := func(provider string) []map[string]interface{} {
+		var (
+			sessions []*store.Session
+			err      error
+		)
+		if provider == "codex" {
+			sessions, err = h.queryCodexSessionsByAccount(codexAccountID)
+		} else if provider == "minimax" {
+			sessions, err = h.queryMiniMaxSessions(h.parseMiniMaxAccountID(r))
+		} else {
+			sessions, err = h.store.QuerySessionHistory(provider)
+		}
+		if err != nil {
+			return nil
+		}
+		var list []map[string]interface{}
+		for _, s := range sessions {
+			m := map[string]interface{}{
+				"id":                  s.ID,
+				"startedAt":           s.StartedAt.Format(time.RFC3339),
+				"endedAt":             nil,
+				"pollInterval":        s.PollInterval,
+				"maxSubRequests":      s.MaxSubRequests,
+				"maxSearchRequests":   s.MaxSearchRequests,
+				"maxToolRequests":     s.MaxToolRequests,
+				"startSubRequests":    s.StartSubRequests,
+				"startSearchRequests": s.StartSearchRequests,
+				"startToolRequests":   s.StartToolRequests,
+				"snapshotCount":       s.SnapshotCount,
+			}
+			if s.EndedAt != nil {
+				m["endedAt"] = s.EndedAt.Format(time.RFC3339)
+			}
+			list = append(list, m)
+		}
+		return list
+	}
+
+	if h.config.HasProvider("synthetic") {
+		response["synthetic"] = buildSessionList("synthetic")
+	}
+	if h.config.HasProvider("zai") {
+		response["zai"] = buildSessionList("zai")
+	}
+	if h.config.HasProvider("anthropic") {
+		response["anthropic"] = buildSessionList("anthropic")
+	}
+	if h.config.HasProvider("copilot") {
+		response["copilot"] = buildSessionList("copilot")
+	}
+	if h.config.HasProvider("codex") {
+		response["codex"] = buildSessionList("codex")
+	}
+	if h.config.HasProvider("antigravity") {
+		response["antigravity"] = buildSessionList("antigravity")
+	}
+	if h.config.HasProvider("minimax") {
+		response["minimax"] = buildSessionList("minimax")
+	}
+	if h.config.HasProvider("openrouter") {
+		quotaType := "credits"
+		var orCycles []map[string]interface{}
+		if active, err := h.store.QueryActiveOpenRouterCycle(quotaType); err == nil && active != nil {
+			orCycles = append(orCycles, openrouterCycleToMap(active))
+		}
+		if history, err := h.store.QueryOpenRouterCycleHistory(quotaType, 50); err == nil {
+			for _, c := range history {
+				orCycles = append(orCycles, openrouterCycleToMap(c))
+			}
+		}
+		response["openrouter"] = map[string]interface{}{
+			"groupBy":    quotaType,
+			"provider":   "openrouter",
+			"quotaNames": []string{"credits"},
+			"cycles":     orCycles,
+		}
+	}
+
+	if h.config.HasProvider("gemini") {
+		response["gemini"] = buildSessionList("gemini")
+	}
+	if h.config.HasProvider("openrouter") {
+		response["openrouter"] = buildSessionList("openrouter")
+	}
+
+	respondJSON(w, http.StatusOK, response)
+}
+
+func (h *Handler) queryCodexSessionsByAccount(accountID int64) ([]*store.Session, error) {
+	targetProvider := fmt.Sprintf("codex:%d", accountID)
+	sessions, err := h.store.QuerySessionHistory(targetProvider)
+	if err != nil {
+		return nil, err
+	}
+
+	// Backward compatibility for older single-account sessions stored as plain "codex".
+	if accountID == DefaultCodexAccountID {
+		legacy, legacyErr := h.store.QuerySessionHistory("codex")
+		if legacyErr != nil {
+			return nil, legacyErr
+		}
+		sessions = append(sessions, legacy...)
+	}
+
+	if len(sessions) <= 1 {
+		return sessions, nil
+	}
+
+	byID := make(map[string]*store.Session, len(sessions))
+	for _, sess := range sessions {
+		if _, exists := byID[sess.ID]; !exists {
+			byID[sess.ID] = sess
+		}
+	}
+
+	merged := make([]*store.Session, 0, len(byID))
+	for _, sess := range byID {
+		merged = append(merged, sess)
+	}
+	sort.SliceStable(merged, func(i, j int) bool {
+		return merged[i].StartedAt.After(merged[j].StartedAt)
+	})
+
+	return merged, nil
+}
+
+// ── Deep Insights ──
+
+type insightStat struct {
+	Value    string `json:"value"`
+	Label    string `json:"label"`
+	Sublabel string `json:"sublabel,omitempty"`
+}
+
+type insightItem struct {
+	Key      string `json:"key"`
+	Type     string `json:"type"`
+	Severity string `json:"severity"`
+	Title    string `json:"title"`
+	Metric   string `json:"metric,omitempty"`
+	Sublabel string `json:"sublabel,omitempty"`
+	Desc     string `json:"description"`
+}
+
+// insightCorrelations maps analogous insight keys across providers.
+// Hiding one key in a group hides all keys in that group.
+var insightCorrelations = [][]string{
+	{"cycle_utilization", "token_budget"},
+	{"tool_share", "tool_breakdown"},
+	{"trend", "trend_24h"},
+	{"weekly_pace", "usage_7d"},
+	// "coverage" uses the same key for both providers - auto-correlated
+}
+
+// getHiddenInsightKeys loads hidden insight keys from DB and expands correlations.
+func (h *Handler) getHiddenInsightKeys() map[string]bool {
+	hidden := map[string]bool{}
+	if h.store == nil {
+		return hidden
+	}
+	val, err := h.store.GetSetting("hidden_insights")
+	if err != nil || val == "" {
+		return hidden
+	}
+	var keys []string
+	if err := json.Unmarshal([]byte(val), &keys); err != nil {
+		return hidden
+	}
+	for _, k := range keys {
+		hidden[k] = true
+	}
+	// Expand correlated keys
+	for _, group := range insightCorrelations {
+		groupHidden := false
+		for _, k := range group {
+			if hidden[k] {
+				groupHidden = true
+				break
+			}
+		}
+		if groupHidden {
+			for _, k := range group {
+				hidden[k] = true
+			}
+		}
+	}
+	return hidden
+}
+
+type insightsResponse struct {
+	Stats    []insightStat `json:"stats"`
+	Insights []insightItem `json:"insights"`
+}
+
+// Insights returns computed deep analytics (API endpoint)
+func (h *Handler) Insights(w http.ResponseWriter, r *http.Request) {
+	provider, err := h.getProviderFromRequest(r)
+	if err != nil {
+		respondError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	rangeDur := parseInsightsRange(r.URL.Query().Get("range"))
+
+	switch provider {
+	case "both":
+		h.insightsBoth(w, r, rangeDur)
+	case "zai":
+		h.insightsZai(w, r, rangeDur)
+	case "synthetic":
+		h.insightsSynthetic(w, r, rangeDur)
+	case "anthropic":
+		h.insightsAnthropic(w, r, rangeDur)
+	case "copilot":
+		h.insightsCopilot(w, r, rangeDur)
+	case "codex":
+		h.insightsCodex(w, r, rangeDur)
+	case "antigravity":
+		h.insightsAntigravity(w, r, rangeDur)
+	case "minimax":
+		h.insightsMiniMax(w, r, rangeDur)
+	case "openrouter":
+		h.insightsOpenRouter(w, r, rangeDur)
+	case "gemini":
+		h.insightsGemini(w, r, rangeDur)
+	default:
+		respondError(w, http.StatusBadRequest, fmt.Sprintf("unknown provider: %s", provider))
+	}
+}
+
+// insightsBoth returns combined insights from all configured providers.
+func (h *Handler) insightsBoth(w http.ResponseWriter, r *http.Request, rangeDur time.Duration) {
+	hidden := h.getHiddenInsightKeys()
+	response := map[string]interface{}{}
+	visibility := h.providerVisibilitySettings()
+
+	if h.config.HasProvider("synthetic") && providerTelemetryEnabled(visibility, "synthetic") {
+		response["synthetic"] = h.buildSyntheticInsights(hidden, rangeDur)
+	}
+	if h.config.HasProvider("zai") && providerTelemetryEnabled(visibility, "zai") {
+		response["zai"] = h.buildZaiInsights(hidden)
+	}
+	if h.config.HasProvider("anthropic") && providerTelemetryEnabled(visibility, "anthropic") {
+		response["anthropic"] = h.buildAnthropicInsights(hidden, rangeDur)
+	}
+	if h.config.HasProvider("copilot") && providerTelemetryEnabled(visibility, "copilot") {
+		response["copilot"] = h.buildCopilotInsights(hidden, rangeDur)
+	}
+	if h.config.HasProvider("codex") && providerTelemetryEnabled(visibility, "codex") {
+		codexAccounts := h.codexUsageAccounts()
+		codexInsights := make([]map[string]interface{}, 0, len(codexAccounts))
+		for _, acc := range codexAccounts {
+			accountID := codexUsageAccountID(acc)
+			if !codexAccountTelemetryEnabled(visibility, accountID) {
+				continue
+			}
+			ins := h.buildCodexInsights(accountID, hidden, rangeDur)
+			codexInsights = append(codexInsights, map[string]interface{}{
+				"accountId":   accountID,
+				"accountName": codexUsageAccountName(acc),
+				"stats":       ins.Stats,
+				"insights":    ins.Insights,
+			})
+		}
+		if len(codexInsights) == 1 {
+			response["codex"] = codexInsights[0]
+		}
+		if len(codexInsights) > 0 {
+			response["codexAccounts"] = codexInsights
+		}
+	}
+	if h.config.HasProvider("antigravity") && providerTelemetryEnabled(visibility, "antigravity") {
+		response["antigravity"] = h.buildAntigravityInsights(hidden, rangeDur)
+	}
+	if h.config.HasProvider("minimax") && providerTelemetryEnabled(visibility, "minimax") {
+		minimaxAccounts := h.minimaxUsageAccounts()
+		minimaxInsights := make([]map[string]interface{}, 0, len(minimaxAccounts))
+		for _, acc := range minimaxAccounts {
+			accountID := minimaxUsageAccountID(acc)
+			if !minimaxAccountTelemetryEnabled(visibility, accountID) {
+				continue
+			}
+			ins := h.buildMiniMaxInsights(accountID, hidden, rangeDur)
+			minimaxInsights = append(minimaxInsights, map[string]interface{}{
+				"accountId":   accountID,
+				"accountName": minimaxUsageAccountName(acc),
+				"stats":       ins.Stats,
+				"insights":    ins.Insights,
+			})
+		}
+		if len(minimaxInsights) == 1 {
+			response["minimax"] = minimaxInsights[0]
+		}
+		if len(minimaxInsights) > 0 {
+			response["minimaxAccounts"] = minimaxInsights
+		}
+	}
+	if h.config.HasProvider("openrouter") && providerTelemetryEnabled(visibility, "openrouter") {
+		response["openrouter"] = h.buildOpenRouterInsights(hidden)
+	}
+	if h.config.HasProvider("gemini") && providerTelemetryEnabled(visibility, "gemini") {
+		response["gemini"] = insightsResponse{Stats: []insightStat{}, Insights: []insightItem{}}
+	}
+
+	respondJSON(w, http.StatusOK, response)
+}
+
+// insightsSynthetic returns Synthetic deep analytics
+func (h *Handler) insightsSynthetic(w http.ResponseWriter, r *http.Request, rangeDur time.Duration) {
+	hidden := h.getHiddenInsightKeys()
+	respondJSON(w, http.StatusOK, h.buildSyntheticInsights(hidden, rangeDur))
+}
+
+// buildSyntheticInsights builds the Synthetic insights response.
+// rangeDur controls the time window for the 4 stat cards.
+func (h *Handler) buildSyntheticInsights(hidden map[string]bool, rangeDur time.Duration) insightsResponse {
+	resp := insightsResponse{Stats: []insightStat{}, Insights: []insightItem{}}
+
+	if h.store == nil {
+		return resp
+	}
+
+	now := time.Now().UTC()
+	rangeStart := now.Add(-rangeDur)
+	d30 := now.Add(-30 * 24 * time.Hour)
+	d7 := now.Add(-7 * 24 * time.Hour)
+
+	// Fetch cycle data for all quota types (last 30 days for insights, rangeDur for stats)
+	subCycles, _ := h.store.QueryCyclesSince("subscription", d30)
+	searchCycles, _ := h.store.QueryCyclesSince("search", d30)
+	toolCycles, _ := h.store.QueryCyclesSince("toolcall", d30)
+
+	sessions, _ := h.store.QuerySessionHistory()
+	latest, _ := h.store.QueryLatest()
+
+	var subLimit float64
+	if latest != nil {
+		subLimit = latest.Sub.Limit
+	}
+
+	// Compute range-specific totals for stat cards
+	rangeDays := int(rangeDur.Hours() / 24)
+	if rangeDays == 0 {
+		rangeDays = 1
+	}
+	rangeLabel := fmt.Sprintf("%dd", rangeDays)
+
+	subRange := cycleSumConsumptionSince(subCycles, rangeStart)
+	searchRange := cycleSumConsumptionSince(searchCycles, rangeStart)
+	toolRange := cycleSumConsumptionSince(toolCycles, rangeStart)
+	totalRange := subRange + searchRange + toolRange
+
+	// Count sessions in range
+	var sessionsInRange int
+	for _, s := range sessions {
+		if !s.StartedAt.Before(rangeStart) {
+			sessionsInRange++
+		}
+	}
+
+	// 30-day totals for insights (always based on 30d regardless of range)
+	sub30 := cycleSumConsumption(subCycles)
+	sub7 := cycleSumConsumptionSince(subCycles, d7)
+
+	subAvg := billingPeriodAvg(subCycles)
+	subPeak := billingPeriodPeak(subCycles)
+
+	// ═══ Stats Cards (exactly 4, range-aware) ═══
+	resp.Stats = append(resp.Stats, insightStat{Value: compactNum(subRange), Label: fmt.Sprintf("Requests (%s)", rangeLabel)})
+	resp.Stats = append(resp.Stats, insightStat{Value: compactNum(totalRange), Label: fmt.Sprintf("Total API Calls (%s)", rangeLabel)})
+	resp.Stats = append(resp.Stats, insightStat{Value: compactNum(toolRange), Label: fmt.Sprintf("Tool Calls (%s)", rangeLabel)})
+	resp.Stats = append(resp.Stats, insightStat{Value: fmt.Sprintf("%d", sessionsInRange), Label: "Sessions"})
+
+	// ═══ Deep Insights (analytical cards only - no session avg, no live quota duplicates) ═══
+
+	// 1. Avg Cycle Utilization %
+	if !hidden["cycle_utilization"] && subAvg > 0 && subLimit > 0 {
+		util := (subAvg / subLimit) * 100
+		var desc, sev string
+		switch {
+		case util < 25:
+			desc = fmt.Sprintf("You average ~%.0f%% of your %.0f quota per cycle. Significantly under-utilizing - a lower tier could save costs.", util, subLimit)
+			sev = "warning"
+		case util < 50:
+			desc = fmt.Sprintf("You average ~%.0f%% of your %.0f quota per cycle. Comfortable headroom - consider downgrading if optimizing costs.", util, subLimit)
+			sev = "info"
+		case util < 80:
+			desc = fmt.Sprintf("You average ~%.0f%% of your %.0f quota per cycle. Plan fits your usage well.", util, subLimit)
+			sev = "positive"
+		case util < 95:
+			desc = fmt.Sprintf("You average ~%.0f%% of your %.0f quota per cycle. Approaching your limit frequently - monitor closely.", util, subLimit)
+			sev = "warning"
+		default:
+			desc = fmt.Sprintf("You average ~%.0f%% of your %.0f quota per cycle. Consistently near limit - consider upgrading.", util, subLimit)
+			sev = "negative"
+		}
+		resp.Insights = append(resp.Insights, insightItem{
+			Key:  "cycle_utilization",
+			Type: "recommendation", Severity: sev,
+			Title:    "Avg Cycle Utilization",
+			Metric:   fmt.Sprintf("%.0f%%", util),
+			Sublabel: fmt.Sprintf("of %.0f limit/cycle", subLimit),
+			Desc:     desc,
+		})
+	}
+
+	subBillingCount := billingPeriodCount(subCycles)
+
+	// 2. Weekly Pace
+	if !hidden["weekly_pace"] && sub7 > 0 {
+		proj := sub7 * (30.0 / 7.0)
+		weeklyPct := float64(0)
+		if sub30 > 0 {
+			weeklyPct = (sub7 / sub30) * 100
+		}
+		sev := "info"
+		if subLimit > 0 {
+			cyclesPerMonth := float64(len(subCycles))
+			if cyclesPerMonth > 0 && proj > subLimit*cyclesPerMonth*0.8 {
+				sev = "warning"
+			}
+		}
+		desc := fmt.Sprintf("%.0f requests this week", sub7)
+		if sub30 > 0 {
+			desc += fmt.Sprintf(" (%.0f%% of 30-day total). Monthly projection: ~%s.", weeklyPct, compactNum(proj))
+		}
+		resp.Insights = append(resp.Insights, insightItem{
+			Key:  "weekly_pace",
+			Type: "trend", Severity: sev,
+			Title:    "Weekly Pace",
+			Metric:   compactNum(sub7),
+			Sublabel: "last 7 days",
+			Desc:     desc,
+		})
+	}
+
+	// 3. Peak vs Average Variance
+	if !hidden["variance"] && subPeak > 0 && subAvg > 0 && subBillingCount > 1 {
+		diff := ((subPeak - subAvg) / subAvg) * 100
+		var item insightItem
+		peakPct := float64(0)
+		if subLimit > 0 {
+			peakPct = (subPeak / subLimit) * 100
+		}
+		switch {
+		case diff > 50:
+			item = insightItem{Key: "variance", Type: "factual", Severity: "warning",
+				Title:    "High Variance",
+				Metric:   fmt.Sprintf("+%.0f%%", diff),
+				Sublabel: "peak above avg",
+				Desc:     fmt.Sprintf("Peak cycle hit %.0f%% of limit (%.0f requests) - %.0f%% above your average of %.0f. Usage varies significantly.", peakPct, subPeak, diff, subAvg),
+			}
+		case diff > 10:
+			item = insightItem{Key: "variance", Type: "factual", Severity: "info",
+				Title:    "Usage Spread",
+				Metric:   fmt.Sprintf("+%.0f%%", diff),
+				Sublabel: "peak above avg",
+				Desc:     fmt.Sprintf("Peak: %.0f%% of limit (%.0f req), average: %.0f. Moderately consistent.", peakPct, subPeak, subAvg),
+			}
+		default:
+			item = insightItem{Key: "variance", Type: "factual", Severity: "positive",
+				Title:    "Consistent",
+				Metric:   fmt.Sprintf("~%.0f%%", (subAvg/subLimit)*100),
+				Sublabel: "steady usage",
+				Desc:     fmt.Sprintf("Peak (%.0f) is close to average (%.0f). Predictable consumption.", subPeak, subAvg),
+			}
+		}
+		resp.Insights = append(resp.Insights, item)
+	}
+
+	// 4. Consumption Trend (needs at least 4 billing periods to be meaningful)
+	if !hidden["trend"] && subBillingCount >= 4 {
+		mid := len(subCycles) / 2
+		recentAvg := billingPeriodAvg(subCycles[:mid])
+		olderAvg := billingPeriodAvg(subCycles[mid:])
+		if olderAvg > 0 {
+			change := ((recentAvg - olderAvg) / olderAvg) * 100
+			var desc, sev, metric string
+			switch {
+			case change > 15:
+				metric = fmt.Sprintf("+%.0f%%", change)
+				desc = fmt.Sprintf("Recent cycles avg %.0f vs earlier %.0f - usage is increasing.", recentAvg, olderAvg)
+				sev = "warning"
+			case change < -15:
+				metric = fmt.Sprintf("%.0f%%", change)
+				desc = fmt.Sprintf("Recent cycles avg %.0f vs earlier %.0f - usage is decreasing.", recentAvg, olderAvg)
+				sev = "positive"
+			default:
+				metric = "Stable"
+				desc = fmt.Sprintf("Recent avg %.0f vs earlier %.0f - steady usage pattern.", recentAvg, olderAvg)
+				sev = "positive"
+			}
+			resp.Insights = append(resp.Insights, insightItem{
+				Key:  "trend",
+				Type: "trend", Severity: sev,
+				Title:    "Trend",
+				Metric:   metric,
+				Sublabel: "recent vs earlier",
+				Desc:     desc,
+			})
+		}
+	}
+
+	// If no insights at all, add a getting-started message
+	if len(resp.Insights) == 0 {
+		resp.Insights = append(resp.Insights, insightItem{
+			Type: "info", Severity: "info",
+			Title: "Getting Started",
+			Desc:  "Keep onWatch running to build up usage data. Deep insights will appear after a few cycles.",
+		})
+	}
+
+	return resp
+}
+
+// insightsZai returns Z.ai deep analytics with historical data
+func (h *Handler) insightsZai(w http.ResponseWriter, r *http.Request, rangeDur time.Duration) {
+	hidden := h.getHiddenInsightKeys()
+	respondJSON(w, http.StatusOK, h.buildZaiInsights(hidden))
+}
+
+// buildZaiInsights builds the Z.ai insights response.
+func (h *Handler) buildZaiInsights(hidden map[string]bool) insightsResponse {
+	resp := insightsResponse{Stats: []insightStat{}, Insights: []insightItem{}}
+
+	if h.store == nil {
+		return resp
+	}
+
+	latest, err := h.store.QueryLatestZai()
+	if err != nil {
+		h.logger.Error("failed to query Z.ai data for insights", "error", err)
+		return resp
+	}
+
+	if latest == nil {
+		resp.Insights = append(resp.Insights, insightItem{
+			Type: "info", Severity: "info",
+			Title: "Getting Started",
+			Desc:  "Keep onWatch running to collect Z.ai usage data. Insights appear after a few snapshots.",
+		})
+		return resp
+	}
+
+	now := time.Now().UTC()
+
+	// Z.ai API: "usage" = budget, "currentValue" = actual consumption
+	tokensBudget := latest.TokensUsage
+	tokensUsed := latest.TokensCurrentValue
+	tokensRemaining := latest.TokensRemaining
+
+	timeBudget := latest.TimeUsage
+	timeUsed := latest.TimeCurrentValue
+	timePercent := float64(latest.TimePercentage)
+	timeRemaining := latest.TimeRemaining
+
+	// Compute total tool calls from usageDetails
+	var totalToolCalls float64
+	if latest.TimeUsageDetails != "" {
+		var details []api.ZaiUsageDetail
+		if err := json.Unmarshal([]byte(latest.TimeUsageDetails), &details); err == nil {
+			for _, d := range details {
+				totalToolCalls += d.Usage
+			}
+		}
+	}
+
+	// Historical snapshots for rate/trend computation
+	d24h := now.Add(-24 * time.Hour)
+	d7d := now.Add(-7 * 24 * time.Hour)
+	snapshots24h, _ := h.store.QueryZaiRange(d24h, now)
+	snapshots7d, _ := h.store.QueryZaiRange(d7d, now)
+
+	// Plan capacity: "usage" field IS the daily budget (resets daily)
+	dailyTokenBudget := tokensBudget // e.g., 200,000,000 tokens/day
+	monthlyTokenCapacity := dailyTokenBudget * 30
+	dailyTimeBudget := timeBudget // e.g., 1000 time units/day
+	monthlyTimeCapacity := dailyTimeBudget * 30
+
+	// Avg tokens per tool call
+	var avgTokensPerCall float64
+	if totalToolCalls > 0 {
+		avgTokensPerCall = tokensUsed / totalToolCalls
+	}
+
+	// ═══ Stats Cards (quick KPI numbers - no duplicates with insights below) ═══
+	resp.Stats = append(resp.Stats, insightStat{
+		Value: fmt.Sprintf("%d%%", latest.TokensPercentage),
+		Label: "Tokens Used",
+	})
+	resp.Stats = append(resp.Stats, insightStat{
+		Value: compactNum(tokensRemaining),
+		Label: "Tokens Left",
+	})
+	resp.Stats = append(resp.Stats, insightStat{
+		Value: fmt.Sprintf("%.0f", totalToolCalls),
+		Label: "Tool Calls",
+	})
+	resp.Stats = append(resp.Stats, insightStat{
+		Value: fmt.Sprintf("%.0f / %.0f", timeUsed, timeBudget),
+		Label: "Time Budget",
+	})
+
+	// ═══ Deep Insights ═══
+
+	// 1. Token Consumption Rate (computed from historical snapshots)
+	if !hidden["token_rate"] && len(snapshots24h) >= 2 {
+		oldest := snapshots24h[0]
+		newest := snapshots24h[len(snapshots24h)-1]
+		elapsed := newest.CapturedAt.Sub(oldest.CapturedAt)
+		tokenDelta := newest.TokensCurrentValue - oldest.TokensCurrentValue
+
+		if elapsed.Hours() > 0 && tokenDelta > 0 {
+			ratePerHour := tokenDelta / elapsed.Hours()
+			resp.Insights = append(resp.Insights, insightItem{
+				Key:  "token_rate",
+				Type: "trend", Severity: "info",
+				Title:    "Token Rate",
+				Metric:   fmt.Sprintf("%s/hr", compactNum(ratePerHour)),
+				Sublabel: fmt.Sprintf("last %.0fh", elapsed.Hours()),
+				Desc: fmt.Sprintf("Consuming ~%s tokens/hour over the last %.1f hours (%s total in this period).",
+					compactNum(ratePerHour), elapsed.Hours(), compactNum(tokenDelta)),
+			})
+
+			// 3. Projected Token Usage (only if we have a reset time)
+			if !hidden["projected_usage"] && latest.TokensNextResetTime != nil {
+				hoursLeft := time.Until(*latest.TokensNextResetTime).Hours()
+				if hoursLeft > 0 {
+					projected := tokensUsed + (ratePerHour * hoursLeft)
+					projectedPct := (projected / tokensBudget) * 100
+
+					projSev := severityFromPercent(projectedPct)
+					projDesc := fmt.Sprintf("At current rate (~%s/hr), projected %s tokens (%s%%) by reset.",
+						compactNum(ratePerHour), compactNum(projected), compactNum(projectedPct))
+					if projectedPct >= 100 {
+						projDesc += " Likely to exhaust budget before reset."
+					} else if projectedPct >= 80 {
+						projDesc += " Approaching limit - monitor closely."
+					} else {
+						projDesc += " Comfortable headroom."
+					}
+					resp.Insights = append(resp.Insights, insightItem{
+						Key:  "projected_usage",
+						Type: "recommendation", Severity: projSev,
+						Title:    "Projected Usage",
+						Metric:   fmt.Sprintf("%.0f%%", projectedPct),
+						Sublabel: fmt.Sprintf("~%s by reset", compactNum(projected)),
+						Desc:     projDesc,
+					})
+				}
+			}
+		}
+	}
+
+	// 4. Time Budget (only when no per-tool details - Top Tool insight covers breakdown)
+	if !hidden["time_budget"] && latest.TimeUsageDetails == "" {
+		// No per-tool details - show basic time budget insight
+		timeSev := severityFromPercent(timePercent)
+		resp.Insights = append(resp.Insights, insightItem{
+			Key:  "time_budget",
+			Type: "factual", Severity: timeSev,
+			Title:    "Time Budget",
+			Metric:   fmt.Sprintf("%d%%", latest.TimePercentage),
+			Sublabel: fmt.Sprintf("%.0f of %.0f used", timeUsed, timeBudget),
+			Desc:     fmt.Sprintf("%.0f of %.0f time budget used (%d%%), %.0f remaining.", timeUsed, timeBudget, latest.TimePercentage, timeRemaining),
+		})
+	}
+
+	// 5. 24h Token Trend (compare first half vs second half of snapshots)
+	if !hidden["trend_24h"] && len(snapshots24h) >= 4 {
+		mid := len(snapshots24h) / 2
+		firstHalf := snapshots24h[:mid]
+		secondHalf := snapshots24h[mid:]
+
+		firstDelta := firstHalf[len(firstHalf)-1].TokensCurrentValue - firstHalf[0].TokensCurrentValue
+		secondDelta := secondHalf[len(secondHalf)-1].TokensCurrentValue - secondHalf[0].TokensCurrentValue
+
+		firstElapsed := firstHalf[len(firstHalf)-1].CapturedAt.Sub(firstHalf[0].CapturedAt).Hours()
+		secondElapsed := secondHalf[len(secondHalf)-1].CapturedAt.Sub(secondHalf[0].CapturedAt).Hours()
+
+		if firstElapsed > 0 && secondElapsed > 0 {
+			firstRate := firstDelta / firstElapsed
+			secondRate := secondDelta / secondElapsed
+
+			if firstRate > 0 {
+				change := ((secondRate - firstRate) / firstRate) * 100
+				var trendSev, trendMetric, trendDesc string
+				switch {
+				case change > 25:
+					trendSev = "warning"
+					trendMetric = fmt.Sprintf("+%.0f%%", change)
+					trendDesc = fmt.Sprintf("Token consumption accelerating: recent rate ~%s/hr vs earlier ~%s/hr.", compactNum(secondRate), compactNum(firstRate))
+				case change < -25:
+					trendSev = "positive"
+					trendMetric = fmt.Sprintf("%.0f%%", change)
+					trendDesc = fmt.Sprintf("Token consumption slowing: recent rate ~%s/hr vs earlier ~%s/hr.", compactNum(secondRate), compactNum(firstRate))
+				default:
+					trendSev = "positive"
+					trendMetric = "Stable"
+					trendDesc = fmt.Sprintf("Steady consumption: ~%s/hr over the observation period.", compactNum((firstRate+secondRate)/2))
+				}
+				resp.Insights = append(resp.Insights, insightItem{
+					Key:  "trend_24h",
+					Type: "trend", Severity: trendSev,
+					Title:    "24h Trend",
+					Metric:   trendMetric,
+					Sublabel: "recent vs earlier",
+					Desc:     trendDesc,
+				})
+			}
+		}
+	}
+
+	// 6. 7-Day Token Summary
+	if !hidden["usage_7d"] && len(snapshots7d) >= 2 {
+		oldest7d := snapshots7d[0]
+		newest7d := snapshots7d[len(snapshots7d)-1]
+		totalDelta7d := newest7d.TokensCurrentValue - oldest7d.TokensCurrentValue
+		elapsed7d := newest7d.CapturedAt.Sub(oldest7d.CapturedAt)
+
+		if totalDelta7d > 0 && elapsed7d.Hours() > 0 {
+			dailyRate := totalDelta7d / (elapsed7d.Hours() / 24)
+			resp.Insights = append(resp.Insights, insightItem{
+				Key:  "usage_7d",
+				Type: "factual", Severity: "info",
+				Title:    "7-Day Usage",
+				Metric:   compactNum(totalDelta7d),
+				Sublabel: fmt.Sprintf("~%s/day", compactNum(dailyRate)),
+				Desc: fmt.Sprintf("%s tokens consumed over %.1f days (%d snapshots). Daily average: ~%s tokens.",
+					compactNum(totalDelta7d), elapsed7d.Hours()/24, len(snapshots7d), compactNum(dailyRate)),
+			})
+		}
+	}
+
+	// 7. Plan Capacity (daily vs monthly context)
+	if !hidden["plan_capacity"] && dailyTokenBudget > 0 {
+		dailyUsedPct := (tokensUsed / dailyTokenBudget) * 100
+		desc := fmt.Sprintf("Daily token limit: %s. Monthly capacity: %s (30 × daily).", compactNum(dailyTokenBudget), compactNum(monthlyTokenCapacity))
+		if dailyUsedPct >= 80 {
+			desc += fmt.Sprintf(" You've consumed %.0f%% of today's budget.", dailyUsedPct)
+		}
+		if dailyTimeBudget > 0 {
+			desc += fmt.Sprintf(" Daily time limit: %.0f units (monthly: %s).", dailyTimeBudget, compactNum(monthlyTimeCapacity))
+		}
+		resp.Insights = append(resp.Insights, insightItem{
+			Key:  "plan_capacity",
+			Type: "factual", Severity: "info",
+			Title:    "Plan Capacity",
+			Metric:   compactNum(monthlyTokenCapacity),
+			Sublabel: fmt.Sprintf("%s tokens/day", compactNum(dailyTokenBudget)),
+			Desc:     desc,
+		})
+	}
+
+	// 8. Tokens Per Call (efficiency metric)
+	if !hidden["tokens_per_call"] && totalToolCalls > 0 && avgTokensPerCall > 0 {
+		sev := "info"
+		desc := fmt.Sprintf("Each tool call consumes ~%s tokens on average (%s tokens across %.0f calls).", compactNum(avgTokensPerCall), compactNum(tokensUsed), totalToolCalls)
+		if dailyTokenBudget > 0 {
+			callsPerDay := dailyTokenBudget / avgTokensPerCall
+			desc += fmt.Sprintf(" At this rate, your daily budget supports ~%.0f calls.", callsPerDay)
+			if callsPerDay < totalToolCalls*2 {
+				sev = "warning"
+			}
+		}
+		resp.Insights = append(resp.Insights, insightItem{
+			Key:  "tokens_per_call",
+			Type: "factual", Severity: sev,
+			Title:    "Tokens Per Call",
+			Metric:   compactNum(avgTokensPerCall),
+			Sublabel: "avg tokens/call",
+			Desc:     desc,
+		})
+	}
+
+	// 9. Top Tool (dominant tool analysis)
+	if !hidden["top_tool"] && latest.TimeUsageDetails != "" {
+		var details []api.ZaiUsageDetail
+		if err := json.Unmarshal([]byte(latest.TimeUsageDetails), &details); err == nil && len(details) > 1 {
+			var topTool string
+			var topUsage, totalUsage float64
+			for _, d := range details {
+				totalUsage += d.Usage
+				if d.Usage > topUsage {
+					topUsage = d.Usage
+					topTool = d.ModelCode
+				}
+			}
+			if totalUsage > 0 {
+				topPct := (topUsage / totalUsage) * 100
+				sev := "info"
+				if topPct > 70 {
+					sev = "warning"
+				}
+				desc := fmt.Sprintf("%s leads with %.0f calls (%.0f%% of %.0f total).", topTool, topUsage, topPct, totalUsage)
+				// Find second-highest for comparison
+				var secondTool string
+				var secondUsage float64
+				for _, d := range details {
+					if d.ModelCode != topTool && d.Usage > secondUsage {
+						secondUsage = d.Usage
+						secondTool = d.ModelCode
+					}
+				}
+				if secondTool != "" {
+					ratio := topUsage / secondUsage
+					desc += fmt.Sprintf(" %.1fx more than %s (%.0f calls).", ratio, secondTool, secondUsage)
+				}
+				resp.Insights = append(resp.Insights, insightItem{
+					Key:  "top_tool",
+					Type: "factual", Severity: sev,
+					Title:    "Top Tool",
+					Metric:   topTool,
+					Sublabel: fmt.Sprintf("%.0f%% of calls", topPct),
+					Desc:     desc,
+				})
+			}
+		}
+	}
+
+	return resp
+}
+
+// ── Anthropic Promo Definitions ──
+
+type anthropicPromo struct {
+	ID               string `json:"id"`
+	Title            string `json:"title"`
+	Description      string `json:"description"`
+	StartsAt         string `json:"startsAt"`
+	EndsAt           string `json:"endsAt"`
+	PeakStartHourET  int    `json:"peakStartHourET"`
+	PeakEndHourET    int    `json:"peakEndHourET"`
+	PeakWeekdaysOnly bool   `json:"peakWeekdaysOnly"`
+}
+
+var anthropicPromos = []anthropicPromo{
+	{
+		ID:               "march-2026-offpeak-2x",
+		Title:            "Higher Limits Available",
+		Description:      "Off-peak hours get doubled 5-hour usage. Additional off-peak usage does not count toward weekly limits.",
+		StartsAt:         "2026-03-13T00:00:00-07:00",
+		EndsAt:           "2026-03-27T23:59:00-07:00",
+		PeakStartHourET:  8,
+		PeakEndHourET:    14,
+		PeakWeekdaysOnly: true,
+	},
+}
+
+func activeAnthropicPromo(now time.Time) *anthropicPromo {
+	for i := range anthropicPromos {
+		start, _ := time.Parse(time.RFC3339, anthropicPromos[i].StartsAt)
+		end, _ := time.Parse(time.RFC3339, anthropicPromos[i].EndsAt)
+		if now.After(start) && now.Before(end) {
+			return &anthropicPromos[i]
+		}
+	}
+	return nil
+}
+
+// ── Anthropic Provider Handlers ──
+
+// currentAnthropic returns Anthropic quota status.
+func (h *Handler) currentAnthropic(w http.ResponseWriter, r *http.Request) {
+	respondJSON(w, http.StatusOK, h.buildAnthropicCurrent())
+}
+
+// buildAnthropicCurrent builds the Anthropic current quota response map.
+// Merges data from the latest snapshot (statusline or API) with per-quota
+// freshness information so the UI can show all quotas with age indicators.
+func (h *Handler) buildAnthropicCurrent() map[string]interface{} {
+	now := time.Now().UTC()
+	response := map[string]interface{}{
+		"capturedAt": now.Format(time.RFC3339),
+		"quotas":     []interface{}{},
+	}
+	if promo := activeAnthropicPromo(now); promo != nil {
+		response["promo"] = promo
+	}
+
+	if h.store == nil {
+		return response
+	}
+
+	// Get per-quota latest values (merges statusline + API snapshots).
+	// This ensures we show Sonnet/extra_usage from older API polls alongside
+	// fresh five_hour/seven_day from statusline.
+	latestPerQuota, err := h.store.QueryAnthropicLatestPerQuota()
+	if err != nil {
+		h.logger.Error("failed to query latest per-quota Anthropic data", "error", err)
+		// Fall back to single-snapshot approach
+		return h.buildAnthropicCurrentFallback(response)
+	}
+
+	if len(latestPerQuota) == 0 {
+		return response
+	}
+
+	// Find the most recent capturedAt across all quotas
+	var latestCaptured time.Time
+	for _, q := range latestPerQuota {
+		if q.CapturedAt.After(latestCaptured) {
+			latestCaptured = q.CapturedAt
+		}
+	}
+	response["capturedAt"] = latestCaptured.Format(time.RFC3339)
+
+	// Sort by display order
+	sort.SliceStable(latestPerQuota, func(i, j int) bool {
+		left := anthropicQuotaDisplayOrder(latestPerQuota[i].Name)
+		right := anthropicQuotaDisplayOrder(latestPerQuota[j].Name)
+		if left != right {
+			return left < right
+		}
+		return latestPerQuota[i].Name < latestPerQuota[j].Name
+	})
+
+	var quotas []map[string]interface{}
+	for _, q := range latestPerQuota {
+		age := now.Sub(q.CapturedAt)
+		qMap := map[string]interface{}{
+			"name":          q.Name,
+			"displayName":   api.AnthropicDisplayName(q.Name),
+			"utilization":   q.Utilization,
+			"status":        anthropicUtilStatus(q.Utilization),
+			"source":        q.Source,
+			"lastUpdatedAt": q.CapturedAt.Format(time.RFC3339),
+			"ageSeconds":    int64(age.Seconds()),
+			"isStale":       age > 30*time.Minute,
+		}
+		if q.ResetsAt != nil {
+			timeUntilReset := time.Until(*q.ResetsAt)
+			qMap["resetsAt"] = q.ResetsAt.Format(time.RFC3339)
+			qMap["timeUntilReset"] = formatDuration(timeUntilReset)
+			qMap["timeUntilResetSeconds"] = int64(timeUntilReset.Seconds())
+		}
+		// Enrich with tracker data
+		if h.anthropicTracker != nil {
+			if summary, err := h.anthropicTracker.UsageSummary(q.Name); err == nil && summary != nil {
+				qMap["currentRate"] = summary.CurrentRate
+				qMap["projectedUtil"] = summary.ProjectedUtil
+			}
+		}
+		quotas = append(quotas, qMap)
+	}
+	response["quotas"] = quotas
+	return response
+}
+
+// buildAnthropicCurrentFallback uses the single latest snapshot when per-quota
+// merge fails. This preserves the original behavior as a safety net.
+func (h *Handler) buildAnthropicCurrentFallback(response map[string]interface{}) map[string]interface{} {
+	latest, err := h.store.QueryLatestAnthropic()
+	if err != nil || latest == nil {
+		return response
+	}
+
+	now := time.Now().UTC()
+	response["capturedAt"] = latest.CapturedAt.Format(time.RFC3339)
+	orderedQuotas := make([]api.AnthropicQuota, len(latest.Quotas))
+	copy(orderedQuotas, latest.Quotas)
+	sort.SliceStable(orderedQuotas, func(i, j int) bool {
+		left := anthropicQuotaDisplayOrder(orderedQuotas[i].Name)
+		right := anthropicQuotaDisplayOrder(orderedQuotas[j].Name)
+		if left != right {
+			return left < right
+		}
+		return orderedQuotas[i].Name < orderedQuotas[j].Name
+	})
+	var quotas []map[string]interface{}
+	age := now.Sub(latest.CapturedAt)
+	for _, q := range orderedQuotas {
+		qMap := map[string]interface{}{
+			"name":          q.Name,
+			"displayName":   api.AnthropicDisplayName(q.Name),
+			"utilization":   q.Utilization,
+			"status":        anthropicUtilStatus(q.Utilization),
+			"source":        "api",
+			"lastUpdatedAt": latest.CapturedAt.Format(time.RFC3339),
+			"ageSeconds":    int64(age.Seconds()),
+			"isStale":       age > 30*time.Minute,
+		}
+		if q.ResetsAt != nil {
+			timeUntilReset := time.Until(*q.ResetsAt)
+			qMap["resetsAt"] = q.ResetsAt.Format(time.RFC3339)
+			qMap["timeUntilReset"] = formatDuration(timeUntilReset)
+			qMap["timeUntilResetSeconds"] = int64(timeUntilReset.Seconds())
+		}
+		if h.anthropicTracker != nil {
+			if summary, err := h.anthropicTracker.UsageSummary(q.Name); err == nil && summary != nil {
+				qMap["currentRate"] = summary.CurrentRate
+				qMap["projectedUtil"] = summary.ProjectedUtil
+			}
+		}
+		quotas = append(quotas, qMap)
+	}
+	response["quotas"] = quotas
+	return response
+}
+
+// anthropicUtilStatus returns a status string based on utilization percentage.
+func anthropicUtilStatus(util float64) string {
+	switch {
+	case util >= 95:
+		return "critical"
+	case util >= 80:
+		return "danger"
+	case util >= 50:
+		return "warning"
+	default:
+		return "healthy"
+	}
+}
+
+func anthropicQuotaDisplayOrder(name string) int {
+	switch name {
+	case "five_hour":
+		return 0
+	case "seven_day":
+		return 1
+	case "seven_day_sonnet":
+		return 2
+	case "monthly_limit":
+		return 3
+	case "extra_usage":
+		return 4
+	default:
+		return 100
+	}
+}
+
+// historyAnthropic returns Anthropic usage history.
+func (h *Handler) historyAnthropic(w http.ResponseWriter, r *http.Request) {
+	if h.store == nil {
+		respondJSON(w, http.StatusOK, []interface{}{})
+		return
+	}
+	rangeStr := r.URL.Query().Get("range")
+	duration, err := parseTimeRange(rangeStr)
+	if err != nil {
+		respondError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	now := time.Now().UTC()
+	start := now.Add(-duration)
+	snapshots, err := h.store.QueryAnthropicRange(start, now)
+	if err != nil {
+		h.logger.Error("failed to query Anthropic history", "error", err)
+		respondError(w, http.StatusInternalServerError, "failed to query history")
+		return
+	}
+	step := downsampleStep(len(snapshots), maxChartPoints)
+	last := len(snapshots) - 1
+	// Track last known value for each quota so statusline snapshots (which only
+	// have five_hour + seven_day) don't chart supplementary quotas as 0.
+	lastKnown := make(map[string]float64)
+	response := make([]map[string]interface{}, 0, min(len(snapshots), maxChartPoints))
+	for i, snap := range snapshots {
+		// Update lastKnown for all quotas in this snapshot
+		for _, q := range snap.Quotas {
+			lastKnown[q.Name] = q.Utilization
+		}
+		if step > 1 && i != 0 && i != last && i%step != 0 {
+			continue
+		}
+		entry := map[string]interface{}{
+			"capturedAt": snap.CapturedAt.Format(time.RFC3339),
+		}
+		for _, q := range snap.Quotas {
+			entry[q.Name] = q.Utilization
+		}
+		// For quotas not in this snapshot, carry forward last known value.
+		// This prevents statusline-only snapshots from charting Sonnet/extra as 0.
+		isStatusline := strings.Contains(snap.RawJSON, `"_source":"statusline"`)
+		if isStatusline {
+			for name, val := range lastKnown {
+				if _, exists := entry[name]; !exists {
+					entry[name] = val
+				}
+			}
+		}
+		// Tag source
+		if isStatusline {
+			entry["_source"] = "statusline"
+		} else {
+			entry["_source"] = "api"
+		}
+		response = append(response, entry)
+	}
+	respondJSON(w, http.StatusOK, response)
+}
+
+// cyclesAnthropic returns per-minute Anthropic snapshot data as cycle-shaped rows.
+// Each polled snapshot becomes a row, enabling 1m/5m/30m/1h grouping in the frontend.
+func (h *Handler) cyclesAnthropic(w http.ResponseWriter, r *http.Request) {
+	if h.store == nil {
+		respondJSON(w, http.StatusOK, []interface{}{})
+		return
+	}
+	quotaName := r.URL.Query().Get("type")
+	if quotaName == "" {
+		quotaName = "five_hour"
+	}
+
+	rangeDur := parseInsightsRange(r.URL.Query().Get("range"))
+	since := time.Now().UTC().Add(-rangeDur)
+
+	points, err := h.store.QueryAnthropicUtilizationSeries(quotaName, since)
+	if err != nil {
+		h.logger.Error("failed to query Anthropic utilization series", "error", err)
+		respondError(w, http.StatusInternalServerError, "failed to query cycles")
+		return
+	}
+
+	response := make([]map[string]interface{}, 0, len(points))
+	for i, pt := range points {
+		var delta float64
+		if i > 0 {
+			d := pt.Utilization - points[i-1].Utilization
+			if d > 0 {
+				delta = d
+			}
+		}
+		var cycleEnd interface{}
+		if i < len(points)-1 {
+			cycleEnd = points[i+1].CapturedAt.Format(time.RFC3339)
+		}
+		response = append(response, map[string]interface{}{
+			"id":              i + 1,
+			"quotaName":       quotaName,
+			"cycleStart":      pt.CapturedAt.Format(time.RFC3339),
+			"cycleEnd":        cycleEnd,
+			"peakUtilization": pt.Utilization,
+			"totalDelta":      delta,
+		})
+	}
+
+	// Reverse to DESC order (newest first) to match frontend expectations
+	for i, j := 0, len(response)-1; i < j; i, j = i+1, j-1 {
+		response[i], response[j] = response[j], response[i]
+	}
+
+	respondJSON(w, http.StatusOK, response)
+}
+
+// anthropicCycleToMap converts an AnthropicResetCycle to a JSON-friendly map.
+func anthropicCycleToMap(cycle *store.AnthropicResetCycle) map[string]interface{} {
+	result := map[string]interface{}{
+		"id":              cycle.ID,
+		"quotaName":       cycle.QuotaName,
+		"cycleStart":      cycle.CycleStart.Format(time.RFC3339),
+		"cycleEnd":        nil,
+		"peakUtilization": cycle.PeakUtilization,
+		"totalDelta":      cycle.TotalDelta,
+	}
+	if cycle.CycleEnd != nil {
+		result["cycleEnd"] = cycle.CycleEnd.Format(time.RFC3339)
+	}
+	if cycle.ResetsAt != nil {
+		result["renewsAt"] = cycle.ResetsAt.Format(time.RFC3339)
+	}
+	return result
+}
+
+// summaryAnthropic returns Anthropic usage summary.
+func (h *Handler) summaryAnthropic(w http.ResponseWriter, r *http.Request) {
+	respondJSON(w, http.StatusOK, h.buildAnthropicSummaryMap())
+}
+
+// buildAnthropicSummaryMap builds the Anthropic summary response.
+func (h *Handler) buildAnthropicSummaryMap() map[string]interface{} {
+	response := map[string]interface{}{}
+	if h.anthropicTracker != nil && h.store != nil {
+		latest, err := h.store.QueryLatestAnthropic()
+		if err == nil && latest != nil {
+			for _, q := range latest.Quotas {
+				if summary, err := h.anthropicTracker.UsageSummary(q.Name); err == nil && summary != nil {
+					response[q.Name] = buildAnthropicSummaryResponse(summary)
+				}
+			}
+		}
+	}
+	return response
+}
+
+// buildAnthropicSummaryResponse builds a summary response from AnthropicTracker data.
+func buildAnthropicSummaryResponse(summary *tracker.AnthropicSummary) map[string]interface{} {
+	result := map[string]interface{}{
+		"quotaName":       summary.QuotaName,
+		"currentUtil":     summary.CurrentUtil,
+		"currentRate":     summary.CurrentRate,
+		"projectedUtil":   summary.ProjectedUtil,
+		"completedCycles": summary.CompletedCycles,
+		"avgPerCycle":     summary.AvgPerCycle,
+		"peakCycle":       summary.PeakCycle,
+		"totalTracked":    summary.TotalTracked,
+		"trackingSince":   nil,
+	}
+	if summary.ResetsAt != nil {
+		result["resetsAt"] = summary.ResetsAt.Format(time.RFC3339)
+		result["timeUntilReset"] = formatDuration(summary.TimeUntilReset)
+	}
+	if !summary.TrackingSince.IsZero() {
+		result["trackingSince"] = summary.TrackingSince.Format(time.RFC3339)
+	}
+	return result
+}
+
+// insightsAnthropic returns Anthropic deep analytics.
+func (h *Handler) insightsAnthropic(w http.ResponseWriter, r *http.Request, rangeDur time.Duration) {
+	hidden := h.getHiddenInsightKeys()
+	respondJSON(w, http.StatusOK, h.buildAnthropicInsights(hidden, rangeDur))
+}
+
+// buildAnthropicInsights builds the Anthropic insights response with per-quota analytics.
+func (h *Handler) buildAnthropicInsights(hidden map[string]bool, rangeDur time.Duration) insightsResponse {
+	resp := insightsResponse{Stats: []insightStat{}, Insights: []insightItem{}}
+	if h.store == nil {
+		return resp
+	}
+	latest, err := h.store.QueryLatestAnthropic()
+	if err != nil || latest == nil {
+		resp.Insights = append(resp.Insights, insightItem{
+			Type: "info", Severity: "info",
+			Title: "Getting Started",
+			Desc:  "Keep onWatch running to collect Anthropic usage data. Insights will appear after a few snapshots.",
+		})
+		return resp
+	}
+
+	// Collect summaries for all quotas
+	quotaNames, _ := h.store.QueryAllAnthropicQuotaNames()
+	summaries := map[string]*tracker.AnthropicSummary{}
+	if h.anthropicTracker != nil {
+		for _, name := range quotaNames {
+			if s, err := h.anthropicTracker.UsageSummary(name); err == nil && s != nil {
+				summaries[name] = s
+			}
+		}
+	}
+
+	// Fetch completed cycles per quota and group into real billing periods
+	quotaCycles := map[string][]*store.AnthropicResetCycle{}
+	quotaBillingCount := map[string]int{}
+	quotaBillingAvg := map[string]float64{}
+	quotaBillingPeak := map[string]float64{}
+	for _, name := range quotaNames {
+		cycles, err := h.store.QueryAnthropicCycleHistory(name, 50)
+		if err == nil && len(cycles) > 0 {
+			quotaCycles[name] = cycles
+			quotaBillingCount[name] = anthropicBillingPeriodCount(cycles)
+			quotaBillingAvg[name] = anthropicBillingPeriodAvg(cycles)
+			quotaBillingPeak[name] = anthropicBillingPeriodPeak(cycles)
+		}
+	}
+
+	// ═══ Stats Cards ═══
+	// Show avg window utilization per quota (current % already shown in KPI cards)
+	for _, q := range latest.Quotas {
+		if avg, ok := quotaBillingAvg[q.Name]; ok && quotaBillingCount[q.Name] > 0 {
+			count := quotaBillingCount[q.Name]
+			periodWord := "window"
+			if count > 1 {
+				periodWord = "windows"
+			}
+			resp.Stats = append(resp.Stats, insightStat{
+				Value:    fmt.Sprintf("%.0f%%", avg),
+				Label:    fmt.Sprintf("Avg %s", api.AnthropicDisplayName(q.Name)),
+				Sublabel: fmt.Sprintf("across %d %s", count, periodWord),
+			})
+		} else {
+			// No completed cycles yet - show current with "Now" label
+			resp.Stats = append(resp.Stats, insightStat{
+				Value: fmt.Sprintf("%.0f%%", q.Utilization),
+				Label: fmt.Sprintf("%s (now)", api.AnthropicDisplayName(q.Name)),
+			})
+		}
+	}
+
+	// ═══ Deep Insights ═══
+
+	// Collect rates for cross-quota analysis
+	quotaRates := map[string]anthropicQuotaRate{}
+
+	// 1. Burn Rate & Forecast per quota (replaces redundant current_* cards)
+	for _, q := range latest.Quotas {
+		key := fmt.Sprintf("forecast_%s", q.Name)
+		if hidden[key] {
+			continue
+		}
+		s := summaries[q.Name]
+		rate := h.computeAnthropicRate(q.Name, q.Utilization, s)
+		quotaRates[q.Name] = rate
+
+		var item insightItem
+		item.Key = key
+		item.Title = api.AnthropicDisplayName(q.Name)
+
+		// Build reset time string (reused across scenarios)
+		resetStr := ""
+		if s != nil && s.ResetsAt != nil {
+			resetStr = formatDuration(s.TimeUntilReset)
+		}
+
+		if !rate.HasRate {
+			// Insufficient data - show analyzing state with preview
+			item.Type = "factual"
+			item.Severity = "info"
+			item.Metric = "Analyzing..."
+			item.Sublabel = "burn rate & forecast"
+			item.Desc = fmt.Sprintf("Collecting usage patterns to calculate burn rate and exhaustion forecasts. Currently at %.0f%%. This typically requires ~10 minutes of data.", q.Utilization)
+		} else if rate.Rate < 0.01 {
+			// Idle - truly zero consumption
+			item.Type = "factual"
+			item.Severity = "info"
+			item.Metric = "Idle"
+			if resetStr != "" {
+				item.Sublabel = fmt.Sprintf("resets in %s", resetStr)
+			} else {
+				item.Sublabel = "no activity"
+			}
+			item.Desc = fmt.Sprintf("No consumption detected recently. Currently at %.0f%%.", q.Utilization)
+		} else if rate.ExhaustsFirst {
+			// Exhausts before reset - danger
+			item.Type = "recommendation"
+			item.Severity = "negative"
+			item.Metric = fmt.Sprintf("%.1f%%/hr", rate.Rate)
+			exhaustStr := formatDuration(rate.TimeToExhaust)
+			item.Sublabel = fmt.Sprintf("exhausts in %s", exhaustStr)
+			desc := fmt.Sprintf("At this rate, quota exhausts in %s.", exhaustStr)
+			if resetStr != "" {
+				desc += fmt.Sprintf(" Resets in %s. May hit limit before reset.", resetStr)
+			}
+			item.Desc = desc
+		} else if rate.ProjectedPct > 80 {
+			// High projected usage at reset - warning
+			item.Type = "recommendation"
+			item.Severity = "warning"
+			item.Metric = fmt.Sprintf("%.1f%%/hr", rate.Rate)
+			if resetStr != "" {
+				item.Sublabel = fmt.Sprintf("~%.0f%% at reset in %s", rate.ProjectedPct, resetStr)
+			} else {
+				item.Sublabel = fmt.Sprintf("projected ~%.0f%%", rate.ProjectedPct)
+			}
+			item.Desc = fmt.Sprintf("Consuming at %.1f%%/hr. Projected ~%.0f%% at reset.", rate.Rate, rate.ProjectedPct)
+		} else {
+			// Safe - comfortable headroom
+			item.Type = "factual"
+			item.Severity = "positive"
+			item.Metric = fmt.Sprintf("%.1f%%/hr", rate.Rate)
+			if resetStr != "" {
+				item.Sublabel = fmt.Sprintf("resets in %s", resetStr)
+			} else {
+				item.Sublabel = "comfortable headroom"
+			}
+			item.Desc = fmt.Sprintf("Consuming at %.1f%%/hr with comfortable headroom.", rate.Rate)
+		}
+
+		resp.Insights = append(resp.Insights, item)
+	}
+
+	// 2. Variance (per quota, ≥3 real billing periods)
+	for _, name := range quotaNames {
+		count := quotaBillingCount[name]
+		avg := quotaBillingAvg[name]
+		peak := quotaBillingPeak[name]
+		if count < 3 || avg <= 1 {
+			continue
+		}
+		key := fmt.Sprintf("variance_%s", name)
+		if hidden[key] {
+			continue
+		}
+		diff := ((peak - avg) / avg) * 100
+		var item insightItem
+		switch {
+		case diff > 50:
+			item = insightItem{Key: key, Type: "factual", Severity: "warning",
+				Title: "High Variance", Metric: fmt.Sprintf("+%.0f%%", diff), Sublabel: api.AnthropicDisplayName(name),
+				Desc: fmt.Sprintf("Peak period %.0f%% vs average %.0f%% for %s - usage varies significantly.", peak, avg, api.AnthropicDisplayName(name)),
+			}
+		case diff > 10:
+			item = insightItem{Key: key, Type: "factual", Severity: "info",
+				Title: "Usage Spread", Metric: fmt.Sprintf("+%.0f%%", diff), Sublabel: api.AnthropicDisplayName(name),
+				Desc: fmt.Sprintf("Peak: %.0f%%, average: %.0f%% for %s - moderately consistent.", peak, avg, api.AnthropicDisplayName(name)),
+			}
+		default:
+			item = insightItem{Key: key, Type: "factual", Severity: "positive",
+				Title: "Consistent", Metric: fmt.Sprintf("~%.0f%%", avg), Sublabel: api.AnthropicDisplayName(name),
+				Desc: fmt.Sprintf("Peak (%.0f%%) close to average (%.0f%%) for %s - predictable usage.", peak, avg, api.AnthropicDisplayName(name)),
+			}
+		}
+		resp.Insights = append(resp.Insights, item)
+	}
+
+	// 3. Trend (per quota, ≥4 real billing periods)
+	for _, name := range quotaNames {
+		count := quotaBillingCount[name]
+		if count < 4 {
+			continue
+		}
+		key := fmt.Sprintf("trend_%s", name)
+		if hidden[key] {
+			continue
+		}
+		periods := groupAnthropicBillingPeriods(quotaCycles[name])
+		mid := len(periods) / 2
+		var recentSum, olderSum float64
+		for _, p := range periods[:mid] {
+			recentSum += p.maxPeak
+		}
+		for _, p := range periods[mid:] {
+			olderSum += p.maxPeak
+		}
+		recentAvg := recentSum / float64(mid)
+		olderAvg := olderSum / float64(len(periods)-mid)
+		if olderAvg <= 0 {
+			continue
+		}
+		change := ((recentAvg - olderAvg) / olderAvg) * 100
+		var desc, sev, metric string
+		switch {
+		case change > 15:
+			metric = fmt.Sprintf("+%.0f%%", change)
+			desc = fmt.Sprintf("Recent %s periods avg %.0f%% vs earlier %.0f%% - usage is increasing.", api.AnthropicDisplayName(name), recentAvg, olderAvg)
+			sev = "warning"
+		case change < -15:
+			metric = fmt.Sprintf("%.0f%%", change)
+			desc = fmt.Sprintf("Recent %s periods avg %.0f%% vs earlier %.0f%% - usage is decreasing.", api.AnthropicDisplayName(name), recentAvg, olderAvg)
+			sev = "positive"
+		default:
+			metric = "Stable"
+			desc = fmt.Sprintf("Recent %s periods avg %.0f%% vs earlier %.0f%% - steady usage.", api.AnthropicDisplayName(name), recentAvg, olderAvg)
+			sev = "positive"
+		}
+		resp.Insights = append(resp.Insights, insightItem{
+			Key: key, Type: "trend", Severity: sev,
+			Title: "Trend", Metric: metric, Sublabel: api.AnthropicDisplayName(name),
+			Desc: desc,
+		})
+	}
+
+	// 4. Cross-quota ratio: 5-Hour vs Weekly All-Model
+	if !hidden["ratio_5h_weekly"] {
+		r5h := quotaRates["five_hour"]
+		r7d := quotaRates["seven_day"]
+		if r5h.HasRate && r7d.HasRate && r5h.Rate >= 0.01 && r7d.Rate >= 0.01 {
+			ratio := r5h.Rate / r7d.Rate
+			resp.Insights = append(resp.Insights, insightItem{
+				Key:      "ratio_5h_weekly",
+				Type:     "factual",
+				Severity: "info",
+				Title:    "5-Hour vs Weekly",
+				Metric:   fmt.Sprintf("1:%.0f", ratio),
+				Sublabel: fmt.Sprintf("1%% weekly ~ %.0f%% of 5-hr", ratio),
+				Desc: fmt.Sprintf(
+					"Every 1%% of Weekly All-Model usage costs ~%.0f%% of a single 5-Hour sprint. "+
+						"Based on current rates: 5-Hour at %.1f%%/hr, Weekly at %.1f%%/hr.",
+					ratio, r5h.Rate, r7d.Rate),
+			})
+		}
+	}
+
+	// If no insights at all, add a getting-started message
+	if len(resp.Insights) == 0 {
+		resp.Insights = append(resp.Insights, insightItem{
+			Type: "info", Severity: "info",
+			Title: "Getting Started",
+			Desc:  "Keep onWatch running to build up usage data. Deep insights will appear after a few cycles.",
+		})
+	}
+
+	return resp
+}
+
+// anthropicQuotaRate holds computed burn rate and forecast for an Anthropic quota.
+type anthropicQuotaRate struct {
+	Rate          float64       // %/hr (0 if idle)
+	HasRate       bool          // true if enough data to compute
+	TimeToExhaust time.Duration // time until 100% at current rate
+	TimeToReset   time.Duration // time until quota resets
+	ExhaustsFirst bool          // true if exhaustion < reset
+	ProjectedPct  float64       // projected % at reset time
+}
+
+// computeAnthropicRate computes burn rate from recent snapshots, falling back to tracker summary.
+func (h *Handler) computeAnthropicRate(quotaName string, currentUtil float64, summary *tracker.AnthropicSummary) anthropicQuotaRate {
+	var result anthropicQuotaRate
+
+	// Fill reset time from summary
+	if summary != nil && summary.ResetsAt != nil {
+		result.TimeToReset = time.Until(*summary.ResetsAt)
+	}
+
+	// Try recent snapshots (last 30 min) for a responsive burn rate
+	if h.store != nil {
+		points, err := h.store.QueryAnthropicUtilizationSeries(quotaName, time.Now().Add(-30*time.Minute))
+		if err == nil && len(points) >= 2 {
+			first := points[0]
+			last := points[len(points)-1]
+			elapsed := last.CapturedAt.Sub(first.CapturedAt)
+			if elapsed >= 5*time.Minute {
+				delta := last.Utilization - first.Utilization
+				if delta > 0 {
+					result.Rate = delta / elapsed.Hours()
+					result.HasRate = true
+				} else {
+					// Utilization didn't increase - idle
+					result.Rate = 0
+					result.HasRate = true
+				}
+			}
+		}
+	}
+
+	// Fall back to tracker's cycle-averaged rate
+	if !result.HasRate && summary != nil && summary.CurrentRate > 0 {
+		result.Rate = summary.CurrentRate
+		result.HasRate = true
+	}
+
+	// Compute derived values
+	if result.HasRate && result.Rate > 0 {
+		remaining := 100 - currentUtil
+		if remaining > 0 {
+			result.TimeToExhaust = time.Duration(remaining / result.Rate * float64(time.Hour))
+		}
+		if result.TimeToReset > 0 {
+			result.ProjectedPct = currentUtil + (result.Rate * result.TimeToReset.Hours())
+			if result.ProjectedPct > 100 {
+				result.ProjectedPct = 100
+			}
+			result.ExhaustsFirst = result.TimeToExhaust > 0 && result.TimeToExhaust < result.TimeToReset
+		}
+	}
+
+	return result
+}
+
+// severityFromPercent returns a severity string based on a usage percentage
+func severityFromPercent(pct float64) string {
+	switch {
+	case pct >= 95:
+		return "negative"
+	case pct >= 80:
+		return "warning"
+	case pct >= 50:
+		return "info"
+	default:
+		return "positive"
+	}
+}
+
+// ── Insight helpers ──
+
+// billingPeriod represents an actual billing period (may span many mini-cycles
+// created by renewsAt jitter). A real reset boundary is detected when
+// peak_requests drops by >50%, indicating the quota counter went back to ~0.
+type billingPeriod struct {
+	start   time.Time
+	maxPeak float64
+}
+
+// groupBillingPeriods groups mini-cycles into actual billing periods.
+// Cycles are expected sorted DESC (newest first, as returned by QueryCyclesSince).
+func groupBillingPeriods(cycles []*store.ResetCycle) []billingPeriod {
+	if len(cycles) == 0 {
+		return nil
+	}
+
+	// Process in chronological order (oldest first)
+	last := len(cycles) - 1
+	current := billingPeriod{
+		start:   cycles[last].CycleStart,
+		maxPeak: cycles[last].PeakRequests,
+	}
+
+	var periods []billingPeriod
+	for i := last - 1; i >= 0; i-- {
+		c := cycles[i]
+		// If peak drops significantly, this is a new billing period
+		if c.PeakRequests < current.maxPeak*0.5 {
+			periods = append(periods, current)
+			current = billingPeriod{
+				start:   c.CycleStart,
+				maxPeak: c.PeakRequests,
+			}
+		} else if c.PeakRequests > current.maxPeak {
+			current.maxPeak = c.PeakRequests
+		}
+	}
+	periods = append(periods, current)
+	return periods
+}
+
+// cycleSumConsumption computes total consumption by grouping mini-cycles into
+// actual billing periods and summing the max peak per period.
+func cycleSumConsumption(cycles []*store.ResetCycle) float64 {
+	var total float64
+	for _, p := range groupBillingPeriods(cycles) {
+		total += p.maxPeak
+	}
+	return total
+}
+
+// cycleSumConsumptionSince computes consumption for cycles starting after since.
+func cycleSumConsumptionSince(cycles []*store.ResetCycle, since time.Time) float64 {
+	var filtered []*store.ResetCycle
+	for _, c := range cycles {
+		if !c.CycleStart.Before(since) {
+			filtered = append(filtered, c)
+		}
+	}
+	return cycleSumConsumption(filtered)
+}
+
+// billingPeriodCount returns the number of actual billing periods.
+func billingPeriodCount(cycles []*store.ResetCycle) int {
+	return len(groupBillingPeriods(cycles))
+}
+
+// billingPeriodAvg returns avg consumption per actual billing period.
+func billingPeriodAvg(cycles []*store.ResetCycle) float64 {
+	periods := groupBillingPeriods(cycles)
+	if len(periods) == 0 {
+		return 0
+	}
+	var total float64
+	for _, p := range periods {
+		total += p.maxPeak
+	}
+	return total / float64(len(periods))
+}
+
+// billingPeriodPeak returns the highest consumption in any single billing period.
+func billingPeriodPeak(cycles []*store.ResetCycle) float64 {
+	var peak float64
+	for _, p := range groupBillingPeriods(cycles) {
+		if p.maxPeak > peak {
+			peak = p.maxPeak
+		}
+	}
+	return peak
+}
+
+// anthropicBillingPeriod represents an actual Anthropic billing period
+// (many mini-cycles from renewsAt jitter merged into one real period).
+type anthropicBillingPeriod struct {
+	start   time.Time
+	maxPeak float64 // highest PeakUtilization across mini-cycles in this period
+}
+
+// groupAnthropicBillingPeriods merges micro-cycles caused by renewsAt jitter
+// into actual billing periods. A real reset is detected when PeakUtilization
+// drops by >50% (utilization went back to ~0). Cycles expected sorted DESC.
+func groupAnthropicBillingPeriods(cycles []*store.AnthropicResetCycle) []anthropicBillingPeriod {
+	if len(cycles) == 0 {
+		return nil
+	}
+
+	// Process in chronological order (oldest first)
+	last := len(cycles) - 1
+	current := anthropicBillingPeriod{
+		start:   cycles[last].CycleStart,
+		maxPeak: cycles[last].PeakUtilization,
+	}
+
+	var periods []anthropicBillingPeriod
+	for i := last - 1; i >= 0; i-- {
+		c := cycles[i]
+		if current.maxPeak > 5 && c.PeakUtilization < current.maxPeak*0.5 {
+			// Peak dropped significantly - this is a real reset
+			periods = append(periods, current)
+			current = anthropicBillingPeriod{
+				start:   c.CycleStart,
+				maxPeak: c.PeakUtilization,
+			}
+		} else if c.PeakUtilization > current.maxPeak {
+			current.maxPeak = c.PeakUtilization
+		}
+	}
+	periods = append(periods, current)
+	return periods
+}
+
+// anthropicBillingPeriodCount returns the number of real billing periods.
+func anthropicBillingPeriodCount(cycles []*store.AnthropicResetCycle) int {
+	return len(groupAnthropicBillingPeriods(cycles))
+}
+
+// anthropicBillingPeriodAvg returns the avg peak utilization per real billing period.
+func anthropicBillingPeriodAvg(cycles []*store.AnthropicResetCycle) float64 {
+	periods := groupAnthropicBillingPeriods(cycles)
+	if len(periods) == 0 {
+		return 0
+	}
+	var total float64
+	for _, p := range periods {
+		total += p.maxPeak
+	}
+	return total / float64(len(periods))
+}
+
+// anthropicBillingPeriodPeak returns the highest peak utilization across all real billing periods.
+func anthropicBillingPeriodPeak(cycles []*store.AnthropicResetCycle) float64 {
+	var peak float64
+	for _, p := range groupAnthropicBillingPeriods(cycles) {
+		if p.maxPeak > peak {
+			peak = p.maxPeak
+		}
+	}
+	return peak
+}
+
+func compactNum(v float64) string {
+	if v >= 1000000000 {
+		return fmt.Sprintf("%.1fB", v/1000000000)
+	}
+	if v >= 1000000 {
+		return fmt.Sprintf("%.1fM", v/1000000)
+	}
+	if v >= 1000 {
+		return fmt.Sprintf("%.1fK", v/1000)
+	}
+	return fmt.Sprintf("%.0f", v)
+}
+
+// GetSettings returns current settings as JSON.
+func (h *Handler) GetSettings(w http.ResponseWriter, r *http.Request) {
+	tz := ""
+	var hiddenInsights []string
+	menubarSettings := menubar.DefaultSettings()
+	if h.store != nil {
+		val, err := h.store.GetSetting("timezone")
+		if err != nil {
+			h.logger.Error("failed to get timezone setting", "error", err)
+		} else {
+			tz = val
+		}
+		hiVal, err := h.store.GetSetting("hidden_insights")
+		if err != nil {
+			h.logger.Error("failed to get hidden_insights setting", "error", err)
+		} else if hiVal != "" {
+			_ = json.Unmarshal([]byte(hiVal), &hiddenInsights)
+		}
+		if settings, err := h.store.GetMenubarSettings(); err != nil {
+			h.logger.Error("failed to get menubar settings", "error", err)
+		} else if settings != nil {
+			menubarSettings = settings
+		}
+	}
+	if hiddenInsights == nil {
+		hiddenInsights = []string{}
+	}
+
+	result := map[string]interface{}{
+		"timezone":        tz,
+		"hidden_insights": hiddenInsights,
+		"menubar":         menubarSettings,
+	}
+
+	// SMTP settings (never return the actual password)
+	if h.store != nil {
+		smtpJSON, _ := h.store.GetSetting("smtp")
+		if smtpJSON != "" {
+			var smtp map[string]interface{}
+			if json.Unmarshal([]byte(smtpJSON), &smtp) == nil {
+				// Mask the password - only indicate whether one is set
+				if _, ok := smtp["password"]; ok {
+					pwd, _ := smtp["password"].(string)
+					smtp["password"] = ""
+					smtp["password_set"] = pwd != ""
+				}
+				result["smtp"] = smtp
+			}
+		}
+
+		// Notification settings
+		notifJSON, _ := h.store.GetSetting("notifications")
+		if notifJSON != "" {
+			var notif map[string]interface{}
+			if json.Unmarshal([]byte(notifJSON), &notif) == nil {
+				result["notifications"] = notif
+			}
+		}
+
+		// Provider visibility settings
+		visJSON, _ := h.store.GetSetting("provider_visibility")
+		if visJSON != "" {
+			var vis map[string]interface{}
+			if json.Unmarshal([]byte(visJSON), &vis) == nil {
+				result["provider_visibility"] = vis
+			}
+		}
+
+		// Provider-specific settings (overrides .env)
+		provJSON, _ := h.store.GetSetting("provider_settings")
+		if provJSON != "" {
+			var prov map[string]interface{}
+			if json.Unmarshal([]byte(provJSON), &prov) == nil {
+				// Strip sensitive fields (API keys, tokens) before sending to client
+				stripProviderSecrets(prov)
+				result["provider_settings"] = prov
+			}
+		}
+	}
+
+	respondJSON(w, http.StatusOK, result)
+}
+
+// emailRegex validates email addresses.
+var emailRegex = regexp.MustCompile(`^[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}$`)
+
+// UpdateSettings updates settings from JSON body (partial updates supported).
+func (h *Handler) UpdateSettings(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPut {
+		respondError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+
+	// Limit request body size to 64KB
+	r.Body = http.MaxBytesReader(w, r.Body, 64*1024)
+
+	var body map[string]json.RawMessage
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		// Check if error is due to MaxBytesReader limit exceeded
+		if err.Error() == "http: request body too large" {
+			respondError(w, http.StatusRequestEntityTooLarge, "request body too large")
+			return
+		}
+		respondError(w, http.StatusBadRequest, "invalid JSON")
+		return
+	}
+
+	if h.store == nil {
+		respondError(w, http.StatusInternalServerError, "store not available")
+		return
+	}
+
+	result := map[string]interface{}{}
+
+	// Handle timezone
+	if raw, ok := body["timezone"]; ok {
+		var tz string
+		if err := json.Unmarshal(raw, &tz); err != nil {
+			respondError(w, http.StatusBadRequest, "invalid timezone value")
+			return
+		}
+		if tz != "" {
+			if _, err := time.LoadLocation(tz); err != nil {
+				respondError(w, http.StatusBadRequest, fmt.Sprintf("invalid timezone: %s", tz))
+				return
+			}
+		}
+		if err := h.store.SetSetting("timezone", tz); err != nil {
+			h.logger.Error("failed to save timezone setting", "error", err)
+			respondError(w, http.StatusInternalServerError, "failed to save setting")
+			return
+		}
+		result["timezone"] = tz
+	}
+
+	// Handle hidden_insights
+	if raw, ok := body["hidden_insights"]; ok {
+		var keys []string
+		if err := json.Unmarshal(raw, &keys); err != nil {
+			respondError(w, http.StatusBadRequest, "invalid hidden_insights value")
+			return
+		}
+		if keys == nil {
+			keys = []string{}
+		}
+		hiddenJSON, _ := json.Marshal(keys)
+		if err := h.store.SetSetting("hidden_insights", string(hiddenJSON)); err != nil {
+			h.logger.Error("failed to save hidden_insights setting", "error", err)
+			respondError(w, http.StatusInternalServerError, "failed to save setting")
+			return
+		}
+		result["hidden_insights"] = keys
+	}
+
+	// Handle SMTP settings
+	if raw, ok := body["smtp"]; ok {
+		var smtp struct {
+			Host        string `json:"host"`
+			Port        int    `json:"port"`
+			Protocol    string `json:"protocol"`
+			Username    string `json:"username"`
+			Password    string `json:"password"`
+			FromAddress string `json:"from_address"`
+			FromName    string `json:"from_name"`
+			To          string `json:"to"`
+		}
+		if err := json.Unmarshal(raw, &smtp); err != nil {
+			respondError(w, http.StatusBadRequest, "invalid smtp value")
+			return
+		}
+		// Validate
+		if smtp.Port < 0 || smtp.Port > 65535 {
+			respondError(w, http.StatusBadRequest, "SMTP port must be between 1 and 65535")
+			return
+		}
+		validProtocols := map[string]bool{"auto": true, "tls": true, "starttls": true, "none": true, "": true}
+		if !validProtocols[smtp.Protocol] {
+			respondError(w, http.StatusBadRequest, "SMTP protocol must be auto, tls, starttls, or none")
+			return
+		}
+		if smtp.FromAddress != "" && !emailRegex.MatchString(smtp.FromAddress) {
+			respondError(w, http.StatusBadRequest, "invalid from address")
+			return
+		}
+		if smtp.To != "" {
+			for _, addr := range strings.Split(smtp.To, ",") {
+				addr = strings.TrimSpace(addr)
+				if addr != "" && !emailRegex.MatchString(addr) {
+					respondError(w, http.StatusBadRequest, fmt.Sprintf("invalid recipient address: %s", addr))
+					return
+				}
+			}
+		}
+
+		// If password is empty, preserve the existing password
+		if smtp.Password == "" {
+			existingJSON, _ := h.store.GetSetting("smtp")
+			if existingJSON != "" {
+				var existing map[string]interface{}
+				if json.Unmarshal([]byte(existingJSON), &existing) == nil {
+					if pwd, ok := existing["password"].(string); ok {
+						smtp.Password = pwd
+					}
+				}
+			}
+		}
+
+		// Encrypt SMTP password using admin password hash as key
+		if smtp.Password != "" && !IsEncryptedValue(smtp.Password) {
+			encryptionKey := DeriveEncryptionKey(h.sessions.passwordHash, nil)
+			encryptedPass, err := notify.Encrypt(smtp.Password, encryptionKey)
+			if err != nil {
+				h.logger.Error("failed to encrypt SMTP password", "error", err)
+				respondError(w, http.StatusInternalServerError, "failed to encrypt SMTP password")
+				return
+			}
+			smtp.Password = encryptedPass
+		}
+
+		smtpJSON, _ := json.Marshal(smtp)
+		if err := h.store.SetSetting("smtp", string(smtpJSON)); err != nil {
+			h.logger.Error("failed to save SMTP settings", "error", err)
+			respondError(w, http.StatusInternalServerError, "failed to save SMTP settings")
+			return
+		}
+		result["smtp"] = "saved"
+
+		// Reconfigure SMTP mailer with new settings
+		if h.notifier != nil {
+			if err := h.notifier.ConfigureSMTP(); err != nil {
+				h.logger.Error("failed to reconfigure SMTP after settings update", "error", err)
+			}
+		}
+	}
+
+	// Handle notification settings
+	if raw, ok := body["notifications"]; ok {
+		var notif struct {
+			WarningThreshold  float64 `json:"warning_threshold"`
+			CriticalThreshold float64 `json:"critical_threshold"`
+			NotifyWarning     bool    `json:"notify_warning"`
+			NotifyCritical    bool    `json:"notify_critical"`
+			NotifyReset       bool    `json:"notify_reset"`
+			NotifyAuthError   bool    `json:"notify_auth_error"`
+			CooldownMinutes   int     `json:"cooldown_minutes"`
+			Overrides         []struct {
+				QuotaKey       string  `json:"quota_key"`
+				Provider       string  `json:"provider"`
+				Warning        float64 `json:"warning"`
+				Critical       float64 `json:"critical"`
+				IsAbsolute     bool    `json:"is_absolute"`
+				DisableReset   bool    `json:"disable_reset"`
+				DisableWarning bool    `json:"disable_warning"`
+				DisableCrit    bool    `json:"disable_critical"`
+			} `json:"overrides"`
+		}
+		if err := json.Unmarshal(raw, &notif); err != nil {
+			respondError(w, http.StatusBadRequest, "invalid notifications value")
+			return
+		}
+		// Validate thresholds
+		if notif.WarningThreshold < 0 || notif.WarningThreshold > 100 {
+			respondError(w, http.StatusBadRequest, "warning threshold must be between 0 and 100")
+			return
+		}
+		if notif.CriticalThreshold < 0 || notif.CriticalThreshold > 100 {
+			respondError(w, http.StatusBadRequest, "critical threshold must be between 0 and 100")
+			return
+		}
+		if notif.WarningThreshold >= notif.CriticalThreshold {
+			respondError(w, http.StatusBadRequest, "warning threshold must be less than critical threshold")
+			return
+		}
+		if notif.CooldownMinutes < 1 {
+			notif.CooldownMinutes = 1
+		}
+		// Validate per-quota overrides
+		for _, o := range notif.Overrides {
+			if o.IsAbsolute {
+				if o.Warning < 0 || o.Critical < 0 {
+					respondError(w, http.StatusBadRequest, "absolute threshold values must be >= 0")
+					return
+				}
+			} else {
+				if o.Warning < 0 || o.Warning > 100 || o.Critical < 0 || o.Critical > 100 {
+					respondError(w, http.StatusBadRequest, "percentage threshold values must be between 0 and 100")
+					return
+				}
+			}
+		}
+
+		notifJSON, _ := json.Marshal(notif)
+		if err := h.store.SetSetting("notifications", string(notifJSON)); err != nil {
+			h.logger.Error("failed to save notification settings", "error", err)
+			respondError(w, http.StatusInternalServerError, "failed to save notification settings")
+			return
+		}
+		result["notifications"] = "saved"
+
+		// Reload notifier if available
+		if h.notifier != nil {
+			if err := h.notifier.Reload(); err != nil {
+				h.logger.Error("failed to reload notifier after notification update", "error", err)
+			}
+		}
+	}
+
+	// Handle provider visibility
+	if raw, ok := body["provider_visibility"]; ok {
+		var vis map[string]map[string]bool
+		if err := json.Unmarshal(raw, &vis); err != nil {
+			respondError(w, http.StatusBadRequest, "invalid provider_visibility value")
+			return
+		}
+		visJSON, _ := json.Marshal(vis)
+		if err := h.store.SetSetting("provider_visibility", string(visJSON)); err != nil {
+			h.logger.Error("failed to save provider visibility settings", "error", err)
+			respondError(w, http.StatusInternalServerError, "failed to save provider visibility settings")
+			return
+		}
+		if h.agentManager != nil {
+			for _, p := range providerCatalog() {
+				enabled := h.providerPollingEnabled(p.Key, vis)
+				if enabled && h.isProviderConfigured(p.Key) {
+					if err := h.agentManager.Start(p.Key); err != nil {
+						h.logger.Warn("provider start skipped after settings update", "provider", p.Key, "error", err)
+					}
+				} else {
+					h.agentManager.Stop(p.Key)
+				}
+			}
+		}
+		result["provider_visibility"] = vis
+	}
+
+	// Handle menubar settings
+	if raw, ok := body["menubar"]; ok {
+		var settings menubar.Settings
+		if err := json.Unmarshal(raw, &settings); err != nil {
+			respondError(w, http.StatusBadRequest, "invalid menubar value")
+			return
+		}
+		normalized := settings.Normalize()
+		normalized.DefaultView = normalizeMenubarView(string(normalized.DefaultView), menubar.ViewStandard)
+		if err := h.store.SetMenubarSettings(normalized); err != nil {
+			h.logger.Error("failed to save menubar settings", "error", err)
+			respondError(w, http.StatusInternalServerError, "failed to save menubar settings")
+			return
+		}
+		h.triggerMenubarRefresh()
+		result["menubar"] = normalized
+	}
+
+	// Handle provider-specific settings
+	if raw, ok := body["provider_settings"]; ok {
+		var provSettings map[string]interface{}
+		if err := json.Unmarshal(raw, &provSettings); err != nil {
+			respondError(w, http.StatusBadRequest, "invalid provider_settings value")
+			return
+		}
+		// Deep-merge with existing settings: preserve fields not in the update
+		// (e.g. sensitive keys omitted from the form when unchanged).
+		existing := make(map[string]interface{})
+		if existingJSON, _ := h.store.GetSetting("provider_settings"); existingJSON != "" {
+			_ = json.Unmarshal([]byte(existingJSON), &existing)
+		}
+		for k, v := range provSettings {
+			newMap, newOK := v.(map[string]interface{})
+			existingMap, existOK := existing[k].(map[string]interface{})
+			if newOK && existOK {
+				// Merge fields: new values override, missing keys preserved
+				for fk, fv := range newMap {
+					existingMap[fk] = fv
+				}
+				existing[k] = existingMap
+			} else {
+				existing[k] = v
+			}
+		}
+		// Sanitize known enum fields before persisting
+		sanitizeProviderSettings(existing)
+		merged, _ := json.Marshal(existing)
+		if err := h.store.SetSetting("provider_settings", string(merged)); err != nil {
+			h.logger.Error("failed to save provider settings", "error", err)
+			respondError(w, http.StatusInternalServerError, "failed to save provider settings")
+			return
+		}
+		h.logger.Info("Provider settings updated", "providers", provSettings)
+		// Strip sensitive fields before returning to client
+		stripProviderSecrets(existing)
+		result["provider_settings"] = existing
+	}
+
+	respondJSON(w, http.StatusOK, result)
+}
+
+// SMTPTest sends a test email via the configured SMTP settings.
+func (h *Handler) SMTPTest(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		respondError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+
+	// Rate limit: 30 second cooldown
+	h.smtpTestMu.Lock()
+	elapsed := time.Since(h.smtpTestLastSent)
+	if elapsed < 30*time.Second {
+		h.smtpTestMu.Unlock()
+		remaining := int((30*time.Second - elapsed).Seconds())
+		respondError(w, http.StatusTooManyRequests, fmt.Sprintf("please wait %d seconds before sending another test", remaining))
+		return
+	}
+	h.smtpTestLastSent = time.Now()
+	h.smtpTestMu.Unlock()
+
+	if h.notifier == nil {
+		respondError(w, http.StatusServiceUnavailable, "notification engine not configured")
+		return
+	}
+
+	diag, err := h.notifier.TestSMTPDiag()
+	if err != nil {
+		h.logger.Error("SMTP test failed", "error", err)
+		errorMsg := sanitizeSMTPError(err)
+		respondJSON(w, http.StatusOK, map[string]interface{}{
+			"success":     false,
+			"message":     errorMsg,
+			"diagnostics": diag,
+		})
+		return
+	}
+
+	respondJSON(w, http.StatusOK, map[string]interface{}{
+		"success":     true,
+		"message":     "Test email sent successfully",
+		"diagnostics": diag,
+	})
+}
+
+// PushVAPIDKey returns the VAPID public key for push subscription.
+func (h *Handler) PushVAPIDKey(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		respondError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	if h.notifier == nil {
+		respondError(w, http.StatusServiceUnavailable, "notification engine not configured")
+		return
+	}
+	key := h.notifier.GetVAPIDPublicKey()
+	if key == "" {
+		respondError(w, http.StatusServiceUnavailable, "push notifications not configured")
+		return
+	}
+	respondJSON(w, http.StatusOK, map[string]string{"public_key": key})
+}
+
+// PushSubscribe handles POST (subscribe) and DELETE (unsubscribe) for push notifications.
+func (h *Handler) PushSubscribe(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodPost {
+		// Limit request body size to 64KB
+		r.Body = http.MaxBytesReader(w, r.Body, 64*1024)
+
+		var body struct {
+			Endpoint string `json:"endpoint"`
+			Keys     struct {
+				P256dh string `json:"p256dh"`
+				Auth   string `json:"auth"`
+			} `json:"keys"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			if err.Error() == "http: request body too large" {
+				respondError(w, http.StatusRequestEntityTooLarge, "request body too large")
+				return
+			}
+			respondError(w, http.StatusBadRequest, "invalid JSON")
+			return
+		}
+		if body.Endpoint == "" || body.Keys.P256dh == "" || body.Keys.Auth == "" {
+			respondError(w, http.StatusBadRequest, "endpoint, p256dh, and auth are required")
+			return
+		}
+		if err := h.store.SavePushSubscription(body.Endpoint, body.Keys.P256dh, body.Keys.Auth); err != nil {
+			h.logger.Error("failed to save push subscription", "error", err)
+			respondError(w, http.StatusInternalServerError, "failed to save subscription")
+			return
+		}
+		respondJSON(w, http.StatusOK, map[string]string{"status": "subscribed"})
+		return
+	}
+
+	if r.Method == http.MethodDelete {
+		// Limit request body size to 64KB
+		r.Body = http.MaxBytesReader(w, r.Body, 64*1024)
+
+		var body struct {
+			Endpoint string `json:"endpoint"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			if err.Error() == "http: request body too large" {
+				respondError(w, http.StatusRequestEntityTooLarge, "request body too large")
+				return
+			}
+			respondError(w, http.StatusBadRequest, "invalid JSON")
+			return
+		}
+		if body.Endpoint == "" {
+			respondError(w, http.StatusBadRequest, "endpoint is required")
+			return
+		}
+		if err := h.store.DeletePushSubscription(body.Endpoint); err != nil {
+			h.logger.Error("failed to delete push subscription", "error", err)
+			respondError(w, http.StatusInternalServerError, "failed to delete subscription")
+			return
+		}
+		respondJSON(w, http.StatusOK, map[string]string{"status": "unsubscribed"})
+		return
+	}
+
+	respondError(w, http.StatusMethodNotAllowed, "method not allowed")
+}
+
+// PushTest sends a test push notification to all subscribed devices.
+func (h *Handler) PushTest(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		respondError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+
+	// Rate limit: 30 second cooldown
+	h.pushTestMu.Lock()
+	elapsed := time.Since(h.pushTestLastSent)
+	if elapsed < 30*time.Second {
+		h.pushTestMu.Unlock()
+		remaining := int((30*time.Second - elapsed).Seconds())
+		respondError(w, http.StatusTooManyRequests, fmt.Sprintf("please wait %d seconds before sending another test", remaining))
+		return
+	}
+	h.pushTestLastSent = time.Now()
+	h.pushTestMu.Unlock()
+
+	if h.notifier == nil {
+		respondError(w, http.StatusServiceUnavailable, "notification engine not configured")
+		return
+	}
+
+	if err := h.notifier.SendTestPush(); err != nil {
+		h.logger.Error("push test failed", "error", err)
+		// Return generic error message to prevent information leakage
+		respondJSON(w, http.StatusOK, map[string]interface{}{
+			"success": false,
+			"message": "Push test failed",
+		})
+		return
+	}
+
+	respondJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"message": "Test push notification sent",
+	})
+}
+
+// Login handles GET (show form) and POST (authenticate).
+func (h *Handler) Login(w http.ResponseWriter, r *http.Request) {
+	// If already logged in, redirect to dashboard
+	bp := h.getBasePath()
+	if cookie, err := r.Cookie(sessionCookieName); err == nil {
+		if h.sessions != nil && h.sessions.ValidateToken(cookie.Value) {
+			http.Redirect(w, r, bp+"/", http.StatusFound)
+			return
+		}
+	}
+
+	if r.Method == http.MethodPost {
+		h.loginPost(w, r)
+		return
+	}
+
+	// Use whitelisted error messages to prevent XSS and info leakage
+	errorCode := r.URL.Query().Get("error")
+	errorMsg := loginErrors[errorCode] // empty string if not in whitelist
+
+	data := map[string]interface{}{
+		"Title":    "Login",
+		"Error":    errorMsg,
+		"Version":  h.version,
+		"BasePath": h.getBasePath(),
+	}
+
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	if err := h.loginTmpl.ExecuteTemplate(w, "layout.html", data); err != nil {
+		h.logger.Error("failed to render login template", "error", err)
+		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+	}
+}
+
+func (h *Handler) loginPost(w http.ResponseWriter, r *http.Request) {
+	bp := h.getBasePath()
+	loginURL := bp + "/login"
+
+	// Check rate limit before processing login attempt
+	if h.rateLimiter != nil {
+		clientIP := getClientIP(r)
+		if h.rateLimiter.IsBlocked(clientIP) {
+			w.Header().Set("Retry-After", "300") // 5 minutes in seconds
+			http.Redirect(w, r, loginURL+"?error="+LoginErrorRateLimit, http.StatusFound)
+			return
+		}
+	}
+
+	if err := r.ParseForm(); err != nil {
+		http.Redirect(w, r, loginURL+"?error="+LoginErrorInvalid, http.StatusFound)
+		return
+	}
+
+	username := r.FormValue("username")
+	password := r.FormValue("password")
+
+	if h.sessions == nil {
+		http.Redirect(w, r, loginURL+"?error="+LoginErrorRequired, http.StatusFound)
+		return
+	}
+
+	token, ok := h.sessions.Authenticate(username, password)
+	if !ok {
+		// Record failed attempt for rate limiting
+		if h.rateLimiter != nil {
+			clientIP := getClientIP(r)
+			if h.rateLimiter.RecordFailure(clientIP) {
+				// IP is now blocked
+				w.Header().Set("Retry-After", "300")
+			}
+		}
+		http.Redirect(w, r, loginURL+"?error="+LoginErrorInvalid, http.StatusFound)
+		return
+	}
+
+	// Clear rate limit on successful login
+	if h.rateLimiter != nil {
+		clientIP := getClientIP(r)
+		h.rateLimiter.Clear(clientIP)
+	}
+
+	// Cookie path must cover the base path for subdirectory hosting
+	cookiePath := "/"
+	if bp != "" {
+		cookiePath = bp + "/"
+	}
+	http.SetCookie(w, &http.Cookie{
+		Name:     sessionCookieName,
+		Value:    token,
+		Path:     cookiePath,
+		MaxAge:   sessionMaxAge,
+		Expires:  time.Now().Add(time.Duration(sessionMaxAge) * time.Second),
+		HttpOnly: true,
+		Secure:   h.config.SecureCookies || (h.config.Host != "" && h.config.Host != "0.0.0.0" && h.config.Host != "127.0.0.1"),
+		SameSite: http.SameSiteStrictMode,
+	})
+
+	http.Redirect(w, r, bp+"/", http.StatusFound)
+}
+
+// Logout clears the session and redirects to login.
+func (h *Handler) Logout(w http.ResponseWriter, r *http.Request) {
+	bp := h.getBasePath()
+	if cookie, err := r.Cookie(sessionCookieName); err == nil && h.sessions != nil {
+		h.sessions.Invalidate(cookie.Value)
+	}
+	cookiePath := "/"
+	if bp != "" {
+		cookiePath = bp + "/"
+	}
+	http.SetCookie(w, &http.Cookie{
+		Name:   sessionCookieName,
+		Value:  "",
+		Path:   cookiePath,
+		MaxAge: -1,
+	})
+	http.Redirect(w, r, bp+"/login", http.StatusFound)
+}
+
+// ChangePassword handles password change requests.
+func (h *Handler) ChangePassword(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPut {
+		respondError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+
+	if h.sessions == nil || h.store == nil {
+		respondError(w, http.StatusInternalServerError, "auth not configured")
+		return
+	}
+
+	// Limit request body size to 64KB
+	r.Body = http.MaxBytesReader(w, r.Body, 64*1024)
+
+	var req struct {
+		CurrentPassword string `json:"current_password"`
+		NewPassword     string `json:"new_password"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		if err.Error() == "http: request body too large" {
+			respondError(w, http.StatusRequestEntityTooLarge, "request body too large")
+			return
+		}
+		respondError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+
+	if req.CurrentPassword == "" || req.NewPassword == "" {
+		respondError(w, http.StatusBadRequest, "current and new passwords are required")
+		return
+	}
+
+	if len(req.NewPassword) < 6 {
+		respondError(w, http.StatusBadRequest, "new password must be at least 6 characters")
+		return
+	}
+
+	// Verify current password and get old hash for re-encryption
+	oldHash := h.sessions.passwordHash
+	_, ok := h.sessions.Authenticate(h.sessions.username, req.CurrentPassword)
+	if !ok {
+		respondError(w, http.StatusUnauthorized, "current password is incorrect")
+		return
+	}
+
+	// Hash and store new password
+	newHash, err := HashPassword(req.NewPassword)
+	if err != nil {
+		h.logger.Error("failed to hash new password", "error", err)
+		respondError(w, http.StatusInternalServerError, "failed to process new password")
+		return
+	}
+	if err := h.store.UpsertUser(h.sessions.username, newHash); err != nil {
+		h.logger.Error("failed to update password in database", "error", err)
+		respondError(w, http.StatusInternalServerError, "failed to save new password")
+		return
+	}
+
+	// Update in-memory hash
+	h.sessions.UpdatePassword(newHash)
+
+	// Re-encrypt all encrypted data with new password key
+	reEncryptErrors := ReEncryptAllData(h.store, oldHash, newHash)
+	if len(reEncryptErrors) > 0 {
+		h.logger.Warn("some data could not be re-encrypted during password change", "errors", reEncryptErrors)
+		// Continue anyway - data might need manual re-entry or was already encrypted with new key
+	}
+
+	// Invalidate all sessions (force re-login)
+	h.sessions.InvalidateAll()
+
+	respondJSON(w, http.StatusOK, map[string]string{"message": "password updated successfully"})
+}
+
+// CheckUpdate checks for available updates (GET /api/update/check).
+func (h *Handler) CheckUpdate(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		respondError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	if h.updater == nil {
+		respondError(w, http.StatusServiceUnavailable, "updater not configured")
+		return
+	}
+	info, err := h.updater.Check()
+	if err != nil {
+		h.logger.Error("update check failed", "error", err)
+		respondError(w, http.StatusInternalServerError, "update check failed")
+		return
+	}
+	respondJSON(w, http.StatusOK, info)
+}
+
+// ApplyUpdate downloads and applies an update (POST /api/update/apply).
+func (h *Handler) ApplyUpdate(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		respondError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	if h.updater == nil {
+		respondError(w, http.StatusServiceUnavailable, "updater not configured")
+		return
+	}
+	if err := h.updater.Apply(); err != nil {
+		h.logger.Error("update apply failed", "error", err)
+		// Return generic error message to prevent information leakage
+		respondError(w, http.StatusInternalServerError, "update failed")
+		return
+	}
+	respondJSON(w, http.StatusOK, map[string]string{"status": "updated"})
+
+	// Schedule restart after response is flushed
+	go func() {
+		time.Sleep(1 * time.Second)
+		if err := h.updater.Restart(); err != nil {
+			h.logger.Error("restart after update failed", "error", err)
+		}
+	}()
+}
+
+// CycleOverview returns cycle overview with cross-quota data at peak moments.
+func (h *Handler) CycleOverview(w http.ResponseWriter, r *http.Request) {
+	provider, err := h.getProviderFromRequest(r)
+	if err != nil {
+		respondError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	switch provider {
+	case "both":
+		h.cycleOverviewBoth(w, r)
+	case "zai":
+		h.cycleOverviewZai(w, r)
+	case "synthetic":
+		h.cycleOverviewSynthetic(w, r)
+	case "anthropic":
+		h.cycleOverviewAnthropic(w, r)
+	case "copilot":
+		h.cycleOverviewCopilot(w, r)
+	case "codex":
+		h.cycleOverviewCodex(w, r)
+	case "antigravity":
+		h.cycleOverviewAntigravity(w, r)
+	case "minimax":
+		h.cycleOverviewMiniMax(w, r)
+	case "openrouter":
+		h.cycleOverviewOpenRouter(w, r)
+	case "gemini":
+		h.cycleOverviewGemini(w, r)
+	default:
+		respondError(w, http.StatusBadRequest, fmt.Sprintf("unknown provider: %s", provider))
+	}
+}
+
+// parseCycleOverviewLimit parses the limit query param, defaulting to 50.
+// Caps at 500 to prevent unbounded queries.
+func parseCycleOverviewLimit(r *http.Request) int {
+	const maxLimit = 500
+	if limitStr := r.URL.Query().Get("limit"); limitStr != "" {
+		if n, err := strconv.Atoi(limitStr); err == nil && n > 0 {
+			if n > maxLimit {
+				return maxLimit
+			}
+			return n
+		}
+	}
+	return 50
+}
+
+// cycleOverviewSynthetic returns Synthetic cycle overview with cross-quota data.
+func (h *Handler) cycleOverviewSynthetic(w http.ResponseWriter, r *http.Request) {
+	if h.store == nil {
+		respondJSON(w, http.StatusOK, map[string]interface{}{"cycles": []interface{}{}})
+		return
+	}
+
+	groupBy := r.URL.Query().Get("groupBy")
+	if groupBy == "" {
+		groupBy = "subscription"
+	}
+
+	limit := parseCycleOverviewLimit(r)
+	rows, err := h.store.QuerySyntheticCycleOverview(groupBy, limit)
+	if err != nil {
+		h.logger.Error("failed to query synthetic cycle overview", "error", err)
+		respondError(w, http.StatusInternalServerError, "failed to query cycle overview")
+		return
+	}
+
+	quotaNames := []string{"subscription", "search", "toolcall"}
+	respondJSON(w, http.StatusOK, map[string]interface{}{
+		"groupBy":    groupBy,
+		"provider":   "synthetic",
+		"quotaNames": quotaNames,
+		"cycles":     cycleOverviewRowsToJSON(rows),
+	})
+}
+
+// cycleOverviewZai returns Z.ai cycle overview with cross-quota data.
+func (h *Handler) cycleOverviewZai(w http.ResponseWriter, r *http.Request) {
+	if h.store == nil {
+		respondJSON(w, http.StatusOK, map[string]interface{}{"cycles": []interface{}{}})
+		return
+	}
+
+	groupBy := r.URL.Query().Get("groupBy")
+	if groupBy == "" {
+		groupBy = "tokens"
+	}
+
+	limit := parseCycleOverviewLimit(r)
+	rows, err := h.store.QueryZaiCycleOverview(groupBy, limit)
+	if err != nil {
+		h.logger.Error("failed to query Z.ai cycle overview", "error", err)
+		respondError(w, http.StatusInternalServerError, "failed to query cycle overview")
+		return
+	}
+
+	quotaNames := []string{"tokens", "time"}
+	respondJSON(w, http.StatusOK, map[string]interface{}{
+		"groupBy":    groupBy,
+		"provider":   "zai",
+		"quotaNames": quotaNames,
+		"cycles":     cycleOverviewRowsToJSON(rows),
+	})
+}
+
+// cycleOverviewAnthropic returns Anthropic cycle overview with cross-quota data.
+func (h *Handler) cycleOverviewAnthropic(w http.ResponseWriter, r *http.Request) {
+	if h.store == nil {
+		respondJSON(w, http.StatusOK, map[string]interface{}{"cycles": []interface{}{}})
+		return
+	}
+
+	groupBy := r.URL.Query().Get("groupBy")
+	if groupBy == "" {
+		groupBy = "five_hour"
+	}
+
+	limit := parseCycleOverviewLimit(r)
+	rows, err := h.store.QueryAnthropicCycleOverview(groupBy, limit)
+	if err != nil {
+		h.logger.Error("failed to query Anthropic cycle overview", "error", err)
+		respondError(w, http.StatusInternalServerError, "failed to query cycle overview")
+		return
+	}
+
+	// Determine quota names from first row with cross-quota data, or default
+	quotaNames := []string{}
+	for _, row := range rows {
+		if len(row.CrossQuotas) > 0 {
+			for _, cq := range row.CrossQuotas {
+				quotaNames = append(quotaNames, cq.Name)
+			}
+			break
+		}
+	}
+	if len(quotaNames) == 0 {
+		// Fallback defaults
+		quotaNames = []string{"five_hour", "seven_day", "seven_day_sonnet"}
+	}
+
+	respondJSON(w, http.StatusOK, map[string]interface{}{
+		"groupBy":    groupBy,
+		"provider":   "anthropic",
+		"quotaNames": quotaNames,
+		"cycles":     cycleOverviewRowsToJSON(rows),
+	})
+}
+
+// cycleOverviewBoth returns combined cycle overview from all configured providers.
+func (h *Handler) cycleOverviewBoth(w http.ResponseWriter, r *http.Request) {
+	response := map[string]interface{}{}
+	if h.store == nil {
+		respondJSON(w, http.StatusOK, response)
+		return
+	}
+
+	limit := parseCycleOverviewLimit(r)
+
+	if h.config.HasProvider("synthetic") {
+		groupBy := r.URL.Query().Get("groupBy")
+		if groupBy == "" {
+			groupBy = "subscription"
+		}
+		if rows, err := h.store.QuerySyntheticCycleOverview(groupBy, limit); err == nil {
+			response["synthetic"] = map[string]interface{}{
+				"groupBy":    groupBy,
+				"provider":   "synthetic",
+				"quotaNames": []string{"subscription", "search", "toolcall"},
+				"cycles":     cycleOverviewRowsToJSON(rows),
+			}
+		}
+	}
+
+	if h.config.HasProvider("zai") {
+		groupBy := r.URL.Query().Get("zaiGroupBy")
+		if groupBy == "" {
+			groupBy = "tokens"
+		}
+		if rows, err := h.store.QueryZaiCycleOverview(groupBy, limit); err == nil {
+			response["zai"] = map[string]interface{}{
+				"groupBy":    groupBy,
+				"provider":   "zai",
+				"quotaNames": []string{"tokens", "time"},
+				"cycles":     cycleOverviewRowsToJSON(rows),
+			}
+		}
+	}
+
+	if h.config.HasProvider("anthropic") {
+		groupBy := r.URL.Query().Get("anthropicGroupBy")
+		if groupBy == "" {
+			groupBy = "five_hour"
+		}
+		if rows, err := h.store.QueryAnthropicCycleOverview(groupBy, limit); err == nil {
+			quotaNames := []string{}
+			for _, row := range rows {
+				if len(row.CrossQuotas) > 0 {
+					for _, cq := range row.CrossQuotas {
+						quotaNames = append(quotaNames, cq.Name)
+					}
+					break
+				}
+			}
+			if len(quotaNames) == 0 {
+				quotaNames = []string{"five_hour", "seven_day", "seven_day_sonnet"}
+			}
+			response["anthropic"] = map[string]interface{}{
+				"groupBy":    groupBy,
+				"provider":   "anthropic",
+				"quotaNames": quotaNames,
+				"cycles":     cycleOverviewRowsToJSON(rows),
+			}
+		}
+	}
+
+	if h.config.HasProvider("copilot") {
+		groupBy := r.URL.Query().Get("copilotGroupBy")
+		if groupBy == "" {
+			groupBy = "premium_interactions"
+		}
+		if rows, err := h.store.QueryCopilotCycleOverview(groupBy, limit); err == nil {
+			quotaNames := []string{}
+			for _, row := range rows {
+				if len(row.CrossQuotas) > 0 {
+					for _, cq := range row.CrossQuotas {
+						quotaNames = append(quotaNames, cq.Name)
+					}
+					break
+				}
+			}
+			if len(quotaNames) == 0 {
+				quotaNames = []string{"premium_interactions", "chat", "completions"}
+			}
+			response["copilot"] = map[string]interface{}{
+				"groupBy":    groupBy,
+				"provider":   "copilot",
+				"quotaNames": quotaNames,
+				"cycles":     cycleOverviewRowsToJSON(rows),
+			}
+		}
+	}
+
+	if h.config.HasProvider("codex") {
+		groupBy := r.URL.Query().Get("codexGroupBy")
+		if groupBy == "" {
+			groupBy = r.URL.Query().Get("groupBy")
+		}
+		if groupBy == "" {
+			groupBy = "five_hour"
+		}
+		if rows, err := h.store.QueryCodexCycleOverview(DefaultCodexAccountID, groupBy, limit); err == nil {
+			quotaNames := []string{}
+			for _, row := range rows {
+				if len(row.CrossQuotas) > 0 {
+					for _, cq := range row.CrossQuotas {
+						quotaNames = append(quotaNames, cq.Name)
+					}
+					break
+				}
+			}
+			if len(quotaNames) == 0 {
+				quotaNames = []string{"five_hour", "seven_day", "code_review"}
+			}
+			response["codex"] = map[string]interface{}{
+				"groupBy":    groupBy,
+				"provider":   "codex",
+				"quotaNames": quotaNames,
+				"cycles":     cycleOverviewRowsToJSON(rows),
+			}
+		}
+	}
+
+	if h.config.HasProvider("openrouter") {
+		quotaType := "credits"
+		var orCycles []map[string]interface{}
+		if active, err := h.store.QueryActiveOpenRouterCycle(quotaType); err == nil && active != nil {
+			orCycles = append(orCycles, openrouterCycleToMap(active))
+		}
+		if history, err := h.store.QueryOpenRouterCycleHistory(quotaType, 50); err == nil {
+			for _, c := range history {
+				orCycles = append(orCycles, openrouterCycleToMap(c))
+			}
+		}
+		response["openrouter"] = map[string]interface{}{
+			"groupBy":    quotaType,
+			"provider":   "openrouter",
+			"quotaNames": []string{"credits"},
+			"cycles":     orCycles,
+		}
+	}
+
+	if h.config.HasProvider("gemini") {
+		response["gemini"] = map[string]interface{}{
+			"groupBy":    "",
+			"provider":   "gemini",
+			"quotaNames": []string{},
+			"cycles":     []interface{}{},
+		}
+	}
+
+	respondJSON(w, http.StatusOK, response)
+}
+
+// cycleOverviewRowsToJSON converts CycleOverviewRow slices to JSON-friendly maps.
+func cycleOverviewRowsToJSON(rows []store.CycleOverviewRow) []map[string]interface{} {
+	result := make([]map[string]interface{}, 0, len(rows))
+	for _, row := range rows {
+		entry := map[string]interface{}{
+			"cycleId":    row.CycleID,
+			"quotaType":  row.QuotaType,
+			"cycleStart": row.CycleStart.Format(time.RFC3339),
+			"peakValue":  row.PeakValue,
+			"totalDelta": row.TotalDelta,
+			"peakTime":   row.PeakTime.Format(time.RFC3339),
+		}
+		if row.CycleEnd != nil {
+			entry["cycleEnd"] = row.CycleEnd.Format(time.RFC3339)
+		} else {
+			entry["cycleEnd"] = nil
+		}
+
+		crossQuotas := make([]map[string]interface{}, 0, len(row.CrossQuotas))
+		for _, cq := range row.CrossQuotas {
+			crossQuotas = append(crossQuotas, map[string]interface{}{
+				"name":         cq.Name,
+				"value":        cq.Value,
+				"limit":        cq.Limit,
+				"percent":      cq.Percent,
+				"startPercent": cq.StartPercent,
+				"delta":        cq.Delta,
+			})
+		}
+		entry["crossQuotas"] = crossQuotas
+		result = append(result, entry)
+	}
+	return result
+}
+
+// ── Copilot Handlers ──
+
+// currentCopilot returns current Copilot quota status.
+func (h *Handler) currentCopilot(w http.ResponseWriter, r *http.Request) {
+	respondJSON(w, http.StatusOK, h.buildCopilotCurrent())
+}
+
+// buildCopilotCurrent builds the Copilot current quota response map.
+func (h *Handler) buildCopilotCurrent() map[string]interface{} {
+	now := time.Now().UTC()
+	response := map[string]interface{}{
+		"capturedAt": now.Format(time.RFC3339),
+		"quotas":     []interface{}{},
+	}
+
+	if h.store == nil {
+		return response
+	}
+
+	latest, err := h.store.QueryLatestCopilot()
+	if err != nil {
+		h.logger.Error("failed to query latest Copilot snapshot", "error", err)
+		return response
+	}
+
+	if latest == nil {
+		return response
+	}
+
+	response["capturedAt"] = latest.CapturedAt.Format(time.RFC3339)
+	if latest.CopilotPlan != "" {
+		response["copilotPlan"] = latest.CopilotPlan
+	}
+
+	var quotas []map[string]interface{}
+	for _, q := range latest.Quotas {
+		usagePercent := 0.0
+		if q.Entitlement > 0 {
+			usagePercent = float64(q.Entitlement-q.Remaining) / float64(q.Entitlement) * 100
+		}
+		qMap := map[string]interface{}{
+			"name":             q.Name,
+			"displayName":      api.CopilotDisplayName(q.Name),
+			"entitlement":      q.Entitlement,
+			"remaining":        q.Remaining,
+			"percentRemaining": q.PercentRemaining,
+			"usagePercent":     usagePercent,
+			"unlimited":        q.Unlimited,
+			"status":           copilotUsageStatus(usagePercent, q.Unlimited),
+		}
+		if latest.ResetDate != nil {
+			timeUntilReset := time.Until(*latest.ResetDate)
+			qMap["resetDate"] = latest.ResetDate.Format(time.RFC3339)
+			qMap["timeUntilReset"] = formatDuration(timeUntilReset)
+			qMap["timeUntilResetSeconds"] = int64(timeUntilReset.Seconds())
+		}
+		// Enrich with tracker data
+		if h.copilotTracker != nil {
+			if summary, err := h.copilotTracker.UsageSummary(q.Name); err == nil && summary != nil {
+				qMap["currentRate"] = summary.CurrentRate
+				qMap["projectedUsage"] = summary.ProjectedUsage
+			}
+		}
+		quotas = append(quotas, qMap)
+	}
+	response["quotas"] = quotas
+	return response
+}
+
+// copilotUsageStatus returns a status string based on usage percentage.
+func copilotUsageStatus(usagePercent float64, unlimited bool) string {
+	if unlimited {
+		return "healthy"
+	}
+	switch {
+	case usagePercent >= 95:
+		return "critical"
+	case usagePercent >= 80:
+		return "danger"
+	case usagePercent >= 50:
+		return "warning"
+	default:
+		return "healthy"
+	}
+}
+
+// historyCopilot returns Copilot usage history.
+func (h *Handler) historyCopilot(w http.ResponseWriter, r *http.Request) {
+	if h.store == nil {
+		respondJSON(w, http.StatusOK, []interface{}{})
+		return
+	}
+	rangeStr := r.URL.Query().Get("range")
+	duration, err := parseTimeRange(rangeStr)
+	if err != nil {
+		respondError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	now := time.Now().UTC()
+	start := now.Add(-duration)
+	snapshots, err := h.store.QueryCopilotRange(start, now)
+	if err != nil {
+		h.logger.Error("failed to query Copilot history", "error", err)
+		respondError(w, http.StatusInternalServerError, "failed to query history")
+		return
+	}
+	step := downsampleStep(len(snapshots), maxChartPoints)
+	last := len(snapshots) - 1
+	response := make([]map[string]interface{}, 0, min(len(snapshots), maxChartPoints))
+	for i, snap := range snapshots {
+		if step > 1 && i != 0 && i != last && i%step != 0 {
+			continue
+		}
+		entry := map[string]interface{}{
+			"capturedAt": snap.CapturedAt.Format(time.RFC3339),
+		}
+		for _, q := range snap.Quotas {
+			if q.Entitlement > 0 {
+				entry[q.Name] = float64(q.Entitlement-q.Remaining) / float64(q.Entitlement) * 100
+			}
+		}
+		response = append(response, entry)
+	}
+	respondJSON(w, http.StatusOK, response)
+}
+
+// cyclesCopilot returns per-minute Copilot snapshot data as cycle-shaped rows.
+func (h *Handler) cyclesCopilot(w http.ResponseWriter, r *http.Request) {
+	if h.store == nil {
+		respondJSON(w, http.StatusOK, []interface{}{})
+		return
+	}
+	quotaName := r.URL.Query().Get("type")
+	if quotaName == "" {
+		quotaName = "premium_interactions"
+	}
+
+	rangeDur := parseInsightsRange(r.URL.Query().Get("range"))
+	since := time.Now().UTC().Add(-rangeDur)
+
+	points, err := h.store.QueryCopilotUsageSeries(quotaName, since)
+	if err != nil {
+		h.logger.Error("failed to query Copilot usage series", "error", err)
+		respondError(w, http.StatusInternalServerError, "failed to query cycles")
+		return
+	}
+
+	response := make([]map[string]interface{}, 0, len(points))
+	for i, pt := range points {
+		usagePercent := 0.0
+		if pt.Entitlement > 0 {
+			usagePercent = float64(pt.Entitlement-pt.Remaining) / float64(pt.Entitlement) * 100
+		}
+		var delta float64
+		if i > 0 {
+			prevPercent := 0.0
+			if points[i-1].Entitlement > 0 {
+				prevPercent = float64(points[i-1].Entitlement-points[i-1].Remaining) / float64(points[i-1].Entitlement) * 100
+			}
+			d := usagePercent - prevPercent
+			if d > 0 {
+				delta = d
+			}
+		}
+		var cycleEnd interface{}
+		if i < len(points)-1 {
+			cycleEnd = points[i+1].CapturedAt.Format(time.RFC3339)
+		}
+		response = append(response, map[string]interface{}{
+			"id":              i + 1,
+			"quotaName":       quotaName,
+			"cycleStart":      pt.CapturedAt.Format(time.RFC3339),
+			"cycleEnd":        cycleEnd,
+			"peakUtilization": usagePercent,
+			"totalDelta":      delta,
+		})
+	}
+
+	// Reverse to DESC order (newest first)
+	for i, j := 0, len(response)-1; i < j; i, j = i+1, j-1 {
+		response[i], response[j] = response[j], response[i]
+	}
+
+	respondJSON(w, http.StatusOK, response)
+}
+
+// copilotCycleToMap converts a CopilotResetCycle to a JSON-friendly map.
+func copilotCycleToMap(cycle *store.CopilotResetCycle) map[string]interface{} {
+	result := map[string]interface{}{
+		"id":         cycle.ID,
+		"quotaName":  cycle.QuotaName,
+		"cycleStart": cycle.CycleStart.Format(time.RFC3339),
+		"cycleEnd":   nil,
+		"peakUsed":   cycle.PeakUsed,
+		"totalDelta": cycle.TotalDelta,
+	}
+	if cycle.CycleEnd != nil {
+		result["cycleEnd"] = cycle.CycleEnd.Format(time.RFC3339)
+	}
+	if cycle.ResetDate != nil {
+		result["resetDate"] = cycle.ResetDate.Format(time.RFC3339)
+	}
+	return result
+}
+
+// summaryCopilot returns Copilot usage summary.
+func (h *Handler) summaryCopilot(w http.ResponseWriter, r *http.Request) {
+	respondJSON(w, http.StatusOK, h.buildCopilotSummaryMap())
+}
+
+// buildCopilotSummaryMap builds the Copilot summary response.
+func (h *Handler) buildCopilotSummaryMap() map[string]interface{} {
+	response := map[string]interface{}{}
+	if h.copilotTracker != nil && h.store != nil {
+		latest, err := h.store.QueryLatestCopilot()
+		if err == nil && latest != nil {
+			for _, q := range latest.Quotas {
+				if summary, err := h.copilotTracker.UsageSummary(q.Name); err == nil && summary != nil {
+					response[q.Name] = buildCopilotSummaryResponse(summary)
+				}
+			}
+		}
+	}
+	return response
+}
+
+// buildCopilotSummaryResponse builds a summary response from CopilotTracker data.
+func buildCopilotSummaryResponse(summary *tracker.CopilotSummary) map[string]interface{} {
+	result := map[string]interface{}{
+		"quotaName":        summary.QuotaName,
+		"entitlement":      summary.Entitlement,
+		"currentUsed":      summary.CurrentUsed,
+		"currentRemaining": summary.CurrentRemaining,
+		"usagePercent":     summary.UsagePercent,
+		"unlimited":        summary.Unlimited,
+		"currentRate":      summary.CurrentRate,
+		"projectedUsage":   summary.ProjectedUsage,
+		"completedCycles":  summary.CompletedCycles,
+		"avgPerCycle":      summary.AvgPerCycle,
+		"peakCycle":        summary.PeakCycle,
+		"totalTracked":     summary.TotalTracked,
+		"trackingSince":    nil,
+	}
+	if summary.ResetDate != nil {
+		result["resetDate"] = summary.ResetDate.Format(time.RFC3339)
+		result["timeUntilReset"] = formatDuration(summary.TimeUntilReset)
+	}
+	if !summary.TrackingSince.IsZero() {
+		result["trackingSince"] = summary.TrackingSince.Format(time.RFC3339)
+	}
+	return result
+}
+
+// insightsCopilot returns Copilot deep analytics.
+func (h *Handler) insightsCopilot(w http.ResponseWriter, r *http.Request, rangeDur time.Duration) {
+	hidden := h.getHiddenInsightKeys()
+	respondJSON(w, http.StatusOK, h.buildCopilotInsights(hidden, rangeDur))
+}
+
+// buildCopilotInsights builds the Copilot insights response.
+func (h *Handler) buildCopilotInsights(hidden map[string]bool, rangeDur time.Duration) insightsResponse {
+	resp := insightsResponse{Stats: []insightStat{}, Insights: []insightItem{}}
+	if h.store == nil {
+		return resp
+	}
+	latest, err := h.store.QueryLatestCopilot()
+	if err != nil || latest == nil {
+		resp.Insights = append(resp.Insights, insightItem{
+			Type: "info", Severity: "info",
+			Title: "Getting Started",
+			Desc:  "Keep onWatch running to collect Copilot usage data. Insights will appear after a few snapshots.",
+		})
+		return resp
+	}
+
+	// Collect summaries for all quotas
+	quotaNames, _ := h.store.QueryAllCopilotQuotaNames()
+	summaries := map[string]*tracker.CopilotSummary{}
+	if h.copilotTracker != nil {
+		for _, name := range quotaNames {
+			if s, err := h.copilotTracker.UsageSummary(name); err == nil && s != nil {
+				summaries[name] = s
+			}
+		}
+	}
+
+	// ═══ Stats Cards ═══
+	for _, q := range latest.Quotas {
+		if q.Unlimited {
+			resp.Stats = append(resp.Stats, insightStat{
+				Value: "∞",
+				Label: api.CopilotDisplayName(q.Name),
+			})
+			continue
+		}
+		usagePercent := 0.0
+		if q.Entitlement > 0 {
+			usagePercent = float64(q.Entitlement-q.Remaining) / float64(q.Entitlement) * 100
+		}
+		resp.Stats = append(resp.Stats, insightStat{
+			Value:    fmt.Sprintf("%.0f%%", usagePercent),
+			Label:    api.CopilotDisplayName(q.Name),
+			Sublabel: fmt.Sprintf("%d / %d used", q.Entitlement-q.Remaining, q.Entitlement),
+		})
+	}
+
+	// ═══ Deep Insights ═══
+
+	// 1. Burn Rate & Forecast per non-unlimited quota
+	for _, q := range latest.Quotas {
+		if q.Unlimited || q.Entitlement == 0 {
+			continue
+		}
+		key := fmt.Sprintf("forecast_%s", q.Name)
+		if hidden[key] {
+			continue
+		}
+		s := summaries[q.Name]
+		usagePercent := float64(q.Entitlement-q.Remaining) / float64(q.Entitlement) * 100
+
+		if s != nil && s.CurrentRate > 0 {
+			resp.Insights = append(resp.Insights, insightItem{
+				Key: key, Type: "forecast", Severity: copilotInsightSeverity(usagePercent),
+				Title:  fmt.Sprintf("%s Burn Rate", api.CopilotDisplayName(q.Name)),
+				Metric: fmt.Sprintf("%.1f / hr", s.CurrentRate),
+				Desc:   fmt.Sprintf("Currently at %.0f%% usage (%d/%d). At this rate, projected to use %d by reset.", usagePercent, q.Entitlement-q.Remaining, q.Entitlement, s.ProjectedUsage),
+			})
+		} else {
+			resp.Insights = append(resp.Insights, insightItem{
+				Key: key, Type: "current", Severity: copilotInsightSeverity(usagePercent),
+				Title:  fmt.Sprintf("%s Usage", api.CopilotDisplayName(q.Name)),
+				Metric: fmt.Sprintf("%.0f%%", usagePercent),
+				Desc:   fmt.Sprintf("%d of %d used. Need more data to estimate burn rate.", q.Entitlement-q.Remaining, q.Entitlement),
+			})
+		}
+	}
+
+	// 2. Reset countdown
+	if !hidden["reset_countdown"] && latest.ResetDate != nil {
+		timeLeft := time.Until(*latest.ResetDate)
+		if timeLeft > 0 {
+			resp.Insights = append(resp.Insights, insightItem{
+				Key: "reset_countdown", Type: "info", Severity: "info",
+				Title:  "Quota Reset",
+				Metric: formatDuration(timeLeft),
+				Desc:   fmt.Sprintf("Quotas reset on %s.", latest.ResetDate.Format("Jan 2, 2006")),
+			})
+		}
+	}
+
+	// 3. Coverage - how long we've been tracking
+	if !hidden["coverage"] {
+		snapCount := 0
+		since := time.Now().Add(-rangeDur)
+		if points, err := h.store.QueryCopilotUsageSeries("premium_interactions", since); err == nil {
+			snapCount = len(points)
+		}
+		if snapCount > 0 {
+			resp.Insights = append(resp.Insights, insightItem{
+				Key: "coverage", Type: "info", Severity: "info",
+				Title:  "Data Coverage",
+				Metric: fmt.Sprintf("%d snapshots", snapCount),
+				Desc:   fmt.Sprintf("Tracking Copilot usage with %d data points in selected range.", snapCount),
+			})
+		}
+	}
+
+	return resp
+}
+
+// copilotInsightSeverity returns an insight severity based on usage percentage.
+func copilotInsightSeverity(usagePercent float64) string {
+	switch {
+	case usagePercent >= 90:
+		return "critical"
+	case usagePercent >= 70:
+		return "warning"
+	default:
+		return "info"
+	}
+}
+
+// codexInsightSeverity returns an insight severity based on usage percentage for Codex.
+// Uses the same thresholds as codexUtilStatus for consistency.
+func codexInsightSeverity(util float64) string {
+	return codexUtilStatus(util)
+}
+
+// ── Codex Handlers ──
+
+func (h *Handler) currentCodex(w http.ResponseWriter, r *http.Request) {
+	accountID := parseCodexAccountID(r)
+	respondJSON(w, http.StatusOK, h.buildCodexCurrent(accountID))
+}
+
+// getCodexDisplayMode returns the Codex display mode for a given account.
+// Priority: 1) provider_settings[codex][display_mode] from DB, 2) CODEX_SHOW_AVAILABLE env var, 3) default "usage"
+func (h *Handler) getCodexDisplayMode() string {
+	if h.store != nil {
+		provJSON, err := h.store.GetSetting("provider_settings")
+		if err == nil && provJSON != "" {
+			var provSettings map[string]map[string]interface{}
+			if json.Unmarshal([]byte(provJSON), &provSettings) == nil {
+				if codexSettings, ok := provSettings["codex"]; ok {
+					if dm, ok := codexSettings["display_mode"].(string); ok && dm != "" {
+						return dm
+					}
+				}
+			}
+		}
+	}
+	if h.config != nil && h.config.CodexShowAvailable != "" {
+		return h.config.CodexShowAvailable
+	}
+	return "usage"
+}
+
+// getCodexPaceMode returns the Codex pace mode from provider_settings.
+// Returns "calendar", "5-day", or "6-day". Defaults to "calendar".
+func (h *Handler) getCodexPaceMode() string {
+	if h.store != nil {
+		provJSON, err := h.store.GetSetting("provider_settings")
+		if err == nil && provJSON != "" {
+			var provSettings map[string]map[string]interface{}
+			if json.Unmarshal([]byte(provJSON), &provSettings) == nil {
+				if codexSettings, ok := provSettings["codex"]; ok {
+					if pm, ok := codexSettings["pace_mode"].(string); ok && pm != "" {
+						return pm
+					}
+				}
+			}
+		}
+	}
+	return "calendar"
+}
+
+func (h *Handler) buildCodexCurrent(accountID int64) map[string]interface{} {
+	now := time.Now().UTC()
+	response := map[string]interface{}{
+		"capturedAt": now.Format(time.RFC3339),
+		"quotas":     []interface{}{},
+	}
+	if h.store == nil {
+		return response
+	}
+
+	latest, err := h.store.QueryLatestCodex(accountID)
+	if err != nil {
+		h.logger.Error("failed to query latest Codex snapshot", "error", err)
+		return response
+	}
+	if latest == nil {
+		return response
+	}
+
+	response["capturedAt"] = latest.CapturedAt.Format(time.RFC3339)
+	if latest.PlanType != "" {
+		response["planType"] = latest.PlanType
+	}
+	if latest.CreditsBalance != nil {
+		response["creditsBalance"] = *latest.CreditsBalance
+	}
+
+	orderedQuotas := make([]api.CodexQuota, len(latest.Quotas))
+	copy(orderedQuotas, latest.Quotas)
+	sort.SliceStable(orderedQuotas, func(i, j int) bool {
+		left := codexQuotaDisplayOrder(orderedQuotas[i].Name)
+		right := codexQuotaDisplayOrder(orderedQuotas[j].Name)
+		if left != right {
+			return left < right
+		}
+		return orderedQuotas[i].Name < orderedQuotas[j].Name
+	})
+
+	quotas := make([]map[string]interface{}, 0, len(orderedQuotas))
+	quotaIndexByName := make(map[string]int, len(orderedQuotas))
+	displayMode := h.getCodexDisplayMode()
+	showAvailable := displayMode == "available"
+	for _, q := range orderedQuotas {
+		normalizedName := codexNormalizedQuotaName(latest.PlanType, q.Name)
+		headroom := 100 - q.Utilization
+		if headroom < 0 {
+			headroom = 0
+		}
+		status := codexUtilStatus(q.Utilization)
+		qMap := map[string]interface{}{
+			"name":        normalizedName,
+			"displayName": api.CodexDisplayName(normalizedName),
+			"utilization": q.Utilization,
+			"headroom":    headroom,
+			"status":      status,
+		}
+		// code_review always shows remaining; five_hour/seven_day show remaining when display_mode="available"
+		if normalizedName == "code_review" || (showAvailable && (normalizedName == "five_hour" || normalizedName == "seven_day")) {
+			remaining := 100 - q.Utilization
+			if remaining < 0 {
+				remaining = 0
+			}
+			qMap["cardPercent"] = remaining
+			qMap["cardLabel"] = "Remaining"
+			qMap["remainingPercent"] = remaining
+			qMap["status"] = codexRemainingStatus(remaining)
+		}
+		if q.ResetsAt != nil {
+			timeUntilReset := time.Until(*q.ResetsAt)
+			qMap["resetsAt"] = q.ResetsAt.Format(time.RFC3339)
+			qMap["timeUntilReset"] = formatDuration(timeUntilReset)
+			qMap["timeUntilResetSeconds"] = int64(timeUntilReset.Seconds())
+		}
+		if h.codexTracker != nil {
+			if summary, err := h.codexTracker.UsageSummary(accountID, q.Name); err == nil && summary != nil {
+				qMap["currentRate"] = summary.CurrentRate
+				qMap["projectedUtil"] = summary.ProjectedUtil
+			}
+		}
+		if idx, exists := quotaIndexByName[normalizedName]; exists {
+			quotas[idx] = qMap
+		} else {
+			quotaIndexByName[normalizedName] = len(quotas)
+			quotas = append(quotas, qMap)
+		}
+	}
+	response["quotas"] = quotas
+	return response
+}
+
+func codexUtilStatus(util float64) string {
+	switch {
+	case util >= 95:
+		return "critical"
+	case util >= 80:
+		return "danger"
+	case util >= 50:
+		return "warning"
+	default:
+		return "healthy"
+	}
+}
+
+func codexQuotaDisplayOrder(name string) int {
+	switch name {
+	case "five_hour":
+		return 0
+	case "seven_day":
+		return 1
+	case "code_review":
+		return 2
+	default:
+		return 100
+	}
+}
+
+// currentAntigravity returns current Antigravity quota status.
+func (h *Handler) currentAntigravity(w http.ResponseWriter, r *http.Request) {
+	respondJSON(w, http.StatusOK, h.buildAntigravityCurrent())
+}
+
+// buildAntigravityCurrent builds the Antigravity current quota response map.
+func (h *Handler) buildAntigravityCurrent() map[string]interface{} {
+	now := time.Now().UTC()
+	response := map[string]interface{}{
+		"capturedAt": now.Format(time.RFC3339),
+		"quotas":     []interface{}{},
+		"pools":      []interface{}{},
+	}
+
+	if h.store == nil {
+		return response
+	}
+
+	latest, err := h.store.QueryLatestAntigravity()
+	if err != nil {
+		h.logger.Error("failed to query latest Antigravity snapshot", "error", err)
+		return response
+	}
+
+	if latest == nil {
+		return response
+	}
+
+	response["capturedAt"] = latest.CapturedAt.Format(time.RFC3339)
+	if latest.Email != "" {
+		response["email"] = latest.Email
+	}
+	if latest.PlanName != "" {
+		response["planName"] = latest.PlanName
+	}
+	if latest.PromptCredits > 0 || latest.MonthlyCredits > 0 {
+		response["promptCredits"] = latest.PromptCredits
+		response["monthlyCredits"] = latest.MonthlyCredits
+	}
+
+	groups := api.GroupAntigravityModelsByLogicalQuota(latest.Models)
+	quotas := make([]map[string]interface{}, 0, len(groups))
+	for _, g := range groups {
+		status := antigravityUsageStatus(g.UsagePercent)
+		qMap := map[string]interface{}{
+			"modelId":           g.GroupKey,
+			"quotaGroup":        g.GroupKey,
+			"label":             g.DisplayName,
+			"displayName":       g.DisplayName,
+			"remainingFraction": g.RemainingFraction,
+			"remainingPercent":  g.RemainingPercent,
+			"usagePercent":      g.UsagePercent,
+			"isExhausted":       g.IsExhausted,
+			"status":            status,
+			"models":            g.ModelIDs,
+			"modelLabels":       g.Labels,
+			"color":             g.Color,
+		}
+		if g.ResetTime != nil {
+			timeUntilReset := g.TimeUntilReset
+			if timeUntilReset < 0 {
+				timeUntilReset = 0
+			}
+			qMap["resetTime"] = g.ResetTime.Format(time.RFC3339)
+			qMap["timeUntilReset"] = formatDuration(timeUntilReset)
+			qMap["timeUntilResetSeconds"] = int64(timeUntilReset.Seconds())
+		}
+
+		if h.antigravityTracker != nil {
+			groupRate := 0.0
+			groupProjected := 0.0
+			for _, modelID := range g.ModelIDs {
+				if summary, err := h.antigravityTracker.UsageSummary(modelID); err == nil && summary != nil {
+					groupRate += summary.CurrentRate
+					groupProjected += summary.ProjectedUsage
+				}
+			}
+			qMap["currentRate"] = groupRate
+			qMap["projectedUsage"] = groupProjected
+		}
+		quotas = append(quotas, qMap)
+	}
+	response["quotas"] = quotas
+	response["pools"] = quotas
+
+	var lowestPool map[string]interface{}
+	lowestRemaining := 101.0
+	for _, q := range quotas {
+		if remaining, ok := q["remainingPercent"].(float64); ok && remaining < lowestRemaining {
+			lowestRemaining = remaining
+			lowestPool = q
+		}
+	}
+	if lowestPool != nil {
+		response["lowestPool"] = lowestPool
+	}
+
+	return response
+}
+
+func antigravityUsageStatus(usagePercent float64) string {
+	switch {
+	case usagePercent >= 95:
+		return "critical"
+	case usagePercent >= 80:
+		return "danger"
+	case usagePercent >= 50:
+		return "warning"
+	default:
+		return "healthy"
+	}
+}
+
+// insightsAntigravity returns Antigravity-specific deep analytics.
+func (h *Handler) insightsAntigravity(w http.ResponseWriter, r *http.Request, rangeDur time.Duration) {
+	hidden := h.getHiddenInsightKeys()
+	respondJSON(w, http.StatusOK, h.buildAntigravityInsights(hidden, rangeDur))
+}
+
+// buildAntigravityInsights builds Antigravity insights focused on burn rates and exhaustion forecast.
+func (h *Handler) buildAntigravityInsights(hidden map[string]bool, rangeDur time.Duration) insightsResponse {
+	resp := insightsResponse{Stats: []insightStat{}, Insights: []insightItem{}}
+
+	if h.store == nil {
+		return resp
+	}
+
+	now := time.Now().UTC()
+	rangeStart := now.Add(-rangeDur)
+	latest, err := h.store.QueryLatestAntigravity()
+	if err != nil || latest == nil {
+		return resp
+	}
+
+	groups := api.GroupAntigravityModelsByLogicalQuota(latest.Models)
+	snapshots, err := h.store.QueryAntigravityHistory(rangeStart, now)
+	if err != nil {
+		snapshots = nil
+	}
+
+	type burnRateStats struct {
+		avgCompleted float64
+		current      float64
+		hasCompleted bool
+		hasCurrent   bool
+	}
+
+	burnRatesByGroup := map[string]burnRateStats{}
+	for _, group := range groups {
+		stats := burnRateStats{}
+
+		for _, modelID := range group.ModelIDs {
+			cycles, err := h.store.QueryAntigravityCycleHistory(modelID, 200)
+			if err == nil {
+				var sum float64
+				var count int
+				for _, cycle := range cycles {
+					if cycle == nil || cycle.CycleEnd == nil {
+						continue
+					}
+					// Filter by selected time range
+					if cycle.CycleStart.Before(rangeStart) {
+						continue
+					}
+					dur := cycle.CycleEnd.Sub(cycle.CycleStart)
+					if dur <= 0 || cycle.TotalDelta <= 0 {
+						continue
+					}
+					rate := (cycle.TotalDelta * 100) / dur.Hours()
+					if rate <= 0 {
+						continue
+					}
+					sum += rate
+					count++
+				}
+				if count > 0 {
+					stats.avgCompleted += sum / float64(count)
+					stats.hasCompleted = true
+				}
+			}
+
+			if active, err := h.store.QueryActiveAntigravityCycle(modelID); err == nil && active != nil {
+				dur := now.Sub(active.CycleStart)
+				if dur > 0 && active.TotalDelta > 0 {
+					rate := (active.TotalDelta * 100) / dur.Hours()
+					if rate > 0 {
+						stats.current += rate
+						stats.hasCurrent = true
+					}
+				}
+			}
+		}
+
+		burnRatesByGroup[group.GroupKey] = stats
+	}
+
+	totalAvgBurn := 0.0
+	totalCurrentBurn := 0.0
+	avgBurnCount := 0
+	currentBurnCount := 0
+	for _, group := range groups {
+		stats := burnRatesByGroup[group.GroupKey]
+		if stats.hasCompleted {
+			totalAvgBurn += stats.avgCompleted
+			avgBurnCount++
+		}
+		if stats.hasCurrent {
+			totalCurrentBurn += stats.current
+			currentBurnCount++
+		}
+	}
+	if avgBurnCount > 0 {
+		totalAvgBurn = totalAvgBurn / float64(avgBurnCount)
+	}
+	if currentBurnCount > 0 {
+		totalCurrentBurn = totalCurrentBurn / float64(currentBurnCount)
+	}
+
+	// Show effective burn rate (current if active, otherwise historical average)
+	effectiveBurn := totalCurrentBurn
+	burnLabel := "Current Burn"
+	if effectiveBurn <= 0 && totalAvgBurn > 0 {
+		effectiveBurn = totalAvgBurn
+		burnLabel = "Avg Burn Rate"
+	}
+	if !hidden["avg_burn_rate"] && effectiveBurn > 0 {
+		resp.Stats = append(resp.Stats, insightStat{
+			Label: burnLabel,
+			Value: fmt.Sprintf("%.1f%%/hr", effectiveBurn),
+		})
+	}
+
+	var globalEta *time.Time
+
+	for _, group := range groups {
+		stats := burnRatesByGroup[group.GroupKey]
+		groupRate := stats.current
+		if groupRate <= 0 && stats.hasCompleted {
+			groupRate = stats.avgCompleted
+		}
+
+		severity := "info"
+		metric := "No burn"
+		sublabel := fmt.Sprintf("%.0f%% left", group.RemainingPercent)
+
+		if groupRate > 0 {
+			metric = fmt.Sprintf("%.1f%%/hr", groupRate)
+			hoursToZero := group.RemainingPercent / groupRate
+			if hoursToZero > 0 {
+				eta := now.Add(time.Duration(hoursToZero * float64(time.Hour)))
+
+				if group.ResetTime != nil && eta.Before(*group.ResetTime) {
+					severity = "critical"
+					sublabel = fmt.Sprintf("Exhausts %s", eta.Format("Jan 2 15:04"))
+					if globalEta == nil || eta.Before(*globalEta) {
+						t := eta
+						globalEta = &t
+					}
+				} else {
+					if groupRate >= 5 {
+						severity = "warning"
+					}
+					sublabel = fmt.Sprintf("~%s left", formatDuration(time.Duration(hoursToZero*float64(time.Hour))))
+				}
+			}
+		}
+
+		if !hidden["burn_group_"+group.GroupKey] {
+			resp.Insights = append(resp.Insights, insightItem{
+				Key:      "burn_group_" + group.GroupKey,
+				Title:    group.DisplayName,
+				Metric:   metric,
+				Sublabel: sublabel,
+				Severity: severity,
+			})
+		}
+	}
+
+	// Only show exhaustion warning if there's an impending burndown
+	if globalEta != nil && !hidden["exhaustion_warning"] {
+		resp.Stats = append(resp.Stats, insightStat{
+			Label: "Exhausts By",
+			Value: globalEta.Format("Jan 2 15:04"),
+		})
+	}
+
+	if len(snapshots) >= 2 && !hidden["coverage"] {
+		first := snapshots[0]
+		last := snapshots[len(snapshots)-1]
+		dur := last.CapturedAt.Sub(first.CapturedAt)
+		resp.Insights = append(resp.Insights, insightItem{
+			Key:      "coverage",
+			Title:    "Coverage",
+			Metric:   formatDuration(dur),
+			Sublabel: fmt.Sprintf("%d polls", len(snapshots)),
+			Severity: "info",
+		})
+	}
+
+	return resp
+}
+
+// truncateName truncates a name to maxLen characters with ellipsis.
+func truncateName(name string, maxLen int) string {
+	if len(name) <= maxLen {
+		return name
+	}
+	return name[:maxLen-1] + "..."
+}
+
+// historyAntigravity returns Antigravity usage history with per-model datasets.
+func (h *Handler) historyAntigravity(w http.ResponseWriter, r *http.Request) {
+	if h.store == nil {
+		respondJSON(w, http.StatusOK, map[string]interface{}{
+			"labels":   []string{},
+			"datasets": []interface{}{},
+		})
+		return
+	}
+
+	duration, err := parseTimeRange(r.URL.Query().Get("range"))
+	if err != nil {
+		respondError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	end := time.Now().UTC()
+	start := end.Add(-duration)
+
+	snapshots, err := h.store.QueryAntigravityRange(start, end)
+	if err != nil {
+		h.logger.Error("failed to query antigravity history", "error", err)
+		respondJSON(w, http.StatusOK, map[string]interface{}{
+			"labels":   []string{},
+			"datasets": []interface{}{},
+		})
+		return
+	}
+
+	if len(snapshots) == 0 {
+		respondJSON(w, http.StatusOK, map[string]interface{}{
+			"labels":   []string{},
+			"datasets": []interface{}{},
+		})
+		return
+	}
+
+	step := downsampleStep(len(snapshots), maxChartPoints)
+	var labels []string
+	for i := 0; i < len(snapshots); i += step {
+		labels = append(labels, snapshots[i].CapturedAt.Format(time.RFC3339))
+	}
+
+	groupKeys := api.AntigravityQuotaGroupOrder()
+	groupedSeries := make(map[string][]float64, len(groupKeys))
+	for _, key := range groupKeys {
+		groupedSeries[key] = make([]float64, 0, len(labels))
+	}
+
+	for i := 0; i < len(snapshots); i += step {
+		groups := api.GroupAntigravityModelsByLogicalQuota(snapshots[i].Models)
+		valueByGroup := make(map[string]float64, len(groups))
+		for _, g := range groups {
+			valueByGroup[g.GroupKey] = g.UsagePercent
+		}
+		for _, key := range groupKeys {
+			groupedSeries[key] = append(groupedSeries[key], valueByGroup[key])
+		}
+	}
+
+	datasets := make([]map[string]interface{}, 0, len(groupKeys))
+	for _, key := range groupKeys {
+		datasets = append(datasets, map[string]interface{}{
+			"modelId":     key,
+			"label":       api.AntigravityQuotaGroupDisplayName(key),
+			"data":        groupedSeries[key],
+			"borderColor": api.AntigravityQuotaGroupColor(key),
+			"fill":        false,
+		})
+	}
+
+	respondJSON(w, http.StatusOK, map[string]interface{}{
+		"labels":   labels,
+		"datasets": datasets,
+	})
+}
+
+func codexRemainingStatus(remaining float64) string {
+	switch {
+	case remaining <= 5:
+		return "critical"
+	case remaining <= 20:
+		return "danger"
+	case remaining <= 50:
+		return "warning"
+	default:
+		return "healthy"
+	}
+}
+
+func (h *Handler) historyCodex(w http.ResponseWriter, r *http.Request) {
+	if h.store == nil {
+		respondJSON(w, http.StatusOK, []interface{}{})
+		return
+	}
+	accountID := parseCodexAccountID(r)
+	duration, err := parseTimeRange(r.URL.Query().Get("range"))
+	if err != nil {
+		respondError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	end := time.Now().UTC()
+	start := end.Add(-duration)
+	snapshots, err := h.store.QueryCodexRange(accountID, start, end)
+	if err != nil {
+		h.logger.Error("failed to query Codex history", "error", err)
+		respondError(w, http.StatusInternalServerError, "failed to query history")
+		return
+	}
+	step := downsampleStep(len(snapshots), maxChartPoints)
+	last := len(snapshots) - 1
+	response := make([]map[string]interface{}, 0, min(len(snapshots), maxChartPoints))
+	for i, snap := range snapshots {
+		if step > 1 && i != 0 && i != last && i%step != 0 {
+			continue
+		}
+		entry := map[string]interface{}{"capturedAt": snap.CapturedAt.Format(time.RFC3339)}
+		for _, q := range snap.Quotas {
+			name := codexNormalizedQuotaName(snap.PlanType, q.Name)
+			entry[name] = q.Utilization
+		}
+		response = append(response, entry)
+	}
+	respondJSON(w, http.StatusOK, response)
+}
+
+func (h *Handler) cyclesCodex(w http.ResponseWriter, r *http.Request) {
+	if h.store == nil {
+		respondJSON(w, http.StatusOK, []interface{}{})
+		return
+	}
+
+	accountID := parseCodexAccountID(r)
+	quotaName := r.URL.Query().Get("type")
+	if quotaName == "" {
+		quotaName = "five_hour"
+	}
+
+	validTypes := map[string]bool{
+		"five_hour":   true,
+		"seven_day":   true,
+		"code_review": true,
+	}
+	if !validTypes[quotaName] {
+		respondError(w, http.StatusBadRequest, fmt.Sprintf("invalid quota type: %s", quotaName))
+		return
+	}
+
+	response := []map[string]interface{}{}
+
+	active, err := h.store.QueryActiveCodexCycle(accountID, quotaName)
+	if err != nil {
+		h.logger.Error("failed to query active Codex cycle", "error", err)
+		respondError(w, http.StatusInternalServerError, "failed to query cycles")
+		return
+	}
+	if active != nil {
+		response = append(response, codexCycleToMap(active))
+	}
+
+	history, err := h.store.QueryCodexCycleHistory(accountID, quotaName, 200)
+	if err != nil {
+		h.logger.Error("failed to query Codex cycle history", "error", err)
+		respondError(w, http.StatusInternalServerError, "failed to query cycles")
+		return
+	}
+	for _, cycle := range history {
+		response = append(response, codexCycleToMap(cycle))
+	}
+
+	respondJSON(w, http.StatusOK, response)
+}
+
+func codexCycleToMap(cycle *store.CodexResetCycle) map[string]interface{} {
+	result := map[string]interface{}{
+		"id":              cycle.ID,
+		"quotaName":       cycle.QuotaName,
+		"cycleStart":      cycle.CycleStart.Format(time.RFC3339),
+		"cycleEnd":        nil,
+		"peakUtilization": cycle.PeakUtilization,
+		"totalDelta":      cycle.TotalDelta,
+	}
+	if cycle.CycleEnd != nil {
+		result["cycleEnd"] = cycle.CycleEnd.Format(time.RFC3339)
+	}
+	if cycle.ResetsAt != nil {
+		result["resetsAt"] = cycle.ResetsAt.Format(time.RFC3339)
+	}
+	return result
+}
+
+func (h *Handler) cyclesAntigravity(w http.ResponseWriter, r *http.Request) {
+	if h.store == nil {
+		respondJSON(w, http.StatusOK, []interface{}{})
+		return
+	}
+
+	modelID := r.URL.Query().Get("type")
+	if modelID == "" {
+		// If no model specified, return empty array
+		respondJSON(w, http.StatusOK, []interface{}{})
+		return
+	}
+
+	response := []map[string]interface{}{}
+
+	active, err := h.store.QueryActiveAntigravityCycle(modelID)
+	if err != nil {
+		h.logger.Error("failed to query active Antigravity cycle", "error", err)
+		respondError(w, http.StatusInternalServerError, "failed to query cycles")
+		return
+	}
+	if active != nil {
+		response = append(response, antigravityCycleToMap(active))
+	}
+
+	history, err := h.store.QueryAntigravityCycleHistory(modelID, 200)
+	if err != nil {
+		h.logger.Error("failed to query Antigravity cycle history", "error", err)
+		respondError(w, http.StatusInternalServerError, "failed to query cycles")
+		return
+	}
+	for _, cycle := range history {
+		response = append(response, antigravityCycleToMap(cycle))
+	}
+
+	respondJSON(w, http.StatusOK, response)
+}
+
+func antigravityCycleToMap(cycle *store.AntigravityResetCycle) map[string]interface{} {
+	result := map[string]interface{}{
+		"id":         cycle.ID,
+		"modelId":    cycle.ModelID,
+		"cycleStart": cycle.CycleStart.Format(time.RFC3339),
+		"cycleEnd":   nil,
+		"peakUsage":  cycle.PeakUsage,
+		"totalDelta": cycle.TotalDelta,
+	}
+	if cycle.CycleEnd != nil {
+		result["cycleEnd"] = cycle.CycleEnd.Format(time.RFC3339)
+	}
+	if cycle.ResetTime != nil {
+		result["resetTime"] = cycle.ResetTime.Format(time.RFC3339)
+	}
+	return result
+}
+
+const (
+	minimaxSharedQuotaKey         = "coding_plan"
+	minimaxSharedQuotaDisplayName = "Coding"
+	minimaxInsightSampleLimit     = 20000
+)
+
+// parseMiniMaxAccountID extracts the MiniMax account ID from query params.
+// Falls back to the default MiniMax account (looked up from provider_accounts) if not specified.
+func (h *Handler) parseMiniMaxAccountID(r *http.Request) int64 {
+	accountStr := r.URL.Query().Get("account")
+	if accountStr != "" {
+		if id, err := strconv.ParseInt(accountStr, 10, 64); err == nil && id > 0 {
+			return id
+		}
+	}
+	return h.defaultMiniMaxAccountID()
+}
+
+// defaultMiniMaxAccountID returns the provider_accounts.id for the default MiniMax account.
+func (h *Handler) defaultMiniMaxAccountID() int64 {
+	if h.store == nil {
+		return 0
+	}
+	accounts, err := h.store.QueryActiveProviderAccounts("minimax")
+	if err != nil || len(accounts) == 0 {
+		return 0
+	}
+	return accounts[0].ID
+}
+
+// minimaxUsageAccounts returns current usage for all active MiniMax accounts.
+// Mirrors codexUsageAccounts() pattern.
+func (h *Handler) minimaxUsageAccounts() []map[string]interface{} {
+	if h.store == nil {
+		return []map[string]interface{}{}
+	}
+
+	accounts, err := h.store.QueryActiveProviderAccounts("minimax")
+	if err != nil {
+		h.logger.Error("failed to query MiniMax accounts", "error", err)
+		return []map[string]interface{}{}
+	}
+	if len(accounts) == 0 {
+		defID := h.defaultMiniMaxAccountID()
+		if defID > 0 {
+			accounts = []store.ProviderAccount{
+				{ID: defID, Name: "default"},
+			}
+		}
+	}
+
+	usages := make([]map[string]interface{}, 0, len(accounts))
+	for _, acc := range accounts {
+		usage := h.buildMiniMaxCurrent(acc.ID)
+		usage["accountId"] = acc.ID
+		usage["accountName"] = acc.Name
+		usage["id"] = acc.ID
+		usage["name"] = acc.Name
+		usages = append(usages, usage)
+	}
+	return usages
+}
+
+func minimaxUsageAccountID(usage map[string]interface{}) int64 {
+	if usage == nil {
+		return 0
+	}
+	switch v := usage["accountId"].(type) {
+	case int64:
+		if v > 0 {
+			return v
+		}
+	case int:
+		if v > 0 {
+			return int64(v)
+		}
+	case float64:
+		if v > 0 {
+			return int64(v)
+		}
+	}
+	return 0
+}
+
+func minimaxUsageAccountName(usage map[string]interface{}) string {
+	if usage == nil {
+		return ""
+	}
+	name, _ := usage["accountName"].(string)
+	return name
+}
+
+func minimaxAccountTelemetryEnabled(visibility map[string]interface{}, accountID int64) bool {
+	accountKey := fmt.Sprintf("minimax:%d", accountID)
+	if polling, exists := providerPollingValue(visibility[accountKey]); exists {
+		return polling
+	}
+	return providerTelemetryEnabled(visibility, "minimax")
+}
+
+// MiniMaxAccounts handles MiniMax account management.
+// GET    /api/minimax/accounts        - list all accounts
+// POST   /api/minimax/accounts        - create account  (body: {name, api_key, region})
+// PUT    /api/minimax/accounts?id=N   - update account  (body: {name?, api_key?, region?})
+// DELETE /api/minimax/accounts?id=N   - soft-delete account
+func (h *Handler) MiniMaxAccounts(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		h.minimaxAccountsList(w, r)
+	case http.MethodPost:
+		h.minimaxAccountCreate(w, r)
+	case http.MethodPut:
+		h.minimaxAccountUpdate(w, r)
+	case http.MethodDelete:
+		h.minimaxAccountDelete(w, r)
+	default:
+		respondError(w, http.StatusMethodNotAllowed, "method not allowed")
+	}
+}
+
+func (h *Handler) minimaxAccountsList(w http.ResponseWriter, r *http.Request) {
+	if h.store == nil {
+		respondJSON(w, http.StatusOK, map[string]interface{}{"accounts": []interface{}{}})
+		return
+	}
+	accounts, err := h.store.QueryProviderAccounts("minimax")
+	if err != nil {
+		h.logger.Error("failed to query MiniMax accounts", "error", err)
+		respondError(w, http.StatusInternalServerError, "failed to query accounts")
+		return
+	}
+	result := make([]map[string]interface{}, 0, len(accounts))
+	for _, acc := range accounts {
+		entry := map[string]interface{}{
+			"id":        acc.ID,
+			"name":      acc.Name,
+			"createdAt": acc.CreatedAt.Format(time.RFC3339),
+			"hasKey":    strings.Contains(acc.Metadata, "api_key"),
+		}
+		// Parse region from metadata
+		var meta map[string]interface{}
+		if acc.Metadata != "" {
+			if json.Unmarshal([]byte(acc.Metadata), &meta) == nil {
+				if r, ok := meta["region"].(string); ok {
+					entry["region"] = r
+				}
+			}
+		}
+		if acc.DeletedAt != nil {
+			entry["deletedAt"] = acc.DeletedAt.Format(time.RFC3339)
+		}
+		result = append(result, entry)
+	}
+	respondJSON(w, http.StatusOK, map[string]interface{}{"accounts": result})
+}
+
+func (h *Handler) minimaxAccountCreate(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Name   string `json:"name"`
+		APIKey string `json:"api_key"`
+		Region string `json:"region"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		respondError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if strings.TrimSpace(req.Name) == "" {
+		respondError(w, http.StatusBadRequest, "account name is required")
+		return
+	}
+	if !validProfileName.MatchString(req.Name) {
+		respondError(w, http.StatusBadRequest, "invalid account name: use only letters, numbers, hyphens, and underscores")
+		return
+	}
+	if h.store == nil {
+		respondError(w, http.StatusInternalServerError, "store not available")
+		return
+	}
+
+	acc, err := h.store.GetOrCreateProviderAccount("minimax", req.Name)
+	if err != nil {
+		h.logger.Error("failed to create MiniMax account", "error", err)
+		respondError(w, http.StatusInternalServerError, "failed to create account")
+		return
+	}
+
+	// Store metadata (API key + region)
+	meta := map[string]string{}
+	if req.APIKey != "" {
+		meta["api_key"] = req.APIKey
+	}
+	if req.Region != "" {
+		if req.Region != "global" && req.Region != "cn" {
+			respondError(w, http.StatusBadRequest, "invalid region: must be 'global' or 'cn'")
+			return
+		}
+		meta["region"] = req.Region
+	}
+	if len(meta) > 0 {
+		metaJSON, _ := json.Marshal(meta)
+		if err := h.store.UpdateProviderAccountMetadata(acc.ID, string(metaJSON)); err != nil {
+			h.logger.Error("failed to update MiniMax account metadata", "error", err)
+		}
+	}
+
+	// Hot-reload agents
+	if h.minimaxAgentMgr != nil {
+		h.minimaxAgentMgr.Reload()
+	}
+
+	respondJSON(w, http.StatusCreated, map[string]interface{}{
+		"message": "account created",
+		"id":      acc.ID,
+		"name":    req.Name,
+	})
+}
+
+func (h *Handler) minimaxAccountUpdate(w http.ResponseWriter, r *http.Request) {
+	idStr := r.URL.Query().Get("id")
+	id, err := strconv.ParseInt(idStr, 10, 64)
+	if err != nil || id <= 0 {
+		respondError(w, http.StatusBadRequest, "valid account id is required")
+		return
+	}
+
+	var req struct {
+		Name   *string `json:"name"`
+		APIKey *string `json:"api_key"`
+		Region *string `json:"region"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		respondError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if h.store == nil {
+		respondError(w, http.StatusInternalServerError, "store not available")
+		return
+	}
+
+	acc, err := h.store.GetProviderAccountByID(id)
+	if err != nil || acc == nil || acc.Provider != "minimax" {
+		respondError(w, http.StatusNotFound, "account not found")
+		return
+	}
+
+	// Update name
+	if req.Name != nil && strings.TrimSpace(*req.Name) != "" {
+		trimmedName := strings.TrimSpace(*req.Name)
+		if !validProfileName.MatchString(trimmedName) {
+			respondError(w, http.StatusBadRequest, "invalid account name")
+			return
+		}
+		if err := h.store.RenameProviderAccount(id, trimmedName); err != nil {
+			h.logger.Error("failed to rename MiniMax account", "error", err)
+			respondError(w, http.StatusInternalServerError, "failed to rename account")
+			return
+		}
+	}
+
+	// Update metadata (merge with existing)
+	if req.APIKey != nil || req.Region != nil {
+		existing := map[string]string{}
+		if acc.Metadata != "" {
+			json.Unmarshal([]byte(acc.Metadata), &existing)
+		}
+		if req.APIKey != nil && *req.APIKey != "" {
+			existing["api_key"] = *req.APIKey
+		}
+		if req.Region != nil {
+			if *req.Region != "" && *req.Region != "global" && *req.Region != "cn" {
+				respondError(w, http.StatusBadRequest, "invalid region: must be 'global' or 'cn'")
+				return
+			}
+			existing["region"] = *req.Region
+		}
+		metaJSON, _ := json.Marshal(existing)
+		if err := h.store.UpdateProviderAccountMetadata(id, string(metaJSON)); err != nil {
+			h.logger.Error("failed to update MiniMax account metadata", "error", err)
+			respondError(w, http.StatusInternalServerError, "failed to update account")
+			return
+		}
+	}
+
+	if h.minimaxAgentMgr != nil {
+		h.minimaxAgentMgr.Reload()
+	}
+
+	respondJSON(w, http.StatusOK, map[string]interface{}{"message": "account updated", "id": id})
+}
+
+func (h *Handler) minimaxAccountDelete(w http.ResponseWriter, r *http.Request) {
+	idStr := r.URL.Query().Get("id")
+	id, err := strconv.ParseInt(idStr, 10, 64)
+	if err != nil || id <= 0 {
+		respondError(w, http.StatusBadRequest, "valid account id is required")
+		return
+	}
+	if h.store == nil {
+		respondError(w, http.StatusInternalServerError, "store not available")
+		return
+	}
+
+	acc, err := h.store.GetProviderAccountByID(id)
+	if err != nil || acc == nil || acc.Provider != "minimax" {
+		respondError(w, http.StatusNotFound, "account not found")
+		return
+	}
+
+	if err := h.store.MarkProviderAccountDeletedByID(id); err != nil {
+		h.logger.Error("failed to delete MiniMax account", "error", err)
+		respondError(w, http.StatusInternalServerError, "failed to delete account")
+		return
+	}
+
+	if h.minimaxAgentMgr != nil {
+		h.minimaxAgentMgr.Reload()
+	}
+
+	respondJSON(w, http.StatusOK, map[string]interface{}{"message": "account deleted", "id": id})
+}
+
+// MiniMaxAccountsUsage returns current usage for all active MiniMax accounts.
+func (h *Handler) MiniMaxAccountsUsage(w http.ResponseWriter, r *http.Request) {
+	if h.store == nil {
+		respondJSON(w, http.StatusOK, map[string]interface{}{"accounts": []interface{}{}})
+		return
+	}
+	accounts, err := h.store.QueryActiveProviderAccounts("minimax")
+	if err != nil {
+		h.logger.Error("failed to query MiniMax accounts", "error", err)
+		respondJSON(w, http.StatusOK, map[string]interface{}{"accounts": []interface{}{}})
+		return
+	}
+	result := make([]map[string]interface{}, 0, len(accounts))
+	for _, acc := range accounts {
+		usage := h.buildMiniMaxCurrent(acc.ID)
+		usage["accountId"] = acc.ID
+		usage["accountName"] = acc.Name
+		result = append(result, usage)
+	}
+	respondJSON(w, http.StatusOK, map[string]interface{}{"accounts": result})
+}
+
+type minimaxMergedSample struct {
+	CapturedAt     time.Time
+	Used           int
+	Remaining      int
+	Total          int
+	UsedPercent    float64
+	ResetAt        *time.Time
+	TimeUntilReset time.Duration
+	WindowStart    *time.Time
+	WindowEnd      *time.Time
+	// Weekly quota data (zero when not available).
+	HasWeeklyQuota    bool
+	WeeklyUsed        int
+	WeeklyRemain      int
+	WeeklyTotal       int
+	WeeklyUsedPercent float64
+	WeeklyResetAt     *time.Time
+}
+
+// currentMiniMax returns current MiniMax model usage.
+func (h *Handler) currentMiniMax(w http.ResponseWriter, r *http.Request) {
+	accountID := h.parseMiniMaxAccountID(r)
+	respondJSON(w, http.StatusOK, h.buildMiniMaxCurrent(accountID))
+}
+
+// buildMiniMaxCurrent builds current MiniMax response.
+func (h *Handler) buildMiniMaxCurrent(accountID int64) map[string]interface{} {
+	now := time.Now().UTC()
+	response := map[string]interface{}{
+		"capturedAt":  now.Format(time.RFC3339),
+		"quotas":      []interface{}{},
+		"sharedQuota": false,
+	}
+	if h.store == nil {
+		return response
+	}
+
+	latest, err := h.store.QueryLatestMiniMax(accountID)
+	if err != nil {
+		h.logger.Error("failed to query latest MiniMax snapshot", "error", err)
+		return response
+	}
+	if latest == nil {
+		return response
+	}
+
+	response["capturedAt"] = latest.CapturedAt.Format(time.RFC3339)
+
+	buildQuota := func(quota api.MiniMaxModelQuota, summaryModelName string) map[string]interface{} {
+		q := map[string]interface{}{
+			"name":         quota.ModelName,
+			"displayName":  api.MiniMaxDisplayName(quota.ModelName),
+			"total":        quota.Total,
+			"used":         quota.Used,
+			"remaining":    quota.Remain,
+			"usagePercent": quota.UsedPercent,
+			"status":       minimaxUsageStatus(quota.UsedPercent),
+		}
+		if quota.ResetAt != nil {
+			timeUntilReset := time.Until(*quota.ResetAt)
+			q["resetAt"] = quota.ResetAt.Format(time.RFC3339)
+			q["timeUntilReset"] = formatDuration(timeUntilReset)
+			q["timeUntilResetSeconds"] = int64(timeUntilReset.Seconds())
+		}
+		if h.minimaxTracker != nil && summaryModelName != "" {
+			if summary, err := h.minimaxTracker.UsageSummary(summaryModelName, accountID); err == nil && summary != nil {
+				q["currentRate"] = summary.CurrentRate
+				q["projectedUsage"] = summary.ProjectedUsage
+			}
+		}
+		return q
+	}
+
+	buildWeeklyQuota := func(quota api.MiniMaxModelQuota, displayNameOverride string) map[string]interface{} {
+		displayName := "Weekly " + api.MiniMaxDisplayName(quota.ModelName)
+		if displayNameOverride != "" {
+			displayName = displayNameOverride
+		}
+		q := map[string]interface{}{
+			"name":         "weekly_" + quota.ModelName,
+			"displayName":  displayName,
+			"total":        quota.WeeklyTotal,
+			"used":         quota.WeeklyUsed,
+			"remaining":    quota.WeeklyRemain,
+			"usagePercent": quota.WeeklyUsedPercent,
+			"status":       minimaxUsageStatus(quota.WeeklyUsedPercent),
+			"isWeekly":     true,
+		}
+		if quota.WeeklyResetAt != nil {
+			timeUntilReset := time.Until(*quota.WeeklyResetAt)
+			q["resetAt"] = quota.WeeklyResetAt.Format(time.RFC3339)
+			q["timeUntilReset"] = formatDuration(timeUntilReset)
+			q["timeUntilResetSeconds"] = int64(timeUntilReset.Seconds())
+		}
+		if quota.WeeklyWindowStart != nil {
+			q["windowStart"] = quota.WeeklyWindowStart.Format(time.RFC3339)
+		}
+		if quota.WeeklyWindowEnd != nil {
+			q["windowEnd"] = quota.WeeklyWindowEnd.Format(time.RFC3339)
+		}
+		return q
+	}
+
+	groups := latest.GroupByPool()
+	dailyQuotas := make([]map[string]interface{}, 0, len(groups))
+	weeklyQuotas := make([]map[string]interface{}, 0)
+	allShared := len(groups) == 1 && len(groups[0].ModelNames) > 1
+
+	for _, g := range groups {
+		displayName := api.MiniMaxGroupDisplayName(g.ModelNames)
+		summaryModel := g.ModelNames[0]
+
+		q := buildQuota(g.Quota, summaryModel)
+		q["name"] = displayName
+		q["displayName"] = displayName
+		if len(g.ModelNames) > 1 {
+			q["sharedModels"] = g.ModelNames
+		}
+		dailyQuotas = append(dailyQuotas, q)
+
+		if g.Quota.HasWeeklyQuota && (g.Quota.WeeklyTotal > 0 || g.Quota.WeeklyUsed > 0) {
+			weeklyName := "Wkly " + displayName
+			wq := buildWeeklyQuota(g.Quota, weeklyName)
+			wq["name"] = "wkly_" + displayName
+			if len(g.ModelNames) > 1 {
+				wq["sharedModels"] = g.ModelNames
+			}
+			weeklyQuotas = append(weeklyQuotas, wq)
+		}
+	}
+
+	// All daily quotas first, then all weekly quotas.
+	quotas := make([]map[string]interface{}, 0, len(dailyQuotas)+len(weeklyQuotas))
+	quotas = append(quotas, dailyQuotas...)
+	quotas = append(quotas, weeklyQuotas...)
+
+	response["sharedQuota"] = allShared
+	if len(weeklyQuotas) > 0 {
+		response["weeklyQuotas"] = weeklyQuotas
+	}
+	response["quotas"] = quotas
+	return response
+}
+
+func minimaxSharedModelSummary(models []string) string {
+	if len(models) == 0 {
+		return ""
+	}
+	short := make([]string, 0, len(models))
+	for _, model := range models {
+		short = append(short, strings.TrimPrefix(model, "MiniMax-"))
+	}
+	return strings.Join(short, ", ")
+}
+
+func minimaxUsageStatus(usagePercent float64) string {
+	switch {
+	case usagePercent >= 95:
+		return "critical"
+	case usagePercent >= 80:
+		return "danger"
+	case usagePercent >= 50:
+		return "warning"
+	default:
+		return "healthy"
+	}
+}
+
+func minimaxInsightSeverity(usagePercent float64) string {
+	switch minimaxUsageStatus(usagePercent) {
+	case "critical":
+		return "critical"
+	case "danger", "warning":
+		return "warning"
+	default:
+		return "positive"
+	}
+}
+
+func minimaxStatusLabel(usagePercent float64) string {
+	switch minimaxUsageStatus(usagePercent) {
+	case "critical":
+		return "Critical"
+	case "danger":
+		return "High"
+	case "warning":
+		return "Warning"
+	default:
+		return "Healthy"
+	}
+}
+
+func minimaxRepresentativeModel(snapshot *api.MiniMaxSnapshot) string {
+	if snapshot == nil || len(snapshot.Models) == 0 {
+		return ""
+	}
+	return snapshot.Models[0].ModelName
+}
+
+func minimaxIsSharedGroup(groupBy string) bool {
+	groupBy = strings.TrimSpace(groupBy)
+	if groupBy == "" {
+		return false
+	}
+	return strings.EqualFold(groupBy, minimaxSharedQuotaKey) || strings.EqualFold(groupBy, minimaxSharedQuotaDisplayName)
+}
+
+func minimaxSharedCrossQuota(quota *api.MiniMaxModelQuota) store.CrossQuotaEntry {
+	if quota == nil {
+		return store.CrossQuotaEntry{Name: minimaxSharedQuotaKey}
+	}
+	return store.CrossQuotaEntry{
+		Name:         minimaxSharedQuotaKey,
+		Value:        float64(quota.Used),
+		Limit:        float64(quota.Total),
+		Percent:      quota.UsedPercent,
+		StartPercent: 0,
+		Delta:        quota.UsedPercent,
+	}
+}
+
+func minimaxMergedSamplesFromSnapshots(snapshots []*api.MiniMaxSnapshot) []minimaxMergedSample {
+	samples := make([]minimaxMergedSample, 0, len(snapshots))
+	for _, snap := range snapshots {
+		if snap == nil || len(snap.Models) == 0 {
+			continue
+		}
+		var quota *api.MiniMaxModelQuota
+		if snap.IsSharedQuota() {
+			quota = snap.MergedQuota()
+		} else {
+			quota = &snap.Models[0]
+		}
+		if quota == nil {
+			continue
+		}
+		samples = append(samples, minimaxMergedSample{
+			CapturedAt:        snap.CapturedAt,
+			Used:              quota.Used,
+			Remaining:         quota.Remain,
+			Total:             quota.Total,
+			UsedPercent:       quota.UsedPercent,
+			ResetAt:           quota.ResetAt,
+			TimeUntilReset:    quota.TimeUntilReset,
+			WindowStart:       quota.WindowStart,
+			WindowEnd:         quota.WindowEnd,
+			HasWeeklyQuota:    quota.HasWeeklyQuota,
+			WeeklyUsed:        quota.WeeklyUsed,
+			WeeklyRemain:      quota.WeeklyRemain,
+			WeeklyTotal:       quota.WeeklyTotal,
+			WeeklyUsedPercent: quota.WeeklyUsedPercent,
+			WeeklyResetAt:     quota.WeeklyResetAt,
+		})
+	}
+	sort.Slice(samples, func(i, j int) bool {
+		return samples[i].CapturedAt.Before(samples[j].CapturedAt)
+	})
+	return samples
+}
+
+func minimaxCurrentWindowSamples(samples []minimaxMergedSample, latest minimaxMergedSample) []minimaxMergedSample {
+	if len(samples) == 0 {
+		return nil
+	}
+	filtered := make([]minimaxMergedSample, 0, len(samples))
+	for _, sample := range samples {
+		if latest.WindowStart != nil && sample.CapturedAt.Before(*latest.WindowStart) {
+			continue
+		}
+		if latest.ResetAt != nil {
+			if sample.ResetAt == nil {
+				continue
+			}
+			diff := latest.ResetAt.Sub(*sample.ResetAt)
+			if diff < 0 {
+				diff = -diff
+			}
+			if diff > time.Second {
+				continue
+			}
+		}
+		filtered = append(filtered, sample)
+	}
+	if len(filtered) == 0 {
+		return samples
+	}
+	return filtered
+}
+
+func minimaxDailyUsage(samples []minimaxMergedSample) []struct {
+	day   time.Time
+	value float64
+} {
+	if len(samples) < 2 {
+		return nil
+	}
+	usageByDay := map[time.Time]float64{}
+	prev := samples[0]
+	for _, sample := range samples[1:] {
+		delta := sample.Used - prev.Used
+		if delta < 0 {
+			prev = sample
+			continue
+		}
+		day := time.Date(sample.CapturedAt.Year(), sample.CapturedAt.Month(), sample.CapturedAt.Day(), 0, 0, 0, 0, time.UTC)
+		usageByDay[day] += float64(delta)
+		prev = sample
+	}
+	if len(usageByDay) == 0 {
+		return nil
+	}
+	days := make([]struct {
+		day   time.Time
+		value float64
+	}, 0, len(usageByDay))
+	for day, value := range usageByDay {
+		days = append(days, struct {
+			day   time.Time
+			value float64
+		}{day: day, value: value})
+	}
+	sort.Slice(days, func(i, j int) bool { return days[i].day.Before(days[j].day) })
+	return days
+}
+
+func minimaxTrendDirection(days []struct {
+	day   time.Time
+	value float64
+}) string {
+	if len(days) < 2 {
+		return "Stable"
+	}
+	mid := len(days) / 2
+	if mid == 0 {
+		return "Stable"
+	}
+	var firstTotal float64
+	for _, day := range days[:mid] {
+		firstTotal += day.value
+	}
+	var secondTotal float64
+	for _, day := range days[mid:] {
+		secondTotal += day.value
+	}
+	firstAvg := firstTotal / float64(mid)
+	secondAvg := secondTotal / float64(len(days)-mid)
+	diff := secondAvg - firstAvg
+	threshold := 5.0
+	if firstAvg > 0 {
+		relative := firstAvg * 0.15
+		if relative > threshold {
+			threshold = relative
+		}
+	}
+	switch {
+	case diff > threshold:
+		return "Increasing"
+	case diff < -threshold:
+		return "Decreasing"
+	default:
+		return "Stable"
+	}
+}
+
+func minimaxProjectionSummary(projectedUsage, total int) string {
+	if total <= 0 {
+		return fmt.Sprintf("%d requests", projectedUsage)
+	}
+	projectedPercent := float64(projectedUsage) / float64(total) * 100
+	return fmt.Sprintf("%d/%d (%.1f%%)", projectedUsage, total, projectedPercent)
+}
+
+func minimaxUsageRecommendation(projectedUsage, total int, timeToExhaustion, timeUntilReset time.Duration) string {
+	if total <= 0 {
+		return "Keep collecting data to validate the plan."
+	}
+	projectedPercent := float64(projectedUsage) / float64(total) * 100
+	if timeToExhaustion > 0 && timeUntilReset > 0 && timeToExhaustion < timeUntilReset {
+		return "Current rate would exhaust the pool before reset; reduce usage or increase capacity."
+	}
+	switch {
+	case projectedPercent >= 90:
+		return "Projected usage is high for this window; monitor closely."
+	case projectedPercent >= 60:
+		return "Usage is rising but remains within the current plan."
+	default:
+		return "Current plan remains adequate at the present burn rate."
+	}
+}
+
+func minimaxBurnStatus(projectedUsage, total int, timeToExhaustion, timeUntilReset time.Duration) string {
+	if total <= 0 {
+		return "Waiting for enough data to model burn rate."
+	}
+	projectedPercent := float64(projectedUsage) / float64(total) * 100
+	if timeToExhaustion > 0 && timeUntilReset > 0 && timeToExhaustion < timeUntilReset {
+		return "Quota exhaustion is projected before the reset window."
+	}
+	if projectedPercent >= 80 {
+		return "Current rate would consume most of the pool before reset."
+	}
+	if projectedPercent <= 10 {
+		return "Current rate is well within the available quota."
+	}
+	return "Current burn rate remains within the available quota."
+}
+
+func (h *Handler) buildMiniMaxCycleOverviewRows(groupBy string, limit int, accountID int64) ([]store.CycleOverviewRow, []string, string, error) {
+	if h.store == nil {
+		return nil, nil, groupBy, nil
+	}
+	minimaxAccID := accountID
+	if minimaxAccID == 0 {
+		minimaxAccID = h.defaultMiniMaxAccountID()
+	}
+	h.logger.Debug("buildMiniMaxCycleOverviewRows", "groupBy_in", groupBy, "accountID_in", accountID, "minimaxAccID", minimaxAccID)
+
+	isWeeklyView := groupBy == "weekly_all"
+
+	// Map the shared quota display name ("coding_plan") to the actual representative model.
+	// Also handle empty groupBy by checking if a shared/merged model exists.
+	if groupBy == "" || minimaxIsSharedGroup(groupBy) || isWeeklyView {
+		// Check if there's a merged "MiniMax-M*" model with cycles
+		if cycle, err := h.store.QueryActiveMiniMaxCycle("MiniMax-M*", minimaxAccID); err == nil && cycle != nil {
+			groupBy = "MiniMax-M*"
+		} else if history, err := h.store.QueryMiniMaxCycleHistory("MiniMax-M*", minimaxAccID, 1); err == nil && len(history) > 0 {
+			groupBy = "MiniMax-M*"
+		}
+	}
+
+	latest, err := h.store.QueryLatestMiniMax(minimaxAccID)
+	if err != nil {
+		return nil, nil, groupBy, err
+	}
+	useSharedPath := (latest != nil && latest.IsSharedQuota()) || groupBy == "MiniMax-M*" || isWeeklyView
+	if useSharedPath {
+		sourceModel := groupBy // use resolved groupBy (e.g. "MiniMax-M*") as primary
+		if sourceModel == "" || minimaxIsSharedGroup(sourceModel) {
+			// Resolution gave us the shared key (e.g. "coding_plan") or nothing.
+			// Fall back to a real model name so the cycle query finds data.
+			sourceModel = minimaxRepresentativeModel(latest)
+		}
+		if sourceModel == "" {
+			return nil, []string{minimaxSharedQuotaKey}, minimaxSharedQuotaKey, nil
+		}
+		rows, err := h.store.QueryMiniMaxCycleOverview(sourceModel, limit, minimaxAccID)
+		if err != nil {
+			return nil, nil, groupBy, err
+		}
+		mergedRows := make([]store.CycleOverviewRow, 0, len(rows))
+		poolNameSet := map[string]bool{}
+		for _, row := range rows {
+			// Group cross-quota entries by pool (same limit+value = same pool).
+			type poolKey struct{ limit, value float64 }
+			var poolKeys []poolKey
+			pools := map[poolKey]*store.CrossQuotaEntry{}
+			poolModels := map[poolKey][]string{}
+			for _, cq := range row.CrossQuotas {
+				entry := cq
+				hasWeeklyPrefix := strings.HasPrefix(strings.ToLower(entry.Name), "weekly_")
+				// In 5-hour view, skip weekly entries; in weekly view, skip daily entries.
+				if isWeeklyView && !hasWeeklyPrefix {
+					continue
+				}
+				if !isWeeklyView && hasWeeklyPrefix {
+					continue
+				}
+				k := poolKey{entry.Limit, entry.Value}
+				if _, ok := pools[k]; !ok {
+					poolKeys = append(poolKeys, k)
+					pools[k] = &entry
+				}
+				poolModels[k] = append(poolModels[k], entry.Name)
+			}
+			crossQuotas := make([]store.CrossQuotaEntry, 0, len(poolKeys))
+			var codingQuota *store.CrossQuotaEntry
+			for _, k := range poolKeys {
+				entry := pools[k]
+				displayName := api.MiniMaxGroupDisplayName(poolModels[k])
+				entry.Name = displayName
+				poolNameSet[displayName] = true
+				crossQuotas = append(crossQuotas, *entry)
+				if displayName == "Coding" && codingQuota == nil {
+					codingQuota = entry
+				}
+			}
+			peakValue := row.PeakValue
+			if codingQuota != nil {
+				peakValue = codingQuota.Value
+			}
+			mergedRows = append(mergedRows, store.CycleOverviewRow{
+				CycleID:     row.CycleID,
+				QuotaType:   minimaxSharedQuotaKey,
+				CycleStart:  row.CycleStart,
+				CycleEnd:    row.CycleEnd,
+				PeakValue:   peakValue,
+				TotalDelta:  row.TotalDelta,
+				PeakTime:    row.PeakTime,
+				CrossQuotas: crossQuotas,
+			})
+		}
+		quotaNames := make([]string, 0, len(poolNameSet))
+		for name := range poolNameSet {
+			quotaNames = append(quotaNames, name)
+		}
+		sort.Strings(quotaNames)
+		if len(quotaNames) == 0 {
+			quotaNames = []string{minimaxSharedQuotaKey}
+		}
+		return mergedRows, quotaNames, minimaxSharedQuotaKey, nil
+	}
+
+	rows, err := h.store.QueryMiniMaxCycleOverview(groupBy, limit, minimaxAccID)
+	if err != nil {
+		return nil, nil, groupBy, err
+	}
+	quotaNames := []string{}
+	for _, row := range rows {
+		if len(row.CrossQuotas) == 0 {
+			continue
+		}
+		for _, cq := range row.CrossQuotas {
+			quotaNames = append(quotaNames, cq.Name)
+		}
+		break
+	}
+	if len(quotaNames) == 0 {
+		quotaNames, _ = h.store.QueryAllMiniMaxModelNames(minimaxAccID)
+	}
+	return rows, quotaNames, groupBy, nil
+}
+
+// historyMiniMax returns MiniMax usage history.
+func (h *Handler) historyMiniMax(w http.ResponseWriter, r *http.Request) {
+	if h.store == nil {
+		respondJSON(w, http.StatusOK, []interface{}{})
+		return
+	}
+	rangeStr := r.URL.Query().Get("range")
+	duration, err := parseTimeRange(rangeStr)
+	if err != nil {
+		respondError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	now := time.Now().UTC()
+	start := now.Add(-duration)
+	minimaxAccID := h.parseMiniMaxAccountID(r)
+	snapshots, err := h.store.QueryMiniMaxRange(start, now, minimaxAccID)
+	if err != nil {
+		h.logger.Error("failed to query MiniMax history", "error", err)
+		respondError(w, http.StatusInternalServerError, "failed to query history")
+		return
+	}
+
+	step := downsampleStep(len(snapshots), maxChartPoints)
+	last := len(snapshots) - 1
+	response := make([]map[string]interface{}, 0, min(len(snapshots), maxChartPoints))
+	for i, snap := range snapshots {
+		if step > 1 && i != 0 && i != last && i%step != 0 {
+			continue
+		}
+		entry := map[string]interface{}{
+			"capturedAt": snap.CapturedAt.Format(time.RFC3339),
+		}
+		for _, g := range snap.GroupByPool() {
+			displayName := api.MiniMaxGroupDisplayName(g.ModelNames)
+			entry[displayName] = g.Quota.UsedPercent
+			if g.Quota.HasWeeklyQuota && g.Quota.WeeklyTotal > 0 {
+				entry["Wkly "+displayName] = g.Quota.WeeklyUsedPercent
+			}
+		}
+		response = append(response, entry)
+	}
+	respondJSON(w, http.StatusOK, response)
+}
+
+// cyclesMiniMax returns cycle-like series data for one MiniMax model.
+func (h *Handler) cyclesMiniMax(w http.ResponseWriter, r *http.Request) {
+	if h.store == nil {
+		respondJSON(w, http.StatusOK, []interface{}{})
+		return
+	}
+
+	minimaxAccID := h.parseMiniMaxAccountID(r)
+	modelName := r.URL.Query().Get("type")
+	latest, err := h.store.QueryLatestMiniMax(minimaxAccID)
+	if err != nil {
+		h.logger.Error("failed to query latest MiniMax snapshot", "error", err)
+		respondError(w, http.StatusInternalServerError, "failed to query cycles")
+		return
+	}
+
+	sharedQuota := latest != nil && latest.IsSharedQuota()
+	if sharedQuota && (modelName == "" || minimaxIsSharedGroup(modelName)) {
+		rangeDur := parseInsightsRange(r.URL.Query().Get("range"))
+		since := time.Now().UTC().Add(-rangeDur)
+		snapshots, queryErr := h.store.QueryMiniMaxRange(since, time.Now().UTC(), minimaxAccID, minimaxInsightSampleLimit)
+		if queryErr != nil {
+			h.logger.Error("failed to query MiniMax shared usage series", "error", queryErr)
+			respondError(w, http.StatusInternalServerError, "failed to query cycles")
+			return
+		}
+		samples := minimaxMergedSamplesFromSnapshots(snapshots)
+		response := make([]map[string]interface{}, 0, len(samples))
+		for i, sample := range samples {
+			var delta float64
+			if i > 0 {
+				prev := samples[i-1]
+				if d := sample.UsedPercent - prev.UsedPercent; d > 0 {
+					delta = d
+				}
+			}
+			var cycleEnd interface{}
+			if i < len(samples)-1 {
+				cycleEnd = samples[i+1].CapturedAt.Format(time.RFC3339)
+			}
+			response = append(response, map[string]interface{}{
+				"id":              i + 1,
+				"modelName":       minimaxSharedQuotaDisplayName,
+				"cycleStart":      sample.CapturedAt.Format(time.RFC3339),
+				"cycleEnd":        cycleEnd,
+				"peakUtilization": sample.UsedPercent,
+				"totalDelta":      delta,
+			})
+		}
+		for i, j := 0, len(response)-1; i < j; i, j = i+1, j-1 {
+			response[i], response[j] = response[j], response[i]
+		}
+		respondJSON(w, http.StatusOK, response)
+		return
+	}
+
+	if modelName == "" {
+		models, err := h.store.QueryAllMiniMaxModelNames(minimaxAccID)
+		if err != nil || len(models) == 0 {
+			respondJSON(w, http.StatusOK, []interface{}{})
+			return
+		}
+		modelName = models[0]
+	}
+
+	rangeDur := parseInsightsRange(r.URL.Query().Get("range"))
+	since := time.Now().UTC().Add(-rangeDur)
+
+	points, err := h.store.QueryMiniMaxUsageSeries(modelName, since, minimaxAccID)
+	if err != nil {
+		h.logger.Error("failed to query MiniMax usage series", "error", err)
+		respondError(w, http.StatusInternalServerError, "failed to query cycles")
+		return
+	}
+
+	response := make([]map[string]interface{}, 0, len(points))
+	for i, pt := range points {
+		usagePercent := 0.0
+		if pt.Total > 0 {
+			usagePercent = float64(pt.Used) / float64(pt.Total) * 100
+		}
+		var delta float64
+		if i > 0 {
+			prev := points[i-1]
+			prevPercent := 0.0
+			if prev.Total > 0 {
+				prevPercent = float64(prev.Used) / float64(prev.Total) * 100
+			}
+			if d := usagePercent - prevPercent; d > 0 {
+				delta = d
+			}
+		}
+		var cycleEnd interface{}
+		if i < len(points)-1 {
+			cycleEnd = points[i+1].CapturedAt.Format(time.RFC3339)
+		}
+		response = append(response, map[string]interface{}{
+			"id":              i + 1,
+			"modelName":       modelName,
+			"cycleStart":      pt.CapturedAt.Format(time.RFC3339),
+			"cycleEnd":        cycleEnd,
+			"peakUtilization": usagePercent,
+			"totalDelta":      delta,
+		})
+	}
+	for i, j := 0, len(response)-1; i < j; i, j = i+1, j-1 {
+		response[i], response[j] = response[j], response[i]
+	}
+	respondJSON(w, http.StatusOK, response)
+}
+
+func minimaxCycleToMap(cycle *store.MiniMaxResetCycle) map[string]interface{} {
+	result := map[string]interface{}{
+		"id":         cycle.ID,
+		"modelName":  cycle.ModelName,
+		"cycleStart": cycle.CycleStart.Format(time.RFC3339),
+		"cycleEnd":   nil,
+		"peakUsed":   cycle.PeakUsed,
+		"totalDelta": cycle.TotalDelta,
+	}
+	if cycle.CycleEnd != nil {
+		result["cycleEnd"] = cycle.CycleEnd.Format(time.RFC3339)
+	}
+	if cycle.ResetAt != nil {
+		result["resetAt"] = cycle.ResetAt.Format(time.RFC3339)
+	}
+	return result
+}
+
+// summaryMiniMax returns MiniMax usage summary.
+func (h *Handler) summaryMiniMax(w http.ResponseWriter, r *http.Request) {
+	respondJSON(w, http.StatusOK, h.buildMiniMaxSummaryMap(h.parseMiniMaxAccountID(r)))
+}
+
+func (h *Handler) buildMiniMaxSummaryMap(accountID int64) map[string]interface{} {
+	response := map[string]interface{}{}
+	if h.minimaxTracker == nil || h.store == nil {
+		return response
+	}
+	minimaxAccID := accountID
+	if minimaxAccID == 0 {
+		minimaxAccID = h.defaultMiniMaxAccountID()
+	}
+	latest, err := h.store.QueryLatestMiniMax(minimaxAccID)
+	if err != nil || latest == nil {
+		return response
+	}
+	if latest.IsSharedQuota() {
+		summary, err := h.minimaxTracker.UsageSummary(latest.Models[0].ModelName, minimaxAccID)
+		if err != nil || summary == nil {
+			return response
+		}
+		item := buildMiniMaxSummaryResponse(summary)
+		item["modelName"] = minimaxSharedQuotaDisplayName
+		item["displayName"] = minimaxSharedQuotaDisplayName
+		response["coding_plan"] = item
+		return response
+	}
+	for _, model := range latest.Models {
+		if summary, err := h.minimaxTracker.UsageSummary(model.ModelName, minimaxAccID); err == nil && summary != nil {
+			response[model.ModelName] = buildMiniMaxSummaryResponse(summary)
+		}
+	}
+	return response
+}
+
+func buildMiniMaxSummaryResponse(summary *tracker.MiniMaxSummary) map[string]interface{} {
+	result := map[string]interface{}{
+		"modelName":       summary.ModelName,
+		"total":           summary.Total,
+		"currentUsed":     summary.CurrentUsed,
+		"currentRemain":   summary.CurrentRemain,
+		"usagePercent":    summary.UsagePercent,
+		"currentRate":     summary.CurrentRate,
+		"projectedUsage":  summary.ProjectedUsage,
+		"completedCycles": summary.CompletedCycles,
+		"avgPerCycle":     summary.AvgPerCycle,
+		"peakCycle":       summary.PeakCycle,
+		"totalTracked":    summary.TotalTracked,
+		"trackingSince":   nil,
+	}
+	if summary.ResetAt != nil {
+		result["resetAt"] = summary.ResetAt.Format(time.RFC3339)
+		result["timeUntilReset"] = formatDuration(summary.TimeUntilReset)
+	}
+	if !summary.TrackingSince.IsZero() {
+		result["trackingSince"] = summary.TrackingSince.Format(time.RFC3339)
+	}
+	return result
+}
+
+// insightsMiniMax returns MiniMax insights.
+func (h *Handler) insightsMiniMax(w http.ResponseWriter, r *http.Request, rangeDur time.Duration) {
+	hidden := h.getHiddenInsightKeys()
+	respondJSON(w, http.StatusOK, h.buildMiniMaxInsights(h.parseMiniMaxAccountID(r), hidden, rangeDur))
+}
+
+func (h *Handler) buildMiniMaxInsights(accountID int64, hidden map[string]bool, rangeDur time.Duration) insightsResponse {
+	resp := insightsResponse{Stats: []insightStat{}, Insights: []insightItem{}}
+	if h.store == nil {
+		return resp
+	}
+	minimaxAccID := accountID
+	if minimaxAccID == 0 {
+		minimaxAccID = h.defaultMiniMaxAccountID()
+	}
+	latest, err := h.store.QueryLatestMiniMax(minimaxAccID)
+	if err != nil || latest == nil || len(latest.Models) == 0 {
+		resp.Insights = append(resp.Insights, insightItem{
+			Type: "info", Severity: "info", Title: "Getting Started",
+			Desc: "Keep onWatch running to collect MiniMax usage data. Insights will appear after a few snapshots.",
+		})
+		return resp
+	}
+
+	if latest.IsSharedQuota() {
+		merged := latest.MergedQuota()
+		if merged == nil {
+			return resp
+		}
+		rangeWindow := rangeDur
+		if rangeWindow < 7*24*time.Hour {
+			rangeWindow = 7 * 24 * time.Hour
+		}
+		now := time.Now().UTC()
+		snapshots, err := h.store.QueryMiniMaxRange(now.Add(-rangeWindow), now, minimaxAccID, minimaxInsightSampleLimit)
+		if err != nil {
+			h.logger.Error("failed to query MiniMax snapshots for insights", "error", err)
+		}
+		samples := minimaxMergedSamplesFromSnapshots(snapshots)
+		currentSample := minimaxMergedSample{
+			CapturedAt:        latest.CapturedAt,
+			Used:              merged.Used,
+			Remaining:         merged.Remain,
+			Total:             merged.Total,
+			UsedPercent:       merged.UsedPercent,
+			ResetAt:           merged.ResetAt,
+			TimeUntilReset:    merged.TimeUntilReset,
+			WindowStart:       merged.WindowStart,
+			WindowEnd:         merged.WindowEnd,
+			HasWeeklyQuota:    merged.HasWeeklyQuota,
+			WeeklyUsed:        merged.WeeklyUsed,
+			WeeklyRemain:      merged.WeeklyRemain,
+			WeeklyTotal:       merged.WeeklyTotal,
+			WeeklyUsedPercent: merged.WeeklyUsedPercent,
+			WeeklyResetAt:     merged.WeeklyResetAt,
+		}
+		if len(samples) == 0 {
+			samples = append(samples, currentSample)
+		}
+
+		windowSamples := minimaxCurrentWindowSamples(samples, currentSample)
+		currentRate := 0.0
+		if len(windowSamples) >= 2 {
+			first := windowSamples[0]
+			last := windowSamples[len(windowSamples)-1]
+			if deltaUsed := last.Used - first.Used; deltaUsed > 0 {
+				if elapsed := last.CapturedAt.Sub(first.CapturedAt); elapsed > 0 {
+					currentRate = float64(deltaUsed) / elapsed.Hours()
+				}
+			}
+		}
+
+		projectedUsage := merged.Used
+		projectedPercent := merged.UsedPercent
+		if merged.Total > 0 && merged.TimeUntilReset > 0 && currentRate > 0 {
+			projected := float64(merged.Used) + (currentRate * merged.TimeUntilReset.Hours())
+			if projected > float64(merged.Total) {
+				projected = float64(merged.Total)
+			}
+			if projected < 0 {
+				projected = 0
+			}
+			projectedUsage = int(projected + 0.5)
+			projectedPercent = (float64(projectedUsage) / float64(merged.Total)) * 100
+		}
+
+		timeToExhaustion := time.Duration(0)
+		if merged.Remain > 0 && currentRate > 0 {
+			hoursToExhaustion := float64(merged.Remain) / currentRate
+			if hoursToExhaustion > 0 {
+				timeToExhaustion = time.Duration(hoursToExhaustion * float64(time.Hour))
+			}
+		}
+
+		dailyUsage := minimaxDailyUsage(samples)
+		avgDailyUsage := 0.0
+		peakUsage := 0
+		var peakDate time.Time
+		if len(dailyUsage) > 0 {
+			totalUsage := 0.0
+			for _, day := range dailyUsage {
+				totalUsage += day.value
+				if int(day.value+0.5) > peakUsage {
+					peakUsage = int(day.value + 0.5)
+					peakDate = day.day
+				}
+			}
+			avgDailyUsage = totalUsage / float64(len(dailyUsage))
+		}
+		trendDirection := minimaxTrendDirection(dailyUsage)
+
+		lastCyclePercent := 0.0
+		if sourceModel := minimaxRepresentativeModel(latest); sourceModel != "" {
+			if history, err := h.store.QueryMiniMaxCycleHistory(sourceModel, minimaxAccID, 1); err == nil && len(history) > 0 && merged.Total > 0 {
+				lastCyclePercent = (float64(history[0].TotalDelta) / float64(merged.Total)) * 100
+			}
+		}
+
+		resetText := "--"
+		if merged.TimeUntilReset > 0 {
+			resetText = formatDuration(merged.TimeUntilReset)
+		}
+		burnRateText := fmt.Sprintf("%.1f/hr", currentRate)
+		recommendation := minimaxUsageRecommendation(projectedUsage, merged.Total, timeToExhaustion, merged.TimeUntilReset)
+
+		resp.Stats = append(resp.Stats,
+			insightStat{Value: fmt.Sprintf("%d / %d", merged.Used, merged.Total), Label: "Current Usage", Sublabel: fmt.Sprintf("%d remaining", merged.Remain)},
+			insightStat{Value: burnRateText, Label: "Burn Rate", Sublabel: "Projected " + minimaxProjectionSummary(projectedUsage, merged.Total)},
+			insightStat{Value: resetText, Label: "Resets In"},
+			insightStat{Value: fmt.Sprintf("%.1f%%", merged.UsedPercent), Label: "Current Status", Sublabel: minimaxStatusLabel(merged.UsedPercent)},
+		)
+
+		if !hidden["shared_status"] {
+			resp.Insights = append(resp.Insights, insightItem{
+				Key:      "shared_status",
+				Type:     "factual",
+				Severity: minimaxInsightSeverity(merged.UsedPercent),
+				Title:    fmt.Sprintf("%s: %s", minimaxSharedQuotaDisplayName, minimaxStatusLabel(merged.UsedPercent)),
+				Metric:   fmt.Sprintf("%.1f%% used", merged.UsedPercent),
+				Sublabel: "Shared quota pool",
+				Desc: fmt.Sprintf(
+					"%d of %d requests used, %d remaining. Pool resets in %s.",
+					merged.Used,
+					merged.Total,
+					merged.Remain,
+					resetText,
+				),
+			})
+		}
+		if !hidden["burn_rate"] {
+			exhaustionText := "No exhaustion projected at the current rate."
+			if timeToExhaustion > 0 {
+				exhaustionText = "Estimated exhaustion in " + formatDuration(timeToExhaustion) + "."
+			}
+			resp.Insights = append(resp.Insights, insightItem{
+				Key:      "burn_rate",
+				Type:     "trend",
+				Severity: minimaxInsightSeverity(projectedPercent),
+				Title:    "Burn Rate Analysis",
+				Metric:   burnRateText,
+				Sublabel: "Projected " + minimaxProjectionSummary(projectedUsage, merged.Total),
+				Desc:     fmt.Sprintf("%s %s", minimaxBurnStatus(projectedUsage, merged.Total, timeToExhaustion, merged.TimeUntilReset), exhaustionText),
+			})
+		}
+		if !hidden["trend"] {
+			trendDesc := "Need more historical samples to measure the usage trend."
+			if len(dailyUsage) > 0 {
+				peakText := "no peak day recorded yet"
+				if !peakDate.IsZero() {
+					peakText = fmt.Sprintf("peak day %s with %d requests", peakDate.Format("Jan 2"), peakUsage)
+				}
+				trendDesc = fmt.Sprintf("Average daily usage is %.0f requests, with %s.", avgDailyUsage, peakText)
+			}
+			resp.Insights = append(resp.Insights, insightItem{
+				Key:      "trend",
+				Type:     "trend",
+				Severity: "info",
+				Title:    "Usage Trend (7d)",
+				Metric:   trendDirection,
+				Sublabel: fmt.Sprintf("%.0f/day average", avgDailyUsage),
+				Desc:     trendDesc,
+			})
+		}
+		if !hidden["efficiency"] {
+			comparisonText := "No completed prior cycle recorded yet."
+			if lastCyclePercent > 0 {
+				comparisonText = fmt.Sprintf("Last completed cycle used %.1f%% of the pool.", lastCyclePercent)
+			}
+			resp.Insights = append(resp.Insights, insightItem{
+				Key:      "efficiency",
+				Type:     "recommendation",
+				Severity: "info",
+				Title:    "Quota Efficiency",
+				Metric:   fmt.Sprintf("%.1f%% this cycle", merged.UsedPercent),
+				Sublabel: recommendation,
+				Desc:     comparisonText,
+			})
+		}
+		// Weekly quota insight - only for accounts with weekly limits.
+		if !hidden["ratio_5h_weekly"] && merged.HasWeeklyQuota && merged.WeeklyTotal > 0 {
+			ratio := 0.0
+			if merged.WeeklyUsedPercent > 0 {
+				ratio = merged.UsedPercent / merged.WeeklyUsedPercent
+			}
+			weeklyResetText := "--"
+			if merged.WeeklyTimeUntilReset > 0 {
+				weeklyResetText = formatDuration(merged.WeeklyTimeUntilReset)
+			}
+			resp.Insights = append(resp.Insights, insightItem{
+				Key:      "ratio_5h_weekly",
+				Type:     "factual",
+				Severity: minimaxInsightSeverity(merged.WeeklyUsedPercent),
+				Title:    "5-Hour vs Weekly",
+				Metric:   fmt.Sprintf("%.1f%% weekly", merged.WeeklyUsedPercent),
+				Sublabel: fmt.Sprintf("1%% weekly ~ %.0f%% of 5-hr", ratio),
+				Desc: fmt.Sprintf(
+					"Weekly quota: %d of %d used (%d remaining). Resets in %s. "+
+						"Current interval at %.1f%%, weekly at %.1f%%.",
+					merged.WeeklyUsed, merged.WeeklyTotal, merged.WeeklyRemain,
+					weeklyResetText, merged.UsedPercent, merged.WeeklyUsedPercent,
+				),
+			})
+		}
+		return resp
+	}
+
+	var totalCap, totalUsed int
+	var maxPct float64
+	for _, m := range latest.Models {
+		totalCap += m.Total
+		totalUsed += m.Used
+		if m.UsedPercent > maxPct {
+			maxPct = m.UsedPercent
+		}
+	}
+	avgPct := 0.0
+	if len(latest.Models) > 0 {
+		for _, m := range latest.Models {
+			avgPct += m.UsedPercent
+		}
+		avgPct /= float64(len(latest.Models))
+	}
+
+	resp.Stats = append(resp.Stats, insightStat{Value: fmt.Sprintf("%d", len(latest.Models)), Label: "Active Models"})
+	resp.Stats = append(resp.Stats, insightStat{Value: fmt.Sprintf("%.1f%%", avgPct), Label: "Average Utilization"})
+	resp.Stats = append(resp.Stats, insightStat{Value: fmt.Sprintf("%.1f%%", maxPct), Label: "Peak Utilization"})
+	if totalCap > 0 {
+		resp.Stats = append(resp.Stats, insightStat{Value: fmt.Sprintf("%d/%d", totalUsed, totalCap), Label: "Total Usage"})
+	} else {
+		resp.Stats = append(resp.Stats, insightStat{Value: fmt.Sprintf("%d", totalUsed), Label: "Total Usage"})
+	}
+
+	if !hidden["trend"] {
+		resp.Insights = append(resp.Insights, insightItem{
+			Key: "trend", Type: "trend", Severity: "info",
+			Title:  "Range",
+			Metric: fmt.Sprintf("%dd", int(rangeDur.Hours()/24)),
+			Desc:   "Trend analytics are based on recent MiniMax snapshot history.",
+		})
+	}
+	if !hidden["coverage"] {
+		resp.Insights = append(resp.Insights, insightItem{
+			Key: "coverage", Type: "info", Severity: "info",
+			Title:  "Data Coverage",
+			Metric: latest.CapturedAt.Format("2006-01-02 15:04"),
+			Desc:   "Current insight sample is generated from the latest MiniMax capture.",
+		})
+	}
+
+	for _, m := range latest.Models {
+		if m.UsedPercent < 80 {
+			continue
+		}
+		resp.Insights = append(resp.Insights, insightItem{
+			Key:      "model_" + m.ModelName,
+			Type:     "recommendation",
+			Severity: map[bool]string{true: "critical", false: "warning"}[m.UsedPercent >= 95],
+			Title:    "High Utilization: " + api.MiniMaxDisplayName(m.ModelName),
+			Metric:   fmt.Sprintf("%.1f%%", m.UsedPercent),
+			Desc:     fmt.Sprintf("%s has used %d of %d requests in the current window.", api.MiniMaxDisplayName(m.ModelName), m.Used, m.Total),
+		})
+	}
+
+	return resp
+}
+
+// cycleOverviewMiniMax returns MiniMax cycle overview.
+func (h *Handler) cycleOverviewMiniMax(w http.ResponseWriter, r *http.Request) {
+	if h.store == nil {
+		respondJSON(w, http.StatusOK, map[string]interface{}{"cycles": []interface{}{}})
+		return
+	}
+	groupBy := r.URL.Query().Get("groupBy")
+	limit := parseCycleOverviewLimit(r)
+	rows, quotaNames, resolvedGroupBy, err := h.buildMiniMaxCycleOverviewRows(groupBy, limit, h.parseMiniMaxAccountID(r))
+	if err != nil {
+		h.logger.Error("failed to query MiniMax cycle overview", "error", err)
+		respondError(w, http.StatusInternalServerError, "failed to query cycle overview")
+		return
+	}
+	respondJSON(w, http.StatusOK, map[string]interface{}{
+		"groupBy":    resolvedGroupBy,
+		"provider":   "minimax",
+		"quotaNames": quotaNames,
+		"cycles":     cycleOverviewRowsToJSON(rows),
+	})
+}
+
+func (h *Handler) summaryCodex(w http.ResponseWriter, r *http.Request) {
+	accountID := parseCodexAccountID(r)
+	respondJSON(w, http.StatusOK, h.buildCodexSummaryMap(accountID))
+}
+
+func (h *Handler) buildCodexSummaryMap(accountID int64) map[string]interface{} {
+	response := map[string]interface{}{}
+	if h.codexTracker == nil || h.store == nil {
+		return response
+	}
+	latest, err := h.store.QueryLatestCodex(accountID)
+	if err != nil || latest == nil {
+		return response
+	}
+	for _, q := range latest.Quotas {
+		if summary, err := h.codexTracker.UsageSummary(accountID, q.Name); err == nil && summary != nil {
+			response[q.Name] = buildCodexSummaryResponse(summary)
+		}
+	}
+	return response
+}
+
+func buildCodexSummaryResponse(summary *tracker.CodexSummary) map[string]interface{} {
+	result := map[string]interface{}{
+		"quotaName":       summary.QuotaName,
+		"currentUtil":     summary.CurrentUtil,
+		"currentRate":     summary.CurrentRate,
+		"projectedUtil":   summary.ProjectedUtil,
+		"completedCycles": summary.CompletedCycles,
+		"avgPerCycle":     summary.AvgPerCycle,
+		"peakCycle":       summary.PeakCycle,
+		"totalTracked":    summary.TotalTracked,
+		"trackingSince":   nil,
+	}
+	if summary.ResetsAt != nil {
+		result["resetsAt"] = summary.ResetsAt.Format(time.RFC3339)
+		result["timeUntilReset"] = formatDuration(summary.TimeUntilReset)
+	}
+	if !summary.TrackingSince.IsZero() {
+		result["trackingSince"] = summary.TrackingSince.Format(time.RFC3339)
+	}
+	return result
+}
+
+func (h *Handler) insightsCodex(w http.ResponseWriter, r *http.Request, rangeDur time.Duration) {
+	accountID := parseCodexAccountID(r)
+	hidden := h.getHiddenInsightKeys()
+	respondJSON(w, http.StatusOK, h.buildCodexInsights(accountID, hidden, rangeDur))
+}
+
+func (h *Handler) buildCodexInsights(accountID int64, hidden map[string]bool, rangeDur time.Duration) insightsResponse {
+	resp := insightsResponse{Stats: []insightStat{}, Insights: []insightItem{}}
+	_ = rangeDur
+	if h.store == nil {
+		return resp
+	}
+	latest, err := h.store.QueryLatestCodex(accountID)
+	if err != nil || latest == nil {
+		resp.Insights = append(resp.Insights, insightItem{Type: "info", Severity: "info", Title: "Getting Started", Desc: "Keep onWatch running to collect Codex usage data. Insights will appear after a few snapshots."})
+		return resp
+	}
+	normalizedLatest := *latest
+	normalizedLatest.Quotas = codexNormalizeQuotasForPlan(latest.PlanType, latest.Quotas)
+
+	quotaNames, _ := h.store.QueryAllCodexQuotaNames()
+	summaries := map[string]*tracker.CodexSummary{}
+	if h.codexTracker != nil {
+		for _, name := range quotaNames {
+			if s, err := h.codexTracker.UsageSummary(accountID, name); err == nil && s != nil {
+				normalizedName := codexNormalizedQuotaName(latest.PlanType, name)
+				if existing, exists := summaries[normalizedName]; !exists || existing == nil {
+					summaries[normalizedName] = s
+				}
+			}
+		}
+	}
+
+	// Stats cards: keep non-duplicate metadata only.
+	if latest.PlanType != "" {
+		resp.Stats = append(resp.Stats, insightStat{
+			Value: codexPlanLabel(latest.PlanType),
+			Label: "Plan",
+		})
+	}
+
+	// Replace "Last Sample" with historical behavior metrics.
+	windowStart := time.Now().UTC().Add(-30 * 24 * time.Hour)
+	primaryQuotaName := "five_hour"
+	primaryQuotaLabel := api.CodexDisplayName(primaryQuotaName)
+	if codexIsFreePlan(latest.PlanType) {
+		primaryQuotaName = "seven_day"
+		primaryQuotaLabel = api.CodexDisplayName(primaryQuotaName)
+	}
+
+	primaryCycles, err := h.store.QueryCodexCyclesSince(accountID, primaryQuotaName, windowStart)
+	if codexIsFreePlan(latest.PlanType) && (err != nil || len(primaryCycles) == 0) {
+		if legacyCycles, legacyErr := h.store.QueryCodexCyclesSince(accountID, "five_hour", windowStart); legacyErr == nil {
+			primaryCycles = legacyCycles
+			err = nil
+		}
+	}
+	if err == nil && len(primaryCycles) > 0 {
+		var totalDelta float64
+		var peak float64
+		for _, c := range primaryCycles {
+			totalDelta += c.TotalDelta
+			if c.PeakUtilization > peak {
+				peak = c.PeakUtilization
+			}
+		}
+		resp.Stats = append(resp.Stats, insightStat{
+			Value:    fmt.Sprintf("%.1f%%", totalDelta/float64(len(primaryCycles))),
+			Label:    fmt.Sprintf("Average %s Usage/Cycle", primaryQuotaLabel),
+			Sublabel: fmt.Sprintf("%d cycles (30d)", len(primaryCycles)),
+		})
+		resp.Stats = append(resp.Stats, insightStat{
+			Value: fmt.Sprintf("%.1f%%", peak),
+			Label: fmt.Sprintf("%s Peak (30d)", primaryQuotaLabel),
+		})
+	} else if active, err := h.store.QueryActiveCodexCycle(accountID, primaryQuotaName); err == nil && active != nil {
+		resp.Stats = append(resp.Stats, insightStat{
+			Value:    fmt.Sprintf("%.1f%%", active.TotalDelta),
+			Label:    fmt.Sprintf("%s Delta (Current)", primaryQuotaLabel),
+			Sublabel: fmt.Sprintf("peak %.1f%%", active.PeakUtilization),
+		})
+		resp.Stats = append(resp.Stats, insightStat{
+			Value: fmt.Sprintf("%.1f%%", active.PeakUtilization),
+			Label: fmt.Sprintf("%s Peak (Current)", primaryQuotaLabel),
+		})
+	} else if codexIsFreePlan(latest.PlanType) {
+		if legacyActive, legacyErr := h.store.QueryActiveCodexCycle(accountID, "five_hour"); legacyErr == nil && legacyActive != nil {
+			resp.Stats = append(resp.Stats, insightStat{
+				Value:    fmt.Sprintf("%.1f%%", legacyActive.TotalDelta),
+				Label:    fmt.Sprintf("%s Delta (Current)", primaryQuotaLabel),
+				Sublabel: fmt.Sprintf("peak %.1f%%", legacyActive.PeakUtilization),
+			})
+			resp.Stats = append(resp.Stats, insightStat{
+				Value: fmt.Sprintf("%.1f%%", legacyActive.PeakUtilization),
+				Label: fmt.Sprintf("%s Peak (Current)", primaryQuotaLabel),
+			})
+		}
+	}
+
+	quotaByName := map[string]*api.CodexQuota{}
+	for i := range normalizedLatest.Quotas {
+		quotaByName[normalizedLatest.Quotas[i].Name] = &normalizedLatest.Quotas[i]
+	}
+
+	// Keep explicit burn-rate insights using proper display names.
+	if !hidden["forecast_five_hour"] && !codexIsFreePlan(latest.PlanType) {
+		if q := quotaByName["five_hour"]; q != nil {
+			displayName := api.CodexDisplayName("five_hour")
+			resp.Insights = append(resp.Insights, buildCodexQuotaBurnRateInsight("forecast_five_hour", displayName+" Burn Rate", q, summaries["five_hour"]))
+		}
+	}
+	if !hidden["forecast_seven_day"] {
+		if q := quotaByName["seven_day"]; q != nil {
+			displayName := api.CodexDisplayName("seven_day")
+			resp.Insights = append(resp.Insights, buildCodexQuotaBurnRateInsight("forecast_seven_day", displayName+" Burn Rate", q, summaries["seven_day"]))
+		}
+	}
+
+	if !hidden["forecast_code_review"] {
+		if reviewInsight, ok := h.buildCodexReviewPaceInsight(&normalizedLatest, summaries); ok {
+			resp.Insights = append(resp.Insights, reviewInsight)
+		}
+	}
+
+	// Weekly pace insight (inspired by CodexBar's "on pace/deficit/reserve" model).
+	if !hidden["weekly_pace"] {
+		if paceInsight, ok := h.buildCodexWeeklyPaceInsight(&normalizedLatest, summaries); ok {
+			resp.Insights = append(resp.Insights, paceInsight)
+		}
+	}
+
+	if len(resp.Insights) == 0 {
+		resp.Insights = append(resp.Insights, insightItem{
+			Type:     "info",
+			Severity: "info",
+			Title:    "Collecting Insights",
+			Desc:     "Keep onWatch running to collect enough Codex history for burn-rate and pace analytics.",
+		})
+	}
+
+	return resp
+}
+
+func codexPlanLabel(plan string) string {
+	if plan == "" {
+		return ""
+	}
+	plan = strings.ReplaceAll(plan, "_", " ")
+	parts := strings.Fields(plan)
+	for i := range parts {
+		if len(parts[i]) == 0 {
+			continue
+		}
+		parts[i] = strings.ToUpper(parts[i][:1]) + strings.ToLower(parts[i][1:])
+	}
+	return strings.Join(parts, " ")
+}
+
+func codexQuotaInsightLabel(name string) string {
+	switch name {
+	case "five_hour":
+		return "Short Window"
+	case "seven_day":
+		return "Weekly Window"
+	default:
+		return api.CodexDisplayName(name)
+	}
+}
+
+func buildCodexQuotaBurnRateInsight(key string, title string, quota *api.CodexQuota, summary *tracker.CodexSummary) insightItem {
+	projected := quota.Utilization
+	if summary != nil && summary.ProjectedUtil > projected {
+		projected = summary.ProjectedUtil
+	}
+	sublabel := fmt.Sprintf("~%.0f%% by reset", projected)
+
+	if summary != nil && summary.CurrentRate > 0.01 {
+		desc := fmt.Sprintf("Currently at %.0f%%. At this rate, projected %.0f%% by reset.", quota.Utilization, projected)
+		if summary.ResetsAt != nil && summary.TimeUntilReset > 0 {
+			desc = fmt.Sprintf("Currently at %.0f%%. At this rate, projected %.0f%% by reset in %s.", quota.Utilization, projected, formatDuration(summary.TimeUntilReset))
+		}
+		return insightItem{
+			Key:      key,
+			Type:     "forecast",
+			Severity: codexInsightSeverity(quota.Utilization),
+			Title:    title,
+			Metric:   fmt.Sprintf("%.1f%%/hr", summary.CurrentRate),
+			Sublabel: sublabel,
+			Desc:     desc,
+		}
+	}
+
+	return insightItem{
+		Key:      key,
+		Type:     "info",
+		Severity: "info",
+		Title:    title,
+		Metric:   "Analyzing...",
+		Sublabel: sublabel,
+		Desc:     fmt.Sprintf("Currently at %.0f%%. Collecting more snapshots to estimate burn rate and refine reset projection.", quota.Utilization),
+	}
+}
+
+func (h *Handler) buildCodexReviewPaceInsight(latest *api.CodexSnapshot, summaries map[string]*tracker.CodexSummary) (insightItem, bool) {
+	var reviewQuota *api.CodexQuota
+	for i := range latest.Quotas {
+		if latest.Quotas[i].Name == "code_review" {
+			reviewQuota = &latest.Quotas[i]
+			break
+		}
+	}
+	if reviewQuota == nil {
+		return insightItem{}, false
+	}
+
+	remaining := 100 - reviewQuota.Utilization
+	if remaining < 0 {
+		remaining = 0
+	}
+
+	item := insightItem{
+		Key:      "forecast_code_review",
+		Type:     "forecast",
+		Title:    "Review Request Pace",
+		Sublabel: fmt.Sprintf("%.0f%% remaining", remaining),
+	}
+
+	summary := summaries["code_review"]
+	if summary == nil || summary.CurrentRate <= 0.01 {
+		item.Severity = "info"
+		item.Metric = "Analyzing..."
+		item.Desc = fmt.Sprintf("%.0f%% remaining. Collecting more snapshots to estimate review request pace.", remaining)
+		return item, true
+	}
+
+	projected := reviewQuota.Utilization
+	if summary.ProjectedUtil > projected {
+		projected = summary.ProjectedUtil
+	}
+	item.Severity = codexRemainingStatus(remaining)
+	item.Metric = fmt.Sprintf("%.1f%%/hr", summary.CurrentRate)
+	item.Sublabel = fmt.Sprintf("~%.0f%% by reset", projected)
+	item.Desc = fmt.Sprintf("%.0f%% remaining. At this pace, projected %.0f%% used by reset.", remaining, projected)
+	if summary.ResetsAt != nil && summary.TimeUntilReset > 0 {
+		item.Desc = fmt.Sprintf(
+			"%.0f%% remaining. At this pace, projected %.0f%% used by reset in %s.",
+			remaining,
+			projected,
+			formatDuration(summary.TimeUntilReset),
+		)
+	}
+
+	return item, true
+}
+
+// isWorkDay returns whether the given weekday is a work day for the mode.
+func isWorkDay(wd time.Weekday, mode string) bool {
+	switch mode {
+	case "5-day":
+		return wd != time.Saturday && wd != time.Sunday
+	case "6-day":
+		return wd != time.Sunday
+	default:
+		return true
+	}
+}
+
+// countWorkTime returns fractional work days in [from, to).
+// Full work days contribute 1.0; partial days contribute the elapsed fraction.
+// Non-work days contribute 0. Window is always <=7 days.
+func countWorkTime(from, to time.Time, mode string) float64 {
+	dayDur := 24 * time.Hour
+	total := 0.0
+	for d := from; d.Before(to); d = d.Add(dayDur) {
+		if !isWorkDay(d.Weekday(), mode) {
+			continue
+		}
+		dayEnd := d.Add(dayDur)
+		if dayEnd.After(to) {
+			total += to.Sub(d).Seconds() / dayDur.Seconds()
+		} else {
+			total += 1.0
+		}
+	}
+	return total
+}
+
+func (h *Handler) buildCodexWeeklyPaceInsight(latest *api.CodexSnapshot, summaries map[string]*tracker.CodexSummary) (insightItem, bool) {
+	var weeklyQuota *api.CodexQuota
+	for i := range latest.Quotas {
+		if latest.Quotas[i].Name == "seven_day" {
+			weeklyQuota = &latest.Quotas[i]
+			break
+		}
+	}
+	if weeklyQuota == nil || weeklyQuota.ResetsAt == nil {
+		return insightItem{}, false
+	}
+
+	now := time.Now()
+	window := 7 * 24 * time.Hour
+	timeUntilReset := weeklyQuota.ResetsAt.Sub(now)
+	if timeUntilReset <= 0 || timeUntilReset > window {
+		return insightItem{}, false
+	}
+
+	// Compute expected pace based on configured mode.
+	paceMode := h.getCodexPaceMode()
+	var expectedUsed float64
+	todayIsOff := false
+	if paceMode == "5-day" || paceMode == "6-day" {
+		windowStart := weeklyQuota.ResetsAt.Add(-window)
+		totalWork := countWorkTime(windowStart, *weeklyQuota.ResetsAt, paceMode)
+		elapsedWork := countWorkTime(windowStart, now, paceMode)
+		if totalWork > 0 {
+			expectedUsed = (elapsedWork / totalWork) * 100
+		} else {
+			// Fallback to calendar if no work days in window.
+			elapsed := window - timeUntilReset
+			expectedUsed = (elapsed.Seconds() / window.Seconds()) * 100
+		}
+		todayIsOff = !isWorkDay(now.Weekday(), paceMode)
+	} else {
+		elapsed := window - timeUntilReset
+		expectedUsed = (elapsed.Seconds() / window.Seconds()) * 100
+	}
+
+	delta := weeklyQuota.Utilization - expectedUsed
+	if delta < 0 {
+		delta = -delta
+	}
+
+	item := insightItem{
+		Key:      "weekly_pace",
+		Type:     "trend",
+		Severity: "info",
+		Title:    "Weekly Pace",
+	}
+
+	// Mode suffix for description clarity.
+	modeSuffix := ""
+	if paceMode == "5-day" || paceMode == "6-day" {
+		modeSuffix = fmt.Sprintf(" [%s]", paceMode)
+	}
+
+	rawDelta := weeklyQuota.Utilization - expectedUsed
+	switch {
+	case rawDelta >= -2 && rawDelta <= 2:
+		item.Metric = "On pace"
+		item.Severity = "positive"
+		item.Desc = fmt.Sprintf("Weekly usage is tracking expected pace (%.0f%% used vs %.0f%% expected by now).%s", weeklyQuota.Utilization, expectedUsed, modeSuffix)
+	case rawDelta > 2:
+		item.Metric = fmt.Sprintf("%.0f%% over pace", rawDelta)
+		item.Severity = "warning"
+		item.Desc = fmt.Sprintf("Weekly usage is ahead of pace (%.0f%% used vs %.0f%% expected by now).%s", weeklyQuota.Utilization, expectedUsed, modeSuffix)
+	default:
+		item.Metric = fmt.Sprintf("%.0f%% in reserve", delta)
+		item.Severity = "positive"
+		item.Desc = fmt.Sprintf("Weekly usage is below pace (%.0f%% used vs %.0f%% expected by now).%s", weeklyQuota.Utilization, expectedUsed, modeSuffix)
+	}
+
+	// Sublabel: weekend/off-day indicator takes priority.
+	if todayIsOff {
+		item.Sublabel = "off day - pace paused"
+	} else if summary := summaries["seven_day"]; summary != nil && summary.CurrentRate > 0 && summary.ResetsAt != nil {
+		hoursLeft := summary.TimeUntilReset.Hours()
+		if hoursLeft > 0 {
+			projected := weeklyQuota.Utilization + (summary.CurrentRate * hoursLeft)
+			if projected <= 100 {
+				item.Sublabel = "lasts until reset"
+			} else {
+				item.Sublabel = "risk before reset"
+			}
+		}
+	}
+
+	return item, true
+}
+
+func (h *Handler) cycleOverviewCodex(w http.ResponseWriter, r *http.Request) {
+	if h.store == nil {
+		respondJSON(w, http.StatusOK, map[string]interface{}{"cycles": []interface{}{}})
+		return
+	}
+	accountID := parseCodexAccountID(r)
+	groupBy := r.URL.Query().Get("groupBy")
+	if groupBy == "" {
+		groupBy = "five_hour"
+	}
+	rows, err := h.store.QueryCodexCycleOverview(accountID, groupBy, parseCycleOverviewLimit(r))
+	if err != nil {
+		h.logger.Error("failed to query Codex cycle overview", "error", err)
+		respondError(w, http.StatusInternalServerError, "failed to query cycle overview")
+		return
+	}
+	quotaNames := []string{}
+	for _, row := range rows {
+		if len(row.CrossQuotas) > 0 {
+			for _, cq := range row.CrossQuotas {
+				quotaNames = append(quotaNames, cq.Name)
+			}
+			break
+		}
+	}
+	if len(quotaNames) == 0 {
+		quotaNames = []string{"five_hour", "seven_day", "code_review"}
+	}
+	respondJSON(w, http.StatusOK, map[string]interface{}{
+		"groupBy":    groupBy,
+		"provider":   "codex",
+		"quotaNames": quotaNames,
+		"cycles":     cycleOverviewRowsToJSON(rows),
+	})
+}
+
+func normalizeAntigravityGroupBy(groupBy string) string {
+	switch groupBy {
+	case api.AntigravityQuotaGroupClaudeGPT, api.AntigravityQuotaGroupGeminiPro, api.AntigravityQuotaGroupGeminiFlash:
+		return groupBy
+	}
+
+	if groupBy != "" {
+		mapped := api.AntigravityQuotaGroupForModel(groupBy, groupBy)
+		switch mapped {
+		case api.AntigravityQuotaGroupClaudeGPT, api.AntigravityQuotaGroupGeminiPro, api.AntigravityQuotaGroupGeminiFlash:
+			return mapped
+		}
+	}
+
+	return api.AntigravityQuotaGroupClaudeGPT
+}
+
+// cycleOverviewAntigravity returns Antigravity cycle overview with cross-quota data.
+func (h *Handler) cycleOverviewAntigravity(w http.ResponseWriter, r *http.Request) {
+	if h.store == nil {
+		respondJSON(w, http.StatusOK, map[string]interface{}{"cycles": []interface{}{}})
+		return
+	}
+
+	groupBy := normalizeAntigravityGroupBy(r.URL.Query().Get("groupBy"))
+	limit := parseCycleOverviewLimit(r)
+
+	rows, err := h.store.QueryAntigravityCycleOverview(groupBy, limit)
+	if err != nil {
+		h.logger.Error("failed to query Antigravity cycle overview", "error", err)
+		respondError(w, http.StatusInternalServerError, "failed to query cycle overview")
+		return
+	}
+
+	quotaNames := api.AntigravityQuotaGroupOrder()
+
+	respondJSON(w, http.StatusOK, map[string]interface{}{
+		"groupBy":    groupBy,
+		"provider":   "antigravity",
+		"quotaNames": quotaNames,
+		"cycles":     cycleOverviewRowsToJSON(rows),
+	})
+}
+
+type loggingHistoryCrossQuota struct {
+	Name     string
+	Value    float64
+	Limit    float64
+	Percent  float64
+	HasValue bool
+	HasLimit bool
+}
+
+// LoggingHistory returns polling snapshots (logging history) for providers.
+// This is separate from cycle-overview which shows reset cycles.
+func (h *Handler) LoggingHistory(w http.ResponseWriter, r *http.Request) {
+	provider := r.URL.Query().Get("provider")
+	switch provider {
+	case "synthetic":
+		h.loggingHistorySynthetic(w, r)
+	case "zai":
+		h.loggingHistoryZai(w, r)
+	case "anthropic":
+		h.loggingHistoryAnthropic(w, r)
+	case "copilot":
+		h.loggingHistoryCopilot(w, r)
+	case "codex":
+		h.loggingHistoryCodex(w, r)
+	case "antigravity":
+		h.loggingHistoryAntigravity(w, r)
+	case "minimax":
+		h.loggingHistoryMiniMax(w, r)
+	case "openrouter":
+		h.loggingHistoryOpenRouter(w, r)
+	case "gemini":
+		h.loggingHistoryGemini(w, r)
+	default:
+		respondError(w, http.StatusBadRequest, fmt.Sprintf("unknown provider: %s", provider))
+	}
+}
+
+func (h *Handler) loggingHistoryRangeAndLimit(r *http.Request) (time.Time, time.Time, int) {
+	// Parse range parameter (in days, default 30)
+	rangeDays := 30
+	if rangeStr := r.URL.Query().Get("range"); rangeStr != "" {
+		if parsed, err := strconv.Atoi(rangeStr); err == nil && parsed > 0 && parsed <= 30 {
+			rangeDays = parsed
+		}
+	}
+
+	// Parse limit with higher cap for logging history (1-minute polling needs ~1440 records/day)
+	// Cap at 50000 to allow up to ~35 days of data while preventing unbounded queries
+	const maxLoggingLimit = 50000
+	limit := rangeDays * 24 * 60 // Default: enough for the requested range at 1-min polling
+	if limitStr := r.URL.Query().Get("limit"); limitStr != "" {
+		if n, err := strconv.Atoi(limitStr); err == nil && n > 0 {
+			limit = n
+		}
+	}
+	if limit > maxLoggingLimit {
+		limit = maxLoggingLimit
+	}
+	if limit <= 0 {
+		limit = 200
+	}
+
+	now := time.Now().UTC()
+	start := now.Add(-time.Duration(rangeDays) * 24 * time.Hour)
+	return start, now, limit
+}
+
+func loggingHistoryRowsFromSnapshots(
+	capturedAt []time.Time,
+	ids []int64,
+	quotaNames []string,
+	quotaSeries []map[string]loggingHistoryCrossQuota,
+) []map[string]interface{} {
+	rows := make([]map[string]interface{}, 0, len(capturedAt))
+	prevPercent := map[string]float64{}
+
+	for i := range capturedAt {
+		crossQuotas := make([]map[string]interface{}, 0, len(quotaNames))
+		for _, qn := range quotaNames {
+			cq, ok := quotaSeries[i][qn]
+			if !ok {
+				continue
+			}
+			delta := 0.0
+			if prev, seen := prevPercent[qn]; seen {
+				delta = cq.Percent - prev
+			}
+			entry := map[string]interface{}{
+				"name":    cq.Name,
+				"percent": cq.Percent,
+				"delta":   delta,
+			}
+			if cq.HasValue {
+				entry["value"] = cq.Value
+			}
+			if cq.HasLimit {
+				entry["limit"] = cq.Limit
+			}
+			crossQuotas = append(crossQuotas, entry)
+			prevPercent[qn] = cq.Percent
+		}
+
+		row := map[string]interface{}{
+			"capturedAt":  capturedAt[i].Format(time.RFC3339),
+			"crossQuotas": crossQuotas,
+		}
+		if i < len(ids) {
+			row["id"] = ids[i]
+		} else {
+			row["id"] = i + 1
+		}
+		rows = append(rows, row)
+	}
+
+	for i, j := 0, len(rows)-1; i < j; i, j = i+1, j-1 {
+		rows[i], rows[j] = rows[j], rows[i]
+	}
+	return rows
+}
+
+func (h *Handler) loggingHistorySynthetic(w http.ResponseWriter, r *http.Request) {
+	if h.store == nil {
+		respondJSON(w, http.StatusOK, map[string]interface{}{"logs": []interface{}{}})
+		return
+	}
+
+	start, end, limit := h.loggingHistoryRangeAndLimit(r)
+	snapshots, err := h.store.QueryRange(start, end, limit)
+	if err != nil {
+		h.logger.Error("failed to query Synthetic snapshots", "error", err)
+		respondError(w, http.StatusInternalServerError, "failed to query logging history")
+		return
+	}
+
+	quotaNames := []string{"subscription", "search", "toolcall"}
+	capturedAt := make([]time.Time, 0, len(snapshots))
+	ids := make([]int64, 0, len(snapshots))
+	series := make([]map[string]loggingHistoryCrossQuota, 0, len(snapshots))
+
+	for _, snap := range snapshots {
+		capturedAt = append(capturedAt, snap.CapturedAt)
+		ids = append(ids, snap.ID)
+
+		row := map[string]loggingHistoryCrossQuota{
+			"subscription": {
+				Name:     "subscription",
+				Value:    snap.Sub.Requests,
+				Limit:    snap.Sub.Limit,
+				Percent:  percentUsed(snap.Sub.Requests, snap.Sub.Limit),
+				HasValue: true,
+				HasLimit: true,
+			},
+			"search": {
+				Name:     "search",
+				Value:    snap.Search.Requests,
+				Limit:    snap.Search.Limit,
+				Percent:  percentUsed(snap.Search.Requests, snap.Search.Limit),
+				HasValue: true,
+				HasLimit: true,
+			},
+			"toolcall": {
+				Name:     "toolcall",
+				Value:    snap.ToolCall.Requests,
+				Limit:    snap.ToolCall.Limit,
+				Percent:  percentUsed(snap.ToolCall.Requests, snap.ToolCall.Limit),
+				HasValue: true,
+				HasLimit: true,
+			},
+		}
+		series = append(series, row)
+	}
+
+	respondJSON(w, http.StatusOK, map[string]interface{}{
+		"provider":   "synthetic",
+		"quotaNames": quotaNames,
+		"logs":       loggingHistoryRowsFromSnapshots(capturedAt, ids, quotaNames, series),
+	})
+}
+
+func (h *Handler) loggingHistoryZai(w http.ResponseWriter, r *http.Request) {
+	if h.store == nil {
+		respondJSON(w, http.StatusOK, map[string]interface{}{"logs": []interface{}{}})
+		return
+	}
+
+	start, end, limit := h.loggingHistoryRangeAndLimit(r)
+	snapshots, err := h.store.QueryZaiRange(start, end, limit)
+	if err != nil {
+		h.logger.Error("failed to query Z.ai snapshots", "error", err)
+		respondError(w, http.StatusInternalServerError, "failed to query logging history")
+		return
+	}
+
+	quotaNames := []string{"tokens", "time"}
+	capturedAt := make([]time.Time, 0, len(snapshots))
+	ids := make([]int64, 0, len(snapshots))
+	series := make([]map[string]loggingHistoryCrossQuota, 0, len(snapshots))
+
+	for _, snap := range snapshots {
+		capturedAt = append(capturedAt, snap.CapturedAt)
+		ids = append(ids, snap.ID)
+
+		row := map[string]loggingHistoryCrossQuota{
+			"tokens": {
+				Name:     "tokens",
+				Value:    snap.TokensUsage,
+				Limit:    float64(snap.TokensLimit),
+				Percent:  float64(snap.TokensPercentage),
+				HasValue: true,
+				HasLimit: true,
+			},
+			"time": {
+				Name:     "time",
+				Value:    snap.TimeUsage,
+				Limit:    float64(snap.TimeLimit),
+				Percent:  float64(snap.TimePercentage),
+				HasValue: true,
+				HasLimit: true,
+			},
+		}
+		series = append(series, row)
+	}
+
+	respondJSON(w, http.StatusOK, map[string]interface{}{
+		"provider":   "zai",
+		"quotaNames": quotaNames,
+		"logs":       loggingHistoryRowsFromSnapshots(capturedAt, ids, quotaNames, series),
+	})
+}
+
+func percentUsed(value, limit float64) float64 {
+	if limit <= 0 {
+		return 0
+	}
+	pct := (value / limit) * 100
+	if pct < 0 {
+		return 0
+	}
+	if pct > 100 {
+		return 100
+	}
+	return pct
+}
+
+func anthropicLoggingQuotaOrder(names []string) []string {
+	preferred := []string{"five_hour", "seven_day", "seven_day_sonnet", "monthly_limit", "extra_usage"}
+	present := make(map[string]bool, len(names))
+	for _, n := range names {
+		present[n] = true
+	}
+	ordered := make([]string, 0, len(names))
+	for _, n := range preferred {
+		if present[n] {
+			ordered = append(ordered, n)
+			delete(present, n)
+		}
+	}
+	extra := make([]string, 0, len(present))
+	for n := range present {
+		extra = append(extra, n)
+	}
+	sort.Strings(extra)
+	ordered = append(ordered, extra...)
+	return ordered
+}
+
+func (h *Handler) loggingHistoryAnthropic(w http.ResponseWriter, r *http.Request) {
+	if h.store == nil {
+		respondJSON(w, http.StatusOK, map[string]interface{}{"logs": []interface{}{}})
+		return
+	}
+
+	start, end, limit := h.loggingHistoryRangeAndLimit(r)
+	snapshots, err := h.store.QueryAnthropicRange(start, end, limit)
+	if err != nil {
+		h.logger.Error("failed to query Anthropic snapshots", "error", err)
+		respondError(w, http.StatusInternalServerError, "failed to query logging history")
+		return
+	}
+
+	quotaSet := map[string]bool{}
+	for _, snap := range snapshots {
+		for _, q := range snap.Quotas {
+			quotaSet[q.Name] = true
+		}
+	}
+	quotaNames := make([]string, 0, len(quotaSet))
+	for qn := range quotaSet {
+		quotaNames = append(quotaNames, qn)
+	}
+	if len(quotaNames) == 0 {
+		quotaNames = []string{"five_hour", "seven_day", "seven_day_sonnet"}
+	} else {
+		quotaNames = anthropicLoggingQuotaOrder(quotaNames)
+	}
+
+	capturedAt := make([]time.Time, 0, len(snapshots))
+	ids := make([]int64, 0, len(snapshots))
+	series := make([]map[string]loggingHistoryCrossQuota, 0, len(snapshots))
+
+	for _, snap := range snapshots {
+		capturedAt = append(capturedAt, snap.CapturedAt)
+		ids = append(ids, snap.ID)
+		row := make(map[string]loggingHistoryCrossQuota, len(snap.Quotas))
+		for _, q := range snap.Quotas {
+			row[q.Name] = loggingHistoryCrossQuota{
+				Name:    q.Name,
+				Percent: q.Utilization,
+			}
+		}
+		series = append(series, row)
+	}
+
+	respondJSON(w, http.StatusOK, map[string]interface{}{
+		"provider":   "anthropic",
+		"quotaNames": quotaNames,
+		"logs":       loggingHistoryRowsFromSnapshots(capturedAt, ids, quotaNames, series),
+	})
+}
+
+func (h *Handler) loggingHistoryCopilot(w http.ResponseWriter, r *http.Request) {
+	if h.store == nil {
+		respondJSON(w, http.StatusOK, map[string]interface{}{"logs": []interface{}{}})
+		return
+	}
+
+	start, end, limit := h.loggingHistoryRangeAndLimit(r)
+	snapshots, err := h.store.QueryCopilotRange(start, end, limit)
+	if err != nil {
+		h.logger.Error("failed to query Copilot snapshots", "error", err)
+		respondError(w, http.StatusInternalServerError, "failed to query logging history")
+		return
+	}
+
+	quotaNames := []string{"premium_interactions", "chat", "completions"}
+	capturedAt := make([]time.Time, 0, len(snapshots))
+	ids := make([]int64, 0, len(snapshots))
+	series := make([]map[string]loggingHistoryCrossQuota, 0, len(snapshots))
+
+	for _, snap := range snapshots {
+		capturedAt = append(capturedAt, snap.CapturedAt)
+		ids = append(ids, snap.ID)
+		row := make(map[string]loggingHistoryCrossQuota, len(snap.Quotas))
+		for _, q := range snap.Quotas {
+			usedPercent := 100.0 - q.PercentRemaining
+			if usedPercent < 0 {
+				usedPercent = 0
+			}
+			usedValue := float64(q.Entitlement - q.Remaining)
+			if usedValue < 0 {
+				usedValue = 0
+			}
+			row[q.Name] = loggingHistoryCrossQuota{
+				Name:     q.Name,
+				Value:    usedValue,
+				Limit:    float64(q.Entitlement),
+				Percent:  usedPercent,
+				HasValue: true,
+				HasLimit: true,
+			}
+		}
+		series = append(series, row)
+	}
+
+	respondJSON(w, http.StatusOK, map[string]interface{}{
+		"provider":   "copilot",
+		"quotaNames": quotaNames,
+		"logs":       loggingHistoryRowsFromSnapshots(capturedAt, ids, quotaNames, series),
+	})
+}
+
+func (h *Handler) loggingHistoryCodex(w http.ResponseWriter, r *http.Request) {
+	if h.store == nil {
+		respondJSON(w, http.StatusOK, map[string]interface{}{"logs": []interface{}{}})
+		return
+	}
+
+	accountID := parseCodexAccountID(r)
+	start, end, limit := h.loggingHistoryRangeAndLimit(r)
+	snapshots, err := h.store.QueryCodexRange(accountID, start, end, limit)
+	if err != nil {
+		h.logger.Error("failed to query Codex snapshots", "error", err)
+		respondError(w, http.StatusInternalServerError, "failed to query logging history")
+		return
+	}
+
+	quotaNames := []string{"five_hour", "seven_day", "code_review"}
+	capturedAt := make([]time.Time, 0, len(snapshots))
+	ids := make([]int64, 0, len(snapshots))
+	series := make([]map[string]loggingHistoryCrossQuota, 0, len(snapshots))
+
+	for _, snap := range snapshots {
+		capturedAt = append(capturedAt, snap.CapturedAt)
+		ids = append(ids, snap.ID)
+		row := make(map[string]loggingHistoryCrossQuota, len(snap.Quotas))
+		for _, q := range snap.Quotas {
+			row[q.Name] = loggingHistoryCrossQuota{
+				Name:    q.Name,
+				Percent: q.Utilization,
+			}
+		}
+		series = append(series, row)
+	}
+
+	respondJSON(w, http.StatusOK, map[string]interface{}{
+		"provider":   "codex",
+		"quotaNames": quotaNames,
+		"logs":       loggingHistoryRowsFromSnapshots(capturedAt, ids, quotaNames, series),
+	})
+}
+
+// loggingHistoryAntigravity returns Antigravity polling snapshots with deltas.
+func (h *Handler) loggingHistoryAntigravity(w http.ResponseWriter, r *http.Request) {
+	if h.store == nil {
+		respondJSON(w, http.StatusOK, map[string]interface{}{"logs": []interface{}{}})
+		return
+	}
+
+	start, end, limit := h.loggingHistoryRangeAndLimit(r)
+	snapshots, err := h.store.QueryAntigravityRange(start, end, limit)
+	if err != nil {
+		h.logger.Error("failed to query Antigravity snapshots", "error", err)
+		respondError(w, http.StatusInternalServerError, "failed to query logging history")
+		return
+	}
+
+	quotaNames := api.AntigravityQuotaGroupOrder()
+	capturedAt := make([]time.Time, 0, len(snapshots))
+	ids := make([]int64, 0, len(snapshots))
+	series := make([]map[string]loggingHistoryCrossQuota, 0, len(snapshots))
+
+	for _, snap := range snapshots {
+		capturedAt = append(capturedAt, snap.CapturedAt)
+		ids = append(ids, snap.ID)
+
+		groups := api.GroupAntigravityModelsByLogicalQuota(snap.Models)
+		groupByName := make(map[string]api.AntigravityGroupedQuota, len(groups))
+		for _, group := range groups {
+			groupByName[group.GroupKey] = group
+		}
+
+		row := make(map[string]loggingHistoryCrossQuota, len(quotaNames))
+		for _, qn := range quotaNames {
+			group, ok := groupByName[qn]
+			if !ok {
+				continue
+			}
+			row[qn] = loggingHistoryCrossQuota{
+				Name:    qn,
+				Percent: group.UsagePercent,
+			}
+		}
+		series = append(series, row)
+	}
+
+	respondJSON(w, http.StatusOK, map[string]interface{}{
+		"provider":   "antigravity",
+		"quotaNames": quotaNames,
+		"logs":       loggingHistoryRowsFromSnapshots(capturedAt, ids, quotaNames, series),
+	})
+}
+
+func (h *Handler) loggingHistoryMiniMax(w http.ResponseWriter, r *http.Request) {
+	if h.store == nil {
+		respondJSON(w, http.StatusOK, map[string]interface{}{"logs": []interface{}{}})
+		return
+	}
+
+	start, end, limit := h.loggingHistoryRangeAndLimit(r)
+	minimaxAccID := h.parseMiniMaxAccountID(r)
+	snapshots, err := h.store.QueryMiniMaxRange(start, end, minimaxAccID, limit)
+	if err != nil {
+		h.logger.Error("failed to query MiniMax snapshots", "error", err)
+		respondError(w, http.StatusInternalServerError, "failed to query logging history")
+		return
+	}
+
+	// Build quota names and series using pool-grouped data.
+	quotaNameSet := map[string]bool{}
+	for _, snap := range snapshots {
+		for _, g := range snap.GroupByPool() {
+			name := api.MiniMaxGroupDisplayName(g.ModelNames)
+			quotaNameSet[name] = true
+			if g.Quota.HasWeeklyQuota && (g.Quota.WeeklyTotal > 0 || g.Quota.WeeklyUsed > 0) {
+				quotaNameSet["wkly_"+name] = true
+			}
+		}
+	}
+	if len(quotaNameSet) == 0 {
+		allNames, _ := h.store.QueryAllMiniMaxModelNames(minimaxAccID)
+		for _, n := range allNames {
+			quotaNameSet[n] = true
+		}
+	}
+
+	quotaNames := make([]string, 0, len(quotaNameSet))
+	for name := range quotaNameSet {
+		quotaNames = append(quotaNames, name)
+	}
+	sort.Strings(quotaNames)
+
+	capturedAt := make([]time.Time, 0, len(snapshots))
+	ids := make([]int64, 0, len(snapshots))
+	series := make([]map[string]loggingHistoryCrossQuota, 0, len(snapshots))
+	for _, snap := range snapshots {
+		capturedAt = append(capturedAt, snap.CapturedAt)
+		ids = append(ids, snap.ID)
+		row := make(map[string]loggingHistoryCrossQuota, len(quotaNames))
+
+		for _, g := range snap.GroupByPool() {
+			name := api.MiniMaxGroupDisplayName(g.ModelNames)
+			row[name] = loggingHistoryCrossQuota{
+				Name:     name,
+				Value:    float64(g.Quota.Used),
+				Limit:    float64(g.Quota.Total),
+				Percent:  g.Quota.UsedPercent,
+				HasValue: true,
+				HasLimit: true,
+			}
+			if g.Quota.HasWeeklyQuota && (g.Quota.WeeklyTotal > 0 || g.Quota.WeeklyUsed > 0) {
+				wKey := "wkly_" + name
+				row[wKey] = loggingHistoryCrossQuota{
+					Name:     wKey,
+					Value:    float64(g.Quota.WeeklyUsed),
+					Limit:    float64(g.Quota.WeeklyTotal),
+					Percent:  g.Quota.WeeklyUsedPercent,
+					HasValue: true,
+					HasLimit: true,
+				}
+			}
+		}
+		series = append(series, row)
+	}
+
+	respondJSON(w, http.StatusOK, map[string]interface{}{
+		"provider":   "minimax",
+		"quotaNames": quotaNames,
+		"logs":       loggingHistoryRowsFromSnapshots(capturedAt, ids, quotaNames, series),
+	})
+}
+
+// cycleOverviewCopilot returns Copilot cycle overview with cross-quota data.
+func (h *Handler) cycleOverviewCopilot(w http.ResponseWriter, r *http.Request) {
+	if h.store == nil {
+		respondJSON(w, http.StatusOK, map[string]interface{}{"cycles": []interface{}{}})
+		return
+	}
+
+	groupBy := r.URL.Query().Get("groupBy")
+	if groupBy == "" {
+		groupBy = "premium_interactions"
+	}
+
+	limit := parseCycleOverviewLimit(r)
+	rows, err := h.store.QueryCopilotCycleOverview(groupBy, limit)
+	if err != nil {
+		h.logger.Error("failed to query Copilot cycle overview", "error", err)
+		respondError(w, http.StatusInternalServerError, "failed to query cycle overview")
+		return
+	}
+
+	// Determine quota names from first row with cross-quota data, or default
+	quotaNames := []string{}
+	for _, row := range rows {
+		if len(row.CrossQuotas) > 0 {
+			for _, cq := range row.CrossQuotas {
+				quotaNames = append(quotaNames, cq.Name)
+			}
+			break
+		}
+	}
+	if len(quotaNames) == 0 {
+		quotaNames = []string{"premium_interactions", "chat", "completions"}
+	}
+
+	respondJSON(w, http.StatusOK, map[string]interface{}{
+		"groupBy":    groupBy,
+		"provider":   "copilot",
+		"quotaNames": quotaNames,
+		"cycles":     cycleOverviewRowsToJSON(rows),
+	})
+}
+
+// SystemAlerts returns active system alerts for the notification center.
+func (h *Handler) SystemAlerts(w http.ResponseWriter, r *http.Request) {
+	if h.store == nil {
+		respondJSON(w, http.StatusOK, map[string]interface{}{"alerts": []interface{}{}})
+		return
+	}
+
+	alerts, err := h.store.GetActiveSystemAlerts()
+	if err != nil {
+		h.logger.Error("failed to get system alerts", "error", err)
+		respondError(w, http.StatusInternalServerError, "failed to get alerts")
+		return
+	}
+
+	// Convert to JSON-friendly format
+	result := make([]map[string]interface{}, 0, len(alerts))
+	for _, alert := range alerts {
+		result = append(result, map[string]interface{}{
+			"id":        alert.ID,
+			"type":      alert.AlertType,
+			"severity":  alert.Severity,
+			"title":     alert.Title,
+			"message":   alert.Message,
+			"provider":  alert.Provider,
+			"createdAt": alert.CreatedAt.Format(time.RFC3339),
+		})
+	}
+
+	respondJSON(w, http.StatusOK, map[string]interface{}{"alerts": result})
+}
+
+// DismissAlert dismisses a single system alert.
+func (h *Handler) DismissAlert(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		respondError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+
+	if h.store == nil {
+		respondError(w, http.StatusInternalServerError, "store not available")
+		return
+	}
+
+	var req struct {
+		ID int64 `json:"id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		respondError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+
+	if err := h.store.DismissSystemAlert(req.ID); err != nil {
+		h.logger.Error("failed to dismiss alert", "id", req.ID, "error", err)
+		respondError(w, http.StatusInternalServerError, "failed to dismiss alert")
+		return
+	}
+
+	respondJSON(w, http.StatusOK, map[string]interface{}{"success": true})
+}
+
+// DismissAllAlerts dismisses all active system alerts.
+func (h *Handler) DismissAllAlerts(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		respondError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+
+	if h.store == nil {
+		respondError(w, http.StatusInternalServerError, "store not available")
+		return
+	}
+
+	if err := h.store.DismissAllSystemAlerts(); err != nil {
+		h.logger.Error("failed to dismiss all alerts", "error", err)
+		respondError(w, http.StatusInternalServerError, "failed to dismiss alerts")
+		return
+	}
+
+	respondJSON(w, http.StatusOK, map[string]interface{}{"success": true})
+}
+
+// SimulateAlert creates a test alert for UI verification.
+func (h *Handler) SimulateAlert(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		respondError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+
+	if h.store == nil {
+		respondError(w, http.StatusInternalServerError, "store not available")
+		return
+	}
+
+	var req struct {
+		Type     string `json:"type"`
+		Severity string `json:"severity"`
+		Title    string `json:"title"`
+		Message  string `json:"message"`
+		Provider string `json:"provider"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		respondError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+
+	// Default values for simulation
+	if req.Type == "" {
+		req.Type = "test_alert"
+	}
+	if req.Severity == "" {
+		req.Severity = "warning"
+	}
+	if req.Title == "" {
+		req.Title = "Test Notification"
+	}
+	if req.Message == "" {
+		req.Message = "This is a test notification to verify the notification center UI."
+	}
+	if req.Provider == "" {
+		req.Provider = "system"
+	}
+
+	id, err := h.store.CreateSystemAlert(req.Provider, req.Type, req.Title, req.Message, req.Severity, "")
+	if err != nil {
+		h.logger.Error("failed to create simulated alert", "error", err)
+		respondError(w, http.StatusInternalServerError, "failed to create alert")
+		return
+	}
+
+	respondJSON(w, http.StatusOK, map[string]interface{}{
+		"success":  true,
+		"id":       id,
+		"type":     req.Type,
+		"severity": req.Severity,
+		"title":    req.Title,
+		"message":  req.Message,
+		"provider": req.Provider,
+	})
+}

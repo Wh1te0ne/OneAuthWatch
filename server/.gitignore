@@ -1,0 +1,88 @@
+# Secrets & Environment
+.env
+*.key
+*.pem
+*.cert
+
+# Database
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# Binary
+/onwatch
+/onwatch.exe
+/bin/
+/dist/
+
+# Static (embedded from internal/web/static/ via embed.FS)
+/static/
+
+# Docker data directory
+onwatch-data/
+
+# OS
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+
+# IDE
+.idea/
+.vscode/
+*.code-workspace
+
+# Screenshots & temp
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.bmp
+!docs/screenshots/*.png
+!internal/menubar/icon_template.png
+!internal/menubar/icon_template@2x.png
+tmp/
+temp/
+test-screenshots/
+test-evidence/
+
+# Go
+vendor/
+*.test
+coverage.out
+coverage.html
+
+# Logs
+*.log
+.onwatch.log
+logs/
+opencode.json
+.onwatch.pid
+
+# Node.js (dev tools)
+node_modules/
+package.json
+package-lock.json
+
+# Internal research & analysis docs (moved to temp/)
+# All research, analysis, and working docs go in temp/ which is gitignored above
+
+# Performance monitoring artifacts
+tools/perf-monitor/onwatch
+tools/perf-monitor/*.json
+
+# Python E2E tests
+tests/e2e/.venv/
+__pycache__/
+.pytest_cache/
+*.pyc
+
+# Mock server binary
+/mockserver
+onwatch-test
+
+# Claude Code session artifacts
+.omc/
+.playwright-mcp/

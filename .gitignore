@@ -1,0 +1,50 @@
+# Local tooling and caches
+.codex/
+.gocache/
+.gomodcache/
+.gopath/
+.npm-cache/
+.playwright/
+
+# Reference source trees kept locally for comparison only
+codex-auth-manager-main/
+onWatch-main/
+
+# Environment files
+**/.env
+**/.env.local
+**/.env.*.local
+
+# Node / frontend artifacts
+**/node_modules/
+client/dist/
+client/dist-*/
+client/src-tauri/target/
+client/src-tauri/target-codex-temp/
+
+# Rust / desktop build artifacts
+**/target/
+*.pdb
+
+# Go build artifacts and logs
+server/*.exe
+server/*.exe~
+server/*.log
+server/*.out
+server/*.pid
+server/server.new.exe
+server/server.exe
+server/oneauthwatch-server.exe
+server/oneauthwatch-data/
+
+# Docker / runtime data
+server/*.db
+server/*.db-*
+server/*.sqlite
+server/*.sqlite-*
+
+# Test / coverage artifacts
+**/coverage/
+**/tmp/
+**/.DS_Store
+**/Thumbs.db

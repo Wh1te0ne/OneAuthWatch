@@ -1,0 +1,183 @@
+// Package api provides clients for interacting with the Anthropic API.
+package api
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"log/slog"
+	"net/http"
+	"sync"
+	"time"
+)
+
+// Custom errors for Anthropic API failures.
+var (
+	ErrAnthropicUnauthorized    = errors.New("anthropic: unauthorized - invalid API key")
+	ErrAnthropicForbidden       = errors.New("anthropic: forbidden - token revoked or invalid")
+	ErrAnthropicServerError     = errors.New("anthropic: server error")
+	ErrAnthropicNetworkError    = errors.New("anthropic: network error")
+	ErrAnthropicInvalidResponse = errors.New("anthropic: invalid response")
+	ErrAnthropicRateLimited     = errors.New("anthropic: rate limited (429)")
+)
+
+// AnthropicClient is an HTTP client for the Anthropic API.
+type AnthropicClient struct {
+	httpClient *http.Client
+	token      string
+	tokenMu    sync.RWMutex
+	baseURL    string
+	logger     *slog.Logger
+}
+
+// AnthropicOption configures an AnthropicClient.
+type AnthropicOption func(*AnthropicClient)
+
+// WithAnthropicBaseURL sets a custom base URL (for testing).
+func WithAnthropicBaseURL(url string) AnthropicOption {
+	return func(c *AnthropicClient) {
+		c.baseURL = url
+	}
+}
+
+// WithAnthropicTimeout sets a custom timeout (for testing).
+func WithAnthropicTimeout(timeout time.Duration) AnthropicOption {
+	return func(c *AnthropicClient) {
+		c.httpClient.Timeout = timeout
+	}
+}
+
+// NewAnthropicClient creates a new Anthropic API client.
+func NewAnthropicClient(token string, logger *slog.Logger, opts ...AnthropicOption) *AnthropicClient {
+	client := &AnthropicClient{
+		httpClient: &http.Client{
+			Timeout: 30 * time.Second,
+			Transport: &http.Transport{
+				MaxIdleConns:          1,
+				MaxIdleConnsPerHost:   1,
+				ResponseHeaderTimeout: 30 * time.Second,
+				IdleConnTimeout:       30 * time.Second,
+				TLSHandshakeTimeout:   10 * time.Second,
+				ForceAttemptHTTP2:     true,
+			},
+		},
+		token:   token,
+		baseURL: "https://api.anthropic.com/api/oauth/usage",
+		logger:  logger,
+	}
+
+	for _, opt := range opts {
+		opt(client)
+	}
+
+	return client
+}
+
+// SetToken updates the token used for API requests (for token refresh).
+func (c *AnthropicClient) SetToken(token string) {
+	c.tokenMu.Lock()
+	defer c.tokenMu.Unlock()
+	c.token = token
+}
+
+// getToken returns the current token safely for concurrent access.
+func (c *AnthropicClient) getToken() string {
+	c.tokenMu.RLock()
+	defer c.tokenMu.RUnlock()
+	return c.token
+}
+
+// FetchQuotas retrieves the current quota information from the Anthropic API.
+func (c *AnthropicClient) FetchQuotas(ctx context.Context) (*AnthropicQuotaResponse, error) {
+	reqCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, c.baseURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("anthropic: creating request: %w", err)
+	}
+
+	// Set headers
+	token := c.getToken()
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("anthropic-beta", "oauth-2025-04-20")
+	req.Header.Set("User-Agent", "claude-code/2.1.69")
+
+	// Log request (with redacted token)
+	c.logger.Debug("fetching Anthropic quotas",
+		"url", c.baseURL,
+		"token", redactAnthropicToken(token),
+	)
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		// Check for context cancellation
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		return nil, fmt.Errorf("%w: %v", ErrAnthropicNetworkError, err)
+	}
+	defer resp.Body.Close()
+
+	// Log response status
+	c.logger.Debug("Anthropic quota response received",
+		"status", resp.StatusCode,
+	)
+
+	// Handle HTTP status codes
+	switch {
+	case resp.StatusCode == http.StatusOK:
+		// Continue to parse response
+	case resp.StatusCode == http.StatusUnauthorized:
+		return nil, ErrAnthropicUnauthorized
+	case resp.StatusCode == http.StatusForbidden:
+		return nil, ErrAnthropicForbidden
+	case resp.StatusCode == http.StatusTooManyRequests:
+		return nil, ErrAnthropicRateLimited
+	case resp.StatusCode >= 500:
+		return nil, ErrAnthropicServerError
+	default:
+		return nil, fmt.Errorf("anthropic: unexpected status code %d", resp.StatusCode)
+	}
+
+	// Read response body (bounded to 64KB)
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<16))
+	if err != nil {
+		return nil, fmt.Errorf("%w: reading body: %v", ErrAnthropicInvalidResponse, err)
+	}
+
+	if len(body) == 0 {
+		return nil, fmt.Errorf("%w: empty response body", ErrAnthropicInvalidResponse)
+	}
+
+	var quotaResp AnthropicQuotaResponse
+	if err := json.Unmarshal(body, &quotaResp); err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrAnthropicInvalidResponse, err)
+	}
+
+	// Log active quota names on success
+	if names := quotaResp.ActiveQuotaNames(); len(names) > 0 {
+		c.logger.Debug("Anthropic quotas fetched successfully",
+			"active_quotas", names,
+		)
+	}
+
+	return &quotaResp, nil
+}
+
+// redactAnthropicToken masks the token for logging.
+func redactAnthropicToken(key string) string {
+	if key == "" {
+		return "(empty)"
+	}
+
+	if len(key) < 8 {
+		return "***...***"
+	}
+
+	// Show first 4 chars and last 3 chars
+	return key[:4] + "***...***" + key[len(key)-3:]
+}

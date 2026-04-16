@@ -1,0 +1,71 @@
+name: Desktop Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  publish-desktop:
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macOS Apple Silicon
+            platform: macos-15
+            rust-target: aarch64-apple-darwin
+            args: --target aarch64-apple-darwin --bundles dmg
+          - name: macOS Intel
+            platform: macos-15-intel
+            rust-target: x86_64-apple-darwin
+            args: --target x86_64-apple-darwin --bundles dmg
+          - name: Windows
+            platform: windows-latest
+            rust-target: ""
+            args: ""
+
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.platform }}
+    defaults:
+      run:
+        working-directory: client
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: lts/*
+          cache: npm
+          cache-dependency-path: client/package-lock.json
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Add Rust target
+        if: matrix.rust-target != ''
+        run: rustup target add ${{ matrix.rust-target }}
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Build and publish Tauri app
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          projectPath: client
+          tagName: v__VERSION__
+          releaseName: OneAuthWatch v__VERSION__
+          releaseBody: |
+            OneAuthWatch desktop release.
+
+            Included artifacts are built automatically from the root repository workflow.
+          generateReleaseNotes: false
+          releaseDraft: false
+          prerelease: false
+          args: ${{ matrix.args }}

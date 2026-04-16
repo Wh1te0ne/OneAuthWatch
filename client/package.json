@@ -1,0 +1,44 @@
+{
+  "name": "oneauthwatch",
+  "private": true,
+  "version": "0.1.0",
+  "description": "OneAuthWatch desktop client",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "npm run build:web",
+    "build:web": "tsc -b && vite build --base /static/ui/ --outDir dist-web",
+    "build:desktop": "tsc -b && vite build --base / --outDir dist-desktop",
+    "build:web:sync": "npm run build:web && \"C:\\Program Files\\PowerShell\\7\\pwsh.exe\" -File ../server/scripts/sync-web-ui.ps1",
+    "lint": "eslint .",
+    "preview": "vite preview",
+    "tauri": "tauri",
+    "tauri:dev": "tauri dev",
+    "tauri:build": "tauri build"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2.9.1",
+    "@tauri-apps/plugin-dialog": "^2.6.0",
+    "@tauri-apps/plugin-shell": "^2.3.4",
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0",
+    "zustand": "^5.0.10"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.39.1",
+    "@tailwindcss/vite": "^4.1.18",
+    "@tauri-apps/cli": "^2.9.6",
+    "@types/node": "^24.10.1",
+    "@types/react": "^19.2.5",
+    "@types/react-dom": "^19.2.3",
+    "@vitejs/plugin-react": "^5.1.1",
+    "eslint": "^9.39.1",
+    "eslint-plugin-react-hooks": "^7.0.1",
+    "eslint-plugin-react-refresh": "^0.4.24",
+    "globals": "^16.5.0",
+    "tailwindcss": "^4.1.18",
+    "typescript": "~5.9.3",
+    "typescript-eslint": "^8.46.4",
+    "vite": "^7.2.4"
+  }
+}
