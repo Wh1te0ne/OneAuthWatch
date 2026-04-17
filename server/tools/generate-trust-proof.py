@@ -28,7 +28,7 @@ pycountry = None
 
 
 DEFAULT_OWNER = "onllm-dev"
-DEFAULT_REPO = "onwatch"
+DEFAULT_REPO = "oneauthwatch-server"
 DEFAULT_OUTPUT = "landing/trust-proof.json"
 
 TRUST_ORG_TOTAL_MARKER = "__total_users_with_org_metadata"
@@ -67,14 +67,14 @@ def ensure_runtime_dependencies() -> None:
     except ImportError:
         pass
 
-    boot_flag = "ONWATCH_TRUST_BOOTSTRAPPED"
+    boot_flag = "ONEAUTHWATCH_TRUST_BOOTSTRAPPED"
     if os.environ.get(boot_flag) == "1":
         raise SystemExit(
             "Failed to bootstrap dependencies. Install `pycountry` and "
             "`geonamescache`, then rerun."
         )
 
-    venv_dir = Path(tempfile.gettempdir()) / "onwatch-trust-proof-venv"
+    venv_dir = Path(tempfile.gettempdir()) / "oneauthwatch-server-trust-proof-venv"
     venv_python = venv_dir / "bin" / "python"
 
     if not venv_python.exists():

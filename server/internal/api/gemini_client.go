@@ -137,7 +137,7 @@ func (c *GeminiClient) FetchQuotas(ctx context.Context) (*GeminiQuotaResponse, e
 	token := c.getToken()
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("User-Agent", "onwatch/1.0")
+	req.Header.Set("User-Agent", "oneauthwatch/1.0")
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
@@ -203,7 +203,7 @@ func (c *GeminiClient) FetchTier(ctx context.Context) (*GeminiTierResponse, erro
 	token := c.getToken()
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("User-Agent", "onwatch/1.0")
+	req.Header.Set("User-Agent", "oneauthwatch/1.0")
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {

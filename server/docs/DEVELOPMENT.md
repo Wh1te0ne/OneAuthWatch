@@ -1,6 +1,6 @@
 # Development Guide
 
-Build and run onWatch from source on any platform.
+Build and run OneAuthWatch from source on any platform.
 
 ---
 
@@ -16,7 +16,7 @@ Build and run onWatch from source on any platform.
 
 ```bash
 git clone https://github.com/Wh1te0ne/OneAuthWatch.git
-cd onwatch
+cd oneauthwatch-server
 ./app.sh --build    # or: make build
 ```
 
@@ -62,7 +62,7 @@ winget install GoLang.Go
 Build:
 
 ```powershell
-go build -ldflags="-s -w" -o onwatch.exe .
+go build -ldflags="-s -w" -o oneauthwatch-server.exe .
 ```
 
 ---
@@ -100,7 +100,7 @@ To bump the version, edit `VERSION` and rebuild. The GitHub Actions workflow and
 
 ## Cross-Compilation
 
-onWatch uses pure Go SQLite (`modernc.org/sqlite`), so cross-compilation works without CGO:
+OneAuthWatch uses pure Go SQLite (`modernc.org/sqlite`), so cross-compilation works without CGO:
 
 ```bash
 make release-local
@@ -110,16 +110,16 @@ This produces binaries in `dist/`:
 
 | Platform | Binary |
 |----------|--------|
-| macOS ARM64 | `onwatch-darwin-arm64` |
-| macOS AMD64 | `onwatch-darwin-amd64` |
-| Linux AMD64 | `onwatch-linux-amd64` |
-| Linux ARM64 | `onwatch-linux-arm64` |
-| Windows AMD64 | `onwatch-windows-amd64.exe` |
+| macOS ARM64 | `oneauthwatch-server-darwin-arm64` |
+| macOS AMD64 | `oneauthwatch-server-darwin-amd64` |
+| Linux AMD64 | `oneauthwatch-server-linux-amd64` |
+| Linux ARM64 | `oneauthwatch-server-linux-arm64` |
+| Windows AMD64 | `oneauthwatch-server-windows-amd64.exe` |
 
 Manual cross-compilation:
 
 ```bash
-CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-s -w -X main.version=$(cat VERSION)" -o onwatch-linux-amd64 .
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-s -w -X main.version=$(cat VERSION)" -o oneauthwatch-server-linux-amd64 .
 ```
 
 ---
@@ -130,7 +130,7 @@ CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-s -w -X main.version=$
 
 ```bash
 git clone https://github.com/Wh1te0ne/OneAuthWatch.git
-cd onwatch
+cd oneauthwatch-server
 cp .env.example .env
 ```
 
@@ -176,7 +176,7 @@ make coverage              # Generate HTML coverage report → coverage.html
 
 ## Multi-Provider Architecture
 
-onWatch supports eight providers: Synthetic, Z.ai, Anthropic, Codex, GitHub Copilot, MiniMax, Gemini CLI, and Antigravity. When multiple API keys are set, all agents run in parallel goroutines, each polling its respective API and storing snapshots in the shared SQLite database.
+OneAuthWatch supports eight providers: Synthetic, Z.ai, Anthropic, Codex, GitHub Copilot, MiniMax, Gemini CLI, and Antigravity. When multiple API keys are set, all agents run in parallel goroutines, each polling its respective API and storing snapshots in the shared SQLite database.
 
 The dashboard switches between providers via the `?provider=` query parameter. Each provider renders its own quota cards, insight cards, and stat summaries. Synthetic insights focus on cycle utilization and billing periods; Z.ai insights show plan capacity (daily/monthly token budgets), tokens-per-call efficiency, and top tool analysis; Anthropic insights show burn rate forecasting, window averages, projected exhaustion, and cross-quota ratio analysis (5-Hour vs Weekly); Codex insights track 5-hour and weekly windows with trend and projection context; GitHub Copilot insights track entitlement burn and projected usage; MiniMax insights focus on shared-pool burn and reset projection; Antigravity insights focus on grouped pool burn rates and exhaustion timing.
 
@@ -216,7 +216,7 @@ Key source files:
 Strip debug symbols for a smaller binary:
 
 ```bash
-make build    # Equivalent to: go build -ldflags="-s -w -X main.version=$(VERSION)" -o onwatch .
+make build    # Equivalent to: go build -ldflags="-s -w -X main.version=$(VERSION)" -o oneauthwatch-server .
 ```
 
 Binary sizes: ~15 MB per platform.
@@ -274,7 +274,7 @@ go mod tidy
 
 ## Docker Development
 
-onWatch provides Docker support via `app.sh --docker` and a multi-stage Dockerfile with a distroless runtime image (~10-12 MB).
+OneAuthWatch provides Docker support via `app.sh --docker` and a multi-stage Dockerfile with a distroless runtime image (~10-12 MB).
 
 ### app.sh Docker Commands
 
@@ -289,8 +289,8 @@ onWatch provides Docker support via `app.sh --docker` and a multi-stage Dockerfi
 
 - **Build stage:** `golang:1.25-alpine` compiles a static binary (`CGO_ENABLED=0`) with `-trimpath` and stripped debug symbols
 - **Runtime stage:** `gcr.io/distroless/static-debian12:nonroot` — no shell, no package manager, minimal attack surface
-- **Docker detection:** `config.IsDockerEnvironment()` checks for `/.dockerenv` or `DOCKER=true` env var. When detected, onWatch skips daemonization and logs to stdout
-- **Data persistence:** SQLite database stored at `/data/onwatch.db` via volume mount
+- **Docker detection:** `config.IsDockerEnvironment()` checks for `/.dockerenv` or `DOCKER=true` env var. When detected, OneAuthWatch skips daemonization and logs to stdout
+- **Data persistence:** SQLite database stored at `/data/oneauthwatch.db` via volume mount
 - **Non-root:** Container runs as UID 65532 (distroless `nonroot` user)
 
 ### Docker Development Workflow
@@ -304,7 +304,7 @@ cp .env.docker.example .env
 ./app.sh --docker --run
 
 # 3. View logs
-docker logs -f onwatch
+docker logs -f oneauthwatch-server
 
 # 4. Access dashboard
 open http://localhost:9211
@@ -318,15 +318,15 @@ open http://localhost:9211
 If you need more control than `app.sh` provides:
 
 ```bash
-docker build -t onwatch:latest \
+docker build -t oneauthwatch-server:latest \
   --build-arg VERSION=$(cat VERSION) \
   --build-arg BUILD_TIME=$(date -u +%Y-%m-%dT%H:%M:%SZ) .
 
-docker run -d --name onwatch \
+docker run -d --name oneauthwatch-server \
   -p 9211:9211 \
-  -v ./onwatch-data:/data \
+  -v ./oneauthwatch-data:/data \
   --env-file .env \
-  onwatch:latest
+  oneauthwatch-server:latest
 ```
 
 ### Docker Compose
@@ -337,19 +337,19 @@ docker-compose logs -f      # Follow logs
 docker-compose down         # Stop and remove
 ```
 
-The `docker-compose.yml` includes memory limits (64M limit, 32M reservation), log rotation, and `unless-stopped` restart policy. Data is persisted via bind mount at `./onwatch-data/`.
+The `docker-compose.yml` includes memory limits (64M limit, 32M reservation), log rotation, and `unless-stopped` restart policy. Data is persisted via bind mount at `./oneauthwatch-data/`.
 
 **Note:** For bind mounts, pre-create the directory with correct ownership:
 
 ```bash
-mkdir -p ./onwatch-data && sudo chown -R 65532:65532 ./onwatch-data
+mkdir -p ./oneauthwatch-data && sudo chown -R 65532:65532 ./oneauthwatch-data
 ```
 
 ---
 
 ## Performance Monitoring
 
-A built-in performance monitoring tool tracks onWatch's RAM consumption and HTTP response times. This helps validate memory efficiency and identify performance regressions.
+A built-in performance monitoring tool tracks OneAuthWatch's RAM consumption and HTTP response times. This helps validate memory efficiency and identify performance regressions.
 
 ### Building the Tool
 
@@ -370,7 +370,7 @@ go build -o perf-monitor .
 ./perf-monitor 9211 2m
 ```
 
-**With restart (stops and restarts onWatch for clean baseline):**
+**With restart (stops and restarts OneAuthWatch for clean baseline):**
 ```bash
 ./perf-monitor --restart 9211 1m
 ```
@@ -440,7 +440,7 @@ Measured with the built-in `tools/perf-monitor` while provider agents ran in par
 
 ## Self-Update Mechanism
 
-onWatch includes a self-update system that downloads new releases from GitHub and replaces the running binary. The update can be triggered from the dashboard (update badge in footer) or via `onwatch update`.
+OneAuthWatch includes a self-update system that downloads new releases from GitHub and replaces the running binary. The update can be triggered from the dashboard (update badge in footer) or via `oneauthwatch-server update`.
 
 ### Update Flow
 
@@ -451,7 +451,7 @@ onWatch includes a self-update system that downloads new releases from GitHub an
 
 ### systemd Integration
 
-Under systemd, onWatch auto-detects its service name from `/proc/self/cgroup` and uses `systemctl restart` for proper lifecycle management. Three layers ensure reliability:
+Under systemd, OneAuthWatch auto-detects its service name from `/proc/self/cgroup` and uses `systemctl restart` for proper lifecycle management. Three layers ensure reliability:
 
 | Layer | When | Purpose |
 |-------|------|---------|
@@ -486,12 +486,12 @@ go mod download
 ### Permission denied (Unix)
 
 ```bash
-chmod +x onwatch
+chmod +x oneauthwatch-server
 ```
 
 ### Port already in use
 
 ```bash
-./onwatch stop           # Stop existing instance
-./onwatch --port 9000    # Or use a different port
+./oneauthwatch-server stop           # Stop existing instance
+./oneauthwatch-server --port 9000    # Or use a different port
 ```

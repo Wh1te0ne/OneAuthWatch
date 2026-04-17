@@ -1,13 +1,13 @@
 # GitHub Copilot Setup Guide
 
-Track your GitHub Copilot premium request usage with onWatch.
+Track your GitHub Copilot premium request usage with OneAuthWatch.
 
 ---
 
 ## Prerequisites
 
 - GitHub account with an active Copilot subscription (Individual, Business, or Enterprise)
-- onWatch installed ([Quick Start](../README.md#quick-start))
+- OneAuthWatch installed ([Quick Start](../README.md#quick-start))
 
 ---
 
@@ -20,7 +20,7 @@ Track your GitHub Copilot premium request usage with onWatch.
 2. Click **Generate new token** → **Generate new token (classic)**
 
 3. Configure the token:
-   - **Note**: `onwatch-copilot` (or any name you prefer)
+   - **Note**: `oneauthwatch-server-copilot` (or any name you prefer)
    - **Expiration**: Choose based on your preference (no expiration recommended for background tracking)
    - **Scopes**: Check only the `copilot` scope
 
@@ -32,12 +32,12 @@ Track your GitHub Copilot premium request usage with onWatch.
 
 ---
 
-## Step 2: Configure onWatch
+## Step 2: Configure OneAuthWatch
 
 Add the token to your `.env` file:
 
 ```bash
-cd ~/.onwatch  # or wherever your .env is located
+cd ~/.oneauthwatch  # or wherever your .env is located
 ```
 
 Edit `.env` and add:
@@ -54,17 +54,17 @@ export COPILOT_TOKEN=ghp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 
 ---
 
-## Step 3: Restart onWatch
+## Step 3: Restart OneAuthWatch
 
 ```bash
-onwatch stop
-onwatch
+oneauthwatch-server stop
+oneauthwatch-server
 ```
 
 Or in debug mode to verify:
 
 ```bash
-onwatch --debug
+oneauthwatch-server --debug
 ```
 
 You should see:
@@ -120,20 +120,20 @@ Should return JSON with `quota_snapshots`. If you get 401/403, regenerate the to
 
 - Ensure you have an active Copilot subscription
 - Check that the token hasn't expired
-- Look at logs: `tail -f ~/.onwatch/.onwatch.log`
+- Look at logs: `tail -f ~/.oneauthwatch/.oneauthwatch.log`
 
 ### Token security
 
 - The token is stored locally in your `.env` file
 - Never commit `.env` to version control
-- onWatch never sends your token anywhere except GitHub's API
+- OneAuthWatch never sends your token anywhere except GitHub's API
 - All data stays on your machine (SQLite database)
 
 ---
 
 ## API Details
 
-onWatch uses the same internal API that VS Code, JetBrains, Zed, and other editors use:
+OneAuthWatch uses the same internal API that VS Code, JetBrains, Zed, and other editors use:
 
 ```
 GET https://api.github.com/copilot_internal/user

@@ -2,22 +2,22 @@
 
 [English](./README.en.md) | [简体中文](./README.zh-CN.md)
 
-OneAuthWatch is a local-first workspace for managing auth, quotas, and sync across AI coding accounts.
+OneAuthWatch is a local-first auth, quota, and sync workspace for AI coding accounts.
 
-It combines three parts into one product:
-- a Windows desktop app for reading local auth and refreshing quotas
-- a Go server for storage, polling, and remote querying
-- a web dashboard for checking synced and server-refreshed account state
+It brings together:
+- a Windows desktop app for reading local auth state and refreshing quotas
+- a Go server for persistence, polling, and remote querying
+- a web dashboard for synced and server-refreshed account visibility
 
 ## Highlights
 
 - Supports Codex, Claude Code, and Gemini
-- Desktop can keep working independently without the server
-- Server can keep polling and building historical snapshots
-- Desktop can overwrite-sync the latest local state to the server
-- Web dashboard can be used as a remote viewing surface
+- Desktop remains usable without the server
+- Server keeps historical polling and refresh snapshots
+- Desktop can overwrite-sync the latest local state upstream
+- Web dashboard gives remote visibility into synced accounts
 
-## Architecture
+## Repository Layout
 
 - [`client/`](./client/)  
   React + Tauri desktop application
@@ -34,14 +34,14 @@ npm.cmd install
 npm.cmd run dev
 ```
 
-Build desktop installer:
+Desktop installer build:
 
 ```powershell
 Set-Location .\client
 npm.cmd run tauri build
 ```
 
-Run server locally:
+Local server run:
 
 ```powershell
 Set-Location .\server
@@ -49,7 +49,7 @@ go build -o .\oneauthwatch-server.exe .
 .\oneauthwatch-server.exe --debugstdout
 ```
 
-Run server with Docker:
+Docker server run:
 
 ```powershell
 Set-Location .\server
@@ -70,10 +70,9 @@ Default published image:
 
 ## Product Direction
 
-OneAuthWatch is designed around a simple split:
-- local desktop keeps the closest view of local auth state
-- server keeps historical refresh and remote access capability
-- web dashboard focuses on visibility rather than replacing the desktop
+- The desktop is the local operating surface.
+- The server adds history, remote query, and multi-environment visibility.
+- The web dashboard is intended as a companion view, not a replacement for the desktop client.
 
 ## References
 
@@ -81,4 +80,4 @@ During product exploration and technical comparison, this project referenced:
 - CodexAuthManager
 - onWatch
 
-OneAuthWatch is its own integrated product codebase and is not a direct mirror of those projects.
+OneAuthWatch is the product codebase built on its own architecture and workflow decisions.

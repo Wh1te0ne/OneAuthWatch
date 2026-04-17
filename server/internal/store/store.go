@@ -17,7 +17,7 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-// Store provides SQLite storage for onWatch
+// Store provides SQLite storage for OneAuthWatch
 type Store struct {
 	db *sql.DB
 }
@@ -117,7 +117,7 @@ func preflightDatabasePath(dbPath string) error {
 
 	hint := fmt.Sprintf("check write permissions for %s", dir)
 	if dir == "/data" || strings.HasPrefix(resolvedPath, "/data/") {
-		hint = "check ownership/permissions on ./onwatch-data (try: chown -R 65532:65532 ./onwatch-data) or use a named volume"
+		hint = "check ownership/permissions on ./oneauthwatch-data (try: chown -R 65532:65532 ./oneauthwatch-data) or use a named volume"
 	}
 
 	if info, statErr := os.Stat(resolvedPath); statErr == nil {
@@ -135,7 +135,7 @@ func preflightDatabasePath(dbPath string) error {
 		return fmt.Errorf("database path preflight failed (db=%s): %w", trimmed, statErr)
 	}
 
-	probe, err := os.CreateTemp(dir, ".onwatch-db-writecheck-*")
+	probe, err := os.CreateTemp(dir, ".oneauthwatch-db-writecheck-*")
 	if err != nil {
 		return fmt.Errorf("database path is not writable (db=%s, dir=%s): %w - %s", trimmed, dir, err, hint)
 	}

@@ -242,7 +242,7 @@ func TestClient_SetsUserAgent(t *testing.T) {
 	mu.Lock()
 	defer mu.Unlock()
 
-	expected := "onwatch/1.0"
+	expected := "oneauthwatch-server/1.0"
 	if userAgent != expected {
 		t.Errorf("User-Agent header = %q, want %q", userAgent, expected)
 	}

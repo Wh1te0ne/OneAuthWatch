@@ -1,4 +1,4 @@
-// Package testutil provides shared test infrastructure for onWatch.
+// Package testutil provides shared test infrastructure for OneAuthWatch.
 package testutil
 
 import (

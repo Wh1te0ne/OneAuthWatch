@@ -1,4 +1,4 @@
-"""Page object for the onWatch settings page."""
+"""Page object for the OneAuthWatch settings page."""
 from typing import Optional
 
 from playwright.sync_api import Page

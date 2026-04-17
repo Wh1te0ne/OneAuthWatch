@@ -1,4 +1,4 @@
-"""Page object for the onWatch dashboard page."""
+"""Page object for the OneAuthWatch dashboard page."""
 from playwright.sync_api import Page
 
 

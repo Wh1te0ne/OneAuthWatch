@@ -41,7 +41,7 @@ func newOneAuthWatchFixture(t *testing.T) *oneAuthWatchFixture {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	tr := tracker.NewCodexTracker(str, logger)
 	manager := NewCodexAgentManager(str, tr, time.Hour, logger)
-	manager.profilesDir = filepath.Join(home, ".onwatch", "codex-profiles")
+	manager.profilesDir = filepath.Join(home, ".oneauthwatch", "codex-profiles")
 	if err := os.MkdirAll(manager.profilesDir, 0o700); err != nil {
 		t.Fatalf("mkdir profiles dir: %v", err)
 	}

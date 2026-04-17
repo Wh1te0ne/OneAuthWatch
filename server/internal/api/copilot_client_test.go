@@ -42,8 +42,8 @@ func TestCopilotClient_FetchQuotas_Success(t *testing.T) {
 		if r.Header.Get("Accept") != "application/json" {
 			t.Errorf("Accept header = %q, want application/json", r.Header.Get("Accept"))
 		}
-		if r.Header.Get("User-Agent") != "onwatch/1.0" {
-			t.Errorf("User-Agent = %q, want onwatch/1.0", r.Header.Get("User-Agent"))
+		if r.Header.Get("User-Agent") != "oneauthwatch-server/1.0" {
+			t.Errorf("User-Agent = %q, want oneauthwatch-server/1.0", r.Header.Get("User-Agent"))
 		}
 
 		w.Header().Set("Content-Type", "application/json")

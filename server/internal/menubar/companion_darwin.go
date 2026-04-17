@@ -69,7 +69,7 @@ func (c *trayController) onReady() {
 		logger.Debug("Tray icon set from PNG")
 	}
 
-	systray.SetTooltip("onWatch menubar companion")
+	systray.SetTooltip("OneAuthWatch menubar companion")
 	systray.SetOnTapped(func() {
 		c.toggleMenubar()
 	})
@@ -80,7 +80,7 @@ func (c *trayController) onReady() {
 		c.popover = popover
 	}
 
-	dashboardItem := systray.AddMenuItem("Open Dashboard", "Open the local onWatch dashboard")
+	dashboardItem := systray.AddMenuItem("Open Dashboard", "Open the local OneAuthWatch dashboard")
 	systray.AddSeparator()
 	quitItem := systray.AddMenuItem("Quit Menubar", "Quit the menubar companion")
 
@@ -153,8 +153,8 @@ func (c *trayController) refreshLoop() {
 func (c *trayController) refreshStatus() {
 	logger := slog.Default()
 	if c == nil || c.cfg == nil || c.cfg.SnapshotProvider == nil {
-		systray.SetTitle("onWatch")
-		systray.SetTooltip("onWatch menubar companion")
+		systray.SetTitle("OneAuthWatch")
+		systray.SetTooltip("OneAuthWatch menubar companion")
 		return
 	}
 
@@ -162,12 +162,12 @@ func (c *trayController) refreshStatus() {
 	if err != nil {
 		logger.Error("failed to refresh menubar snapshot", "error", err)
 		systray.SetTitle("--")
-		systray.SetTooltip("onWatch menubar companion unavailable")
+		systray.SetTooltip("OneAuthWatch menubar companion unavailable")
 		return
 	}
 	if snapshot == nil {
 		systray.SetTitle("--")
-		systray.SetTooltip("onWatch menubar companion unavailable")
+		systray.SetTooltip("OneAuthWatch menubar companion unavailable")
 		return
 	}
 
@@ -230,14 +230,14 @@ func (c *trayController) fetchPreferences() (*Settings, error) {
 
 func trayTooltip(snapshot *Snapshot) string {
 	if snapshot == nil {
-		return "onWatch menubar companion"
+		return "OneAuthWatch menubar companion"
 	}
 	aggregate := snapshot.Aggregate
 	if aggregate.ProviderCount == 0 {
-		return "onWatch menubar companion: no provider data available"
+		return "OneAuthWatch menubar companion: no provider data available"
 	}
 	return fmt.Sprintf(
-		"onWatch menubar companion: %s across %d providers, updated %s",
+		"OneAuthWatch menubar companion: %s across %d providers, updated %s",
 		aggregate.Label,
 		aggregate.ProviderCount,
 		snapshot.UpdatedAgo,

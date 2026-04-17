@@ -399,7 +399,7 @@ func isPublicClientPath(path, basePath string) bool {
 
 // writeUnauthorized sends a 401 Unauthorized response.
 func writeUnauthorized(w http.ResponseWriter) {
-	w.Header().Set("WWW-Authenticate", `Basic realm="onWatch"`)
+	w.Header().Set("WWW-Authenticate", `Basic realm="OneAuthWatch"`)
 	w.WriteHeader(http.StatusUnauthorized)
 	http.Error(w, "Unauthorized", http.StatusUnauthorized)
 }

@@ -1,4 +1,4 @@
-// perf-monitor - RAM and performance monitoring tool for onWatch
+// perf-monitor - RAM and performance monitoring tool for OneAuthWatch
 // Usage: go run main.go [port] [duration]
 // Default: port=9211, duration=1m
 package main
@@ -68,7 +68,7 @@ var (
 
 func main() {
 	fmt.Println("╔════════════════════════════════════════════════════════════════╗")
-	fmt.Println("║         onWatch RAM & Performance Monitor                     ║")
+	fmt.Println("║         OneAuthWatch RAM & Performance Monitor                     ║")
 	fmt.Println("╚════════════════════════════════════════════════════════════════╝")
 	fmt.Println()
 
@@ -99,28 +99,28 @@ func main() {
 	if shouldRestart {
 		// Stop existing instance
 		fmt.Println("🔄 Restart mode enabled")
-		stoponWatch(port)
+		stopOneAuthWatch(port)
 		time.Sleep(500 * time.Millisecond)
 
 		// Start fresh instance
-		pid = startonWatch(port)
+		pid = startOneAuthWatch(port)
 		if pid == 0 {
-			fmt.Println("❌ Failed to start onWatch")
+			fmt.Println("❌ Failed to start OneAuthWatch")
 			os.Exit(1)
 		}
-		fmt.Printf("✓ Started fresh onWatch instance (PID: %d)\n\n", pid)
+		fmt.Printf("✓ Started fresh OneAuthWatch instance (PID: %d)\n\n", pid)
 	} else {
 		// Find existing process
-		pid = findonWatchProcess(port)
+		pid = findOneAuthWatchProcess(port)
 		if pid == 0 {
-			fmt.Printf("❌ onWatch process not found on port %d\n", port)
-			fmt.Println("\nMake sure onWatch is running first:")
-			fmt.Println("   ./onwatch --debug")
+			fmt.Printf("❌ OneAuthWatch process not found on port %d\n", port)
+			fmt.Println("\nMake sure OneAuthWatch is running first:")
+			fmt.Println("   ./oneauthwatch-server --debug")
 			fmt.Println("\nOr use --restart flag:")
 			fmt.Println("   go run main.go --restart")
 			os.Exit(1)
 		}
-		fmt.Printf("✓ Found onWatch process (PID: %d) on port %d\n", pid, port)
+		fmt.Printf("✓ Found OneAuthWatch process (PID: %d) on port %d\n", pid, port)
 	}
 
 	fmt.Printf("✓ Total monitoring duration: %s\n", duration)
@@ -222,11 +222,11 @@ func runMonitoring(pid, port int, totalDuration time.Duration) *Report {
 	return report
 }
 
-func findonWatchProcess(port int) int {
+func findOneAuthWatchProcess(port int) int {
 	// Try PID file
-	pidFile := filepath.Join(os.Getenv("HOME"), "Library", "Application Support", "onwatch", "onwatch.pid")
+	pidFile := filepath.Join(os.Getenv("HOME"), "Library", "Application Support", "oneauthwatch-server", "oneauthwatch-server.pid")
 	if runtime.GOOS != "darwin" {
-		pidFile = filepath.Join(os.Getenv("HOME"), ".local", "share", "onwatch", "onwatch.pid")
+		pidFile = filepath.Join(os.Getenv("HOME"), ".local", "share", "oneauthwatch-server", "oneauthwatch-server.pid")
 	}
 
 	if data, err := os.ReadFile(pidFile); err == nil {
@@ -243,7 +243,7 @@ func findonWatchProcess(port int) int {
 		if err == nil {
 			for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
 				if pid, err := strconv.Atoi(strings.TrimSpace(line)); err == nil && pid > 0 {
-					if isOnwatchProcess(pid) {
+					if isOneAuthWatchProcess(pid) {
 						return pid
 					}
 				}
@@ -263,19 +263,19 @@ func isProcessRunning(pid int) bool {
 	return proc.Signal(os.Signal(nil)) == nil
 }
 
-func isOnwatchProcess(pid int) bool {
+func isOneAuthWatchProcess(pid int) bool {
 	out, err := exec.Command("ps", "-p", strconv.Itoa(pid), "-o", "comm=").Output()
 	if err != nil {
 		return false
 	}
-	return strings.Contains(strings.ToLower(string(out)), "onwatch")
+	return strings.Contains(strings.ToLower(string(out)), "oneauthwatch-server")
 }
 
-func stoponWatch(port int) {
+func stopOneAuthWatch(port int) {
 	// Try PID file first
-	pidFile := filepath.Join(os.Getenv("HOME"), "Library", "Application Support", "onwatch", "onwatch.pid")
+	pidFile := filepath.Join(os.Getenv("HOME"), "Library", "Application Support", "oneauthwatch-server", "oneauthwatch-server.pid")
 	if runtime.GOOS != "darwin" {
-		pidFile = filepath.Join(os.Getenv("HOME"), ".local", "share", "onwatch", "onwatch.pid")
+		pidFile = filepath.Join(os.Getenv("HOME"), ".local", "share", "oneauthwatch-server", "oneauthwatch-server.pid")
 	}
 
 	if data, err := os.ReadFile(pidFile); err == nil {
@@ -295,7 +295,7 @@ func stoponWatch(port int) {
 		if err == nil {
 			for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
 				if pid, err := strconv.Atoi(strings.TrimSpace(line)); err == nil && pid > 0 {
-					if isOnwatchProcess(pid) {
+					if isOneAuthWatchProcess(pid) {
 						if proc, err := os.FindProcess(pid); err == nil {
 							proc.Signal(os.Interrupt)
 							fmt.Printf("   Stopped process (PID: %d) on port %d\n", pid, port)
@@ -307,13 +307,13 @@ func stoponWatch(port int) {
 	}
 }
 
-func startonWatch(port int) int {
-	// Find onwatch binary in various locations
+func startOneAuthWatch(port int) int {
+	// Find oneauthwatch-server binary in various locations
 	possiblePaths := []string{
-		"./onwatch",
-		"../onwatch",
-		"../../onwatch",
-		"/Users/prakersh/project./onwatch/onwatch",
+		"./oneauthwatch-server",
+		"../oneauthwatch-server",
+		"../../oneauthwatch-server",
+		"/Users/prakersh/project./oneauthwatch-server/oneauthwatch-server",
 	}
 
 	binaryPath := ""
@@ -326,37 +326,37 @@ func startonWatch(port int) int {
 
 	if binaryPath == "" {
 		// Try PATH
-		binaryPath = "onwatch"
+		binaryPath = "oneauthwatch-server"
 	}
 
 	// Change to the binary's directory so it can find .env and database
 	binaryDir := filepath.Dir(binaryPath)
 	if binaryDir != "." && binaryDir != "" {
 		os.Chdir(binaryDir)
-		binaryPath = "./onwatch"
+		binaryPath = "./oneauthwatch-server"
 	}
 
-	// Start onwatch in debug mode
+	// Start oneauthwatch-server in debug mode
 	cmd := exec.Command(binaryPath, "--debug", "--port", strconv.Itoa(port))
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	cmd.Env = os.Environ()
 
 	if err := cmd.Start(); err != nil {
-		fmt.Printf("   Error starting onWatch: %v\n", err)
+		fmt.Printf("   Error starting OneAuthWatch: %v\n", err)
 		return 0
 	}
 
 	pid := cmd.Process.Pid
 
 	// Wait for it to be ready
-	fmt.Println("   Waiting for onWatch to be ready...")
+	fmt.Println("   Waiting for OneAuthWatch to be ready...")
 	for i := 0; i < 30; i++ {
 		time.Sleep(200 * time.Millisecond)
 
 		// Check if process is still running
 		if !isProcessRunning(pid) {
-			fmt.Println("   ❌ onWatch process died during startup")
+			fmt.Println("   ❌ OneAuthWatch process died during startup")
 			return 0
 		}
 
@@ -367,7 +367,7 @@ func startonWatch(port int) int {
 		}
 	}
 
-	fmt.Println("   ⚠️  Timeout waiting for onWatch to start")
+	fmt.Println("   ⚠️  Timeout waiting for OneAuthWatch to start")
 	return 0
 }
 

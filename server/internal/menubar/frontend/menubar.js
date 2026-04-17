@@ -268,8 +268,8 @@
       <footer class="menubar-footer" id="footer">
         <div class="menubar-subtitle">Status is computed from the highest-pressure quota in each provider card.</div>
         <div class="footer-links">
-          <a href="https://github.com/onllm-dev/onwatch" data-external="true" data-url="https://github.com/onllm-dev/onwatch" aria-label="View on GitHub">${icons.github}</a>
-          <a href="https://github.com/onllm-dev/onwatch/issues" data-external="true" data-url="https://github.com/onllm-dev/onwatch/issues" aria-label="Get Support">${icons.support}</a>
+          <a href="https://github.com/Wh1te0ne/OneAuthWatch" data-external="true" data-url="https://github.com/Wh1te0ne/OneAuthWatch" aria-label="View on GitHub">${icons.github}</a>
+          <a href="https://github.com/Wh1te0ne/OneAuthWatch/issues" data-external="true" data-url="https://github.com/Wh1te0ne/OneAuthWatch/issues" aria-label="Get Support">${icons.support}</a>
           <a href="https://onllm.dev" data-external="true" data-url="https://onllm.dev" aria-label="Visit onllm.dev">${icons.globe}</a>
         </div>
       </footer>
@@ -294,7 +294,7 @@
       <section class="menubar-panel menubar-view menubar-view-${escapeHTML(view)}">
         <header class="menubar-header status-${status}">
           <div>
-            <div class="menubar-title">onWatch</div>
+            <div class="menubar-title">OneAuthWatch</div>
             <div class="menubar-subtitle">${escapeHTML(aggregateLabel(snapshot))}</div>
           </div>
           <div class="menubar-status-badge">
@@ -321,7 +321,7 @@
       <section class="menubar-panel menubar-error">
         <div>
           <div>Menubar data is temporarily unavailable.</div>
-          <div class="menubar-subtitle">${escapeHTML(error && error.message ? error.message : 'Unable to reach the local onWatch data source.')}</div>
+          <div class="menubar-subtitle">${escapeHTML(error && error.message ? error.message : 'Unable to reach the local OneAuthWatch data source.')}</div>
           <button type="button" id="menubar-retry">Retry</button>
         </div>
       </section>

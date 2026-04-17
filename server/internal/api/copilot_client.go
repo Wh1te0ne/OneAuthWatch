@@ -84,7 +84,7 @@ func (c *CopilotClient) FetchQuotas(ctx context.Context) (*CopilotUserResponse, 
 	// Set headers
 	req.Header.Set("Authorization", "Bearer "+c.token)
 	req.Header.Set("Accept", "application/json")
-	req.Header.Set("User-Agent", "onwatch/1.0")
+	req.Header.Set("User-Agent", "oneauthwatch/1.0")
 
 	// Log request (with redacted token)
 	c.logger.Debug("fetching Copilot quotas",

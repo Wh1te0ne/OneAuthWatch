@@ -159,7 +159,7 @@ func codexAuthPath() string {
 //   - Uses atomic write (temp file + rename) to prevent corruption
 //   - Preserves existing fields (OPENAI_API_KEY, account_id, etc.) from the original file
 //
-// Related: https://github.com/onllm-dev/onWatch/issues/30
+// Related: https://github.com/Wh1te0ne/OneAuthWatch/issues/30
 func WriteCodexCredentials(accessToken, refreshToken, idToken string, expiresIn int) error {
 	authPath := codexAuthPath()
 	if authPath == "" {

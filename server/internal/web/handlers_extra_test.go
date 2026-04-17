@@ -6802,7 +6802,7 @@ func TestHandler_LoginPost_SuccessWithRateLimiter(t *testing.T) {
 	cookies := rr.Result().Cookies()
 	var sessionCookie *http.Cookie
 	for _, c := range cookies {
-		if c.Name == "onwatch_session" {
+		if c.Name == "oneauthwatch_session" {
 			sessionCookie = c
 			break
 		}

@@ -55,7 +55,7 @@ func detectAnthropicCredentialsPlatform(logger *slog.Logger) *AnthropicCredentia
 //   - Uses atomic write (temp file + rename) to prevent corruption
 //   - Preserves existing fields (scopes, subscriptionType, etc.) from the original file
 //
-// Related: https://github.com/onllm-dev/onWatch/issues/16
+// Related: https://github.com/Wh1te0ne/OneAuthWatch/issues/16
 func WriteAnthropicCredentials(accessToken, refreshToken string, expiresIn int) error {
 	home, err := os.UserHomeDir()
 	if err != nil {

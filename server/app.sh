@@ -3,7 +3,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 VERSION=$(cat "$SCRIPT_DIR/VERSION")
-BINARY="onwatch"
+BINARY="oneauthwatch-server"
 DARWIN_FULL_TAGS="menubar,desktop,production"
 DARWIN_CGO_LDFLAGS="-framework UniformTypeIdentifiers -Wl,-no_warn_duplicate_libraries"
 
@@ -23,7 +23,7 @@ warn()    { echo -e "${YELLOW}${BOLD}==> $1${NC}"; }
 # --- Usage ---
 usage() {
     cat <<EOF
-${BOLD}onWatch v${VERSION} -- Project Management Script${NC}
+${BOLD}OneAuthWatch v${VERSION} -- Project Management Script${NC}
 
 ${CYAN}USAGE:${NC}
     ./app.sh [FLAGS...]
@@ -176,7 +176,7 @@ do_clean() {
 }
 
 do_build() {
-    info "Building onWatch v${VERSION}..."
+    info "Building OneAuthWatch v${VERSION}..."
     build_native_binary "$SCRIPT_DIR/$BINARY"
     success "Built ./$BINARY ($(du -h "$BINARY" | cut -f1 | xargs))"
 }
@@ -207,7 +207,7 @@ build_darwin() {
 
     mkdir -p "$SCRIPT_DIR/dist"
     for arch in arm64 amd64; do
-        local output="dist/onwatch-darwin-${arch}"
+        local output="dist/oneauthwatch-server-darwin-${arch}"
         info "Building ${output}..."
         CGO_ENABLED=1 CGO_LDFLAGS="$DARWIN_CGO_LDFLAGS" GOOS=darwin GOARCH="$arch" go build \
             -tags "$DARWIN_FULL_TAGS" \
@@ -247,7 +247,7 @@ do_release() {
     go test -race -cover -count=1 ./...
     success "Tests passed."
 
-    info "Building release artifacts for onWatch v${VERSION}..."
+    info "Building release artifacts for OneAuthWatch v${VERSION}..."
     mkdir -p "$SCRIPT_DIR/dist"
 
     if [[ "$(uname)" == "Darwin" ]]; then
@@ -264,7 +264,7 @@ do_release() {
 
     for target in "${targets[@]}"; do
         IFS=':' read -r os arch ext <<< "$target"
-        local output="dist/onwatch-${os}-${arch}${ext}"
+        local output="dist/oneauthwatch-server-${os}-${arch}${ext}"
         info "  Building ${output}..."
         CGO_ENABLED=0 GOOS="$os" GOARCH="$arch" go build \
             -ldflags="-s -w -X main.version=$VERSION" \
@@ -276,14 +276,14 @@ do_release() {
 }
 
 do_run() {
-    info "Building and running onWatch v${VERSION} in debug mode..."
+    info "Building and running OneAuthWatch v${VERSION} in debug mode..."
     do_build
-    info "Starting ./onwatch --debug"
+    info "Starting ./oneauthwatch-server --debug"
     exec "$SCRIPT_DIR/$BINARY" --debug
 }
 
 do_stop() {
-    info "Stopping onWatch..."
+    info "Stopping OneAuthWatch..."
     if [[ -f "$SCRIPT_DIR/$BINARY" ]]; then
         "$SCRIPT_DIR/$BINARY" stop && success "Stopped." || warn "No running instance found."
     else
@@ -306,28 +306,28 @@ docker_ensure() {
 
 do_docker_build() {
     docker_ensure
-    info "Building Docker image onwatch:${VERSION}..."
-    docker build -t onwatch:latest \
+    info "Building Docker image oneauthwatch-server:${VERSION}..."
+    docker build -t oneauthwatch-server:latest \
         --build-arg VERSION="$VERSION" \
         --build-arg BUILD_TIME="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
         "$SCRIPT_DIR"
     local size
-    size=$(docker image ls onwatch:latest --format '{{.Size}}')
-    success "Docker image built: onwatch:latest ($size)"
+    size=$(docker image ls oneauthwatch-server:latest --format '{{.Size}}')
+    success "Docker image built: oneauthwatch-server:latest ($size)"
 }
 
 do_docker_run() {
     docker_ensure
     # Build if image doesn't exist
-    if ! docker image inspect onwatch:latest &>/dev/null; then
+    if ! docker image inspect oneauthwatch-server:latest &>/dev/null; then
         do_docker_build
     fi
 
     # Stop existing container if running
-    docker rm -f onwatch 2>/dev/null || true
+    docker rm -f oneauthwatch-server 2>/dev/null || true
 
     # Create data dir
-    mkdir -p "$SCRIPT_DIR/onwatch-data"
+    mkdir -p "$SCRIPT_DIR/oneauthwatch-data"
 
     # Build env-file arg
     local env_args=()
@@ -337,36 +337,36 @@ do_docker_run() {
         warn "No .env file found. Create one from .env.docker.example"
     fi
 
-    info "Starting onWatch container..."
-    docker run -d --name onwatch \
+    info "Starting OneAuthWatch container..."
+    docker run -d --name oneauthwatch-server \
         -p "${ONEAUTHWATCH_PORT:-9211}:9211" \
-        -v "$SCRIPT_DIR/onwatch-data:/data" \
+        -v "$SCRIPT_DIR/oneauthwatch-data:/data" \
         "${env_args[@]}" \
         --restart unless-stopped \
         --memory 64m \
-        onwatch:latest
+        oneauthwatch-server:latest
 
     success "Container started. Dashboard: http://localhost:${ONEAUTHWATCH_PORT:-9211}"
-    info "  Logs:  docker logs -f onwatch"
+    info "  Logs:  docker logs -f oneauthwatch-server"
     info "  Stop:  ./app.sh --docker --stop"
 }
 
 do_docker_stop() {
     docker_ensure
-    info "Stopping onWatch container..."
-    if docker stop onwatch 2>/dev/null; then
-        docker rm onwatch 2>/dev/null || true
+    info "Stopping OneAuthWatch container..."
+    if docker stop oneauthwatch-server 2>/dev/null; then
+        docker rm oneauthwatch-server 2>/dev/null || true
         success "Container stopped and removed."
     else
-        warn "No running container named 'onwatch' found."
+        warn "No running container named 'oneauthwatch-server' found."
     fi
 }
 
 do_docker_clean() {
     docker_ensure
     info "Cleaning Docker resources..."
-    docker rm -f onwatch 2>/dev/null && info "  Removed container: onwatch" || true
-    docker rmi onwatch:latest 2>/dev/null && info "  Removed image: onwatch:latest" || true
+    docker rm -f oneauthwatch-server 2>/dev/null && info "  Removed container: oneauthwatch-server" || true
+    docker rmi oneauthwatch-server:latest 2>/dev/null && info "  Removed image: oneauthwatch-server:latest" || true
     success "Docker clean complete."
 }
 

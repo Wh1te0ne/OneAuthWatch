@@ -62,10 +62,10 @@ class TestDashboard:
         assert updated_text != ""
 
     def test_version_in_footer(self, dashboard_page: Page) -> None:
-        """Dashboard footer should display the onWatch version."""
+        """Dashboard footer should display the OneAuthWatch version."""
         dash = DashboardPage(dashboard_page)
         version_text = dash.get_version_text()
-        assert "onWatch" in version_text
+        assert "OneAuthWatch" in version_text
         assert re.search(r"v[\d.]+", version_text) or "dev" in version_text.lower()
 
     def test_settings_link_present(self, dashboard_page: Page) -> None:

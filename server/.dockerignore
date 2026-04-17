@@ -19,8 +19,8 @@
 # Build artifacts
 dist/
 bin/
-onwatch
-onwatch.exe
+oneauthwatch-server
+oneauthwatch-server.exe
 
 # Screenshots, design, and docs (embedded assets are in internal/)
 docs/screenshots/

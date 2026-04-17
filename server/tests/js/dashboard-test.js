@@ -2,7 +2,7 @@ const { chromium } = require('playwright');
 const path = require('path');
 const fs = require('fs');
 
-async function testOnWatchDashboard() {
+async function testOneAuthWatchDashboard() {
   const results = {
     timestamp: new Date().toISOString(),
     tests: [],
@@ -19,7 +19,7 @@ async function testOnWatchDashboard() {
       fs.mkdirSync(screenshotsDir, { recursive: true });
     }
 
-    console.log('🧪 Starting onWatch Dashboard Tests...\n');
+    console.log('🧪 Starting OneAuthWatch Dashboard Tests...\n');
 
     // Launch browser
     browser = await chromium.launch({ 
@@ -95,15 +95,15 @@ async function testOnWatchDashboard() {
     
     // Check if dashboard content is visible
     const dashboardContent = await page.content();
-    const hasOnWatchTitle = dashboardContent.includes('onWatch') || dashboardContent.toLowerCase().includes('onwatch');
+    const hasOneAuthWatchTitle = dashboardContent.includes('OneAuthWatch') || dashboardContent.toLowerCase().includes('oneauthwatch-server');
 
     results.tests.push({
       name: 'Dashboard Authentication',
-      status: hasOnWatchTitle ? 'PASS' : 'FAIL',
-      details: { hasDashboardTitle: hasOnWatchTitle }
+      status: hasOneAuthWatchTitle ? 'PASS' : 'FAIL',
+      details: { hasDashboardTitle: hasOneAuthWatchTitle }
     });
 
-    console.log(`📊 Dashboard loaded: ${hasOnWatchTitle}`);
+    console.log(`📊 Dashboard loaded: ${hasOneAuthWatchTitle}`);
 
     // Test 3: Check Dashboard Elements
     console.log('\n=== Test 3: Dashboard Elements ===');
@@ -331,4 +331,4 @@ async function testOnWatchDashboard() {
 }
 
 // Run tests
-testOnWatchDashboard().catch(console.error);
+testOneAuthWatchDashboard().catch(console.error);

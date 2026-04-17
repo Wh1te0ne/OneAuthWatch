@@ -1,4 +1,4 @@
-// Package agent provides the background polling agent for onWatch.
+// Package agent provides the background polling agent for OneAuthWatch.
 package agent
 
 import (
@@ -30,8 +30,8 @@ const maxAuthFailures = 3
 const maxRateLimitFailures = 5
 
 // IsClaudeCodeRunning checks if Claude Code is currently executing.
-// When Claude Code is running, onWatch skips proactive OAuth refresh to avoid
-// competing for the same refresh token - a refresh by onWatch invalidates
+// When Claude Code is running, OneAuthWatch skips proactive OAuth refresh to avoid
+// competing for the same refresh token - a refresh by OneAuthWatch invalidates
 // Claude Code's pending refresh, causing it to get invalid_grant and re-auth.
 // Exported as a package-level variable so tests can override it.
 //
@@ -244,11 +244,11 @@ func rateLimitBackoff(failCount int) time.Duration {
 // proactiveRefresh attempts to refresh the OAuth token before it expires.
 // Respects rate limit backoff to avoid burning refresh tokens.
 // Skips proactive refresh if Claude Code is running to avoid competing for the
-// same refresh token (onWatch refreshes would invalidate Claude Code's pending
+// same refresh token (OneAuthWatch refreshes would invalidate Claude Code's pending
 // refresh and cause re-authentication).
 func (a *AnthropicAgent) proactiveRefresh(ctx context.Context, creds *api.AnthropicCredentials) {
 	// Skip if Claude Code is running - avoid competing for the same refresh token.
-	// onWatch refreshing burns Claude Code's scheduled refresh, causing invalid_grant.
+	// OneAuthWatch refreshing burns Claude Code's scheduled refresh, causing invalid_grant.
 	checkFn := IsClaudeCodeRunning // package-level default
 	if a.isClaudeCodeRunning != nil {
 		checkFn = a.isClaudeCodeRunning

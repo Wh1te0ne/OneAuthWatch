@@ -9,7 +9,7 @@ self.addEventListener('push', function(event) {
       body: data.body,
       icon: '/static/favicon.svg',
       badge: '/static/favicon.svg',
-      tag: 'onwatch-alert',
+      tag: 'oneauthwatch-server-alert',
       renotify: true
     })
   );

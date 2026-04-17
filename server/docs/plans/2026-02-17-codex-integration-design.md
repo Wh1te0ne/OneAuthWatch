@@ -1,10 +1,10 @@
-# Codex OAuth Integration Design (onWatch)
+# Codex OAuth Integration Design (OneAuthWatch)
 
 ## Status
 Approved in discussion.
 
 ## Objective
-Add Codex usage tracking to onWatch with a provider experience that is uniform with existing Anthropic and Copilot integrations.
+Add Codex usage tracking to OneAuthWatch with a provider experience that is uniform with existing Anthropic and Copilot integrations.
 
 ## Final Decisions
 1. **V1 source mode**: OAuth only.
@@ -44,9 +44,9 @@ Add Codex usage tracking to onWatch with a provider experience that is uniform w
 ### Usage endpoint
 - Fetch usage with Bearer auth using Codex OAuth usage endpoint behavior equivalent to CodexBar.
 - Use deterministic endpoint fallback on 404 between `/backend-api/wham/usage` and `/api/codex/usage`.
-- Normalize into onWatch internal snapshot model before storage.
+- Normalize into OneAuthWatch internal snapshot model before storage.
 
-## Canonical Codex Quota Mapping (onWatch)
+## Canonical Codex Quota Mapping (OneAuthWatch)
 - `five_hour` <- OAuth `rate_limit.primary_window`
 - `seven_day` <- OAuth `rate_limit.secondary_window` (when present)
 
@@ -59,7 +59,7 @@ Optional metadata (not required for cards):
 - `plan_type`
 - `credits.balance`
 
-## onWatch Integration Architecture
+## OneAuthWatch Integration Architecture
 
 ### Config layer
 - Extend provider availability logic to include `codex`.

@@ -1,6 +1,6 @@
-"""Pytest configuration and fixtures for onWatch E2E tests.
+"""Pytest configuration and fixtures for OneAuthWatch E2E tests.
 
-Session-scoped fixtures build and start the mock server and onwatch binary,
+Session-scoped fixtures build and start the mock server and oneauthwatch-server binary,
 then tear them down after all tests complete.
 """
 import os
@@ -15,9 +15,9 @@ import urllib.request
 import urllib.error
 
 # Ports
-ONWATCH_PORT = 19211
+ONEAUTHWATCH_PORT = 19211
 MOCK_PORT = 19212
-BASE_URL = f"http://localhost:{ONWATCH_PORT}"
+BASE_URL = f"http://localhost:{ONEAUTHWATCH_PORT}"
 MOCK_URL = f"http://localhost:{MOCK_PORT}"
 
 # Credentials
@@ -27,12 +27,12 @@ PASSWORD = "testpass123"
 # Paths
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 MOCK_BINARY = "/tmp/mockserver-test"
-ONWATCH_BINARY = "/tmp/onwatch-test"
-# E2E isolation: override HOME so the canonical DB path (~/.onwatch/data/onwatch.db)
+ONEAUTHWATCH_BINARY = "/tmp/oneauthwatch-server-test"
+# E2E isolation: override HOME so the canonical DB path (~/.oneauthwatch/data/oneauthwatch.db)
 # does not exist. This prevents main.go's fixExplicitDBPath() from redirecting to
 # the production database.
-E2E_HOME = "/tmp/onwatch-e2e-home"
-DB_PATH = "/tmp/onwatch-e2e.db"
+E2E_HOME = "/tmp/oneauthwatch-server-e2e-home"
+DB_PATH = "/tmp/oneauthwatch-server-e2e.db"
 
 
 def _wait_for_http(url: str, timeout: float = 30.0, interval: float = 0.5) -> bool:
@@ -102,8 +102,8 @@ def mock_server() -> Generator[subprocess.Popen, None, None]:
 
 
 @pytest.fixture(scope="session")
-def onwatch_server(mock_server: subprocess.Popen) -> Generator[subprocess.Popen, None, None]:
-    """Build and start the onwatch binary."""
+def oneauthwatch_server(mock_server: subprocess.Popen) -> Generator[subprocess.Popen, None, None]:
+    """Build and start the oneauthwatch-server binary."""
     # Clean up any stale DB and home directory
     import shutil
     for path in [DB_PATH, f"{DB_PATH}-journal", f"{DB_PATH}-wal", f"{DB_PATH}-shm"]:
@@ -115,12 +115,12 @@ def onwatch_server(mock_server: subprocess.Popen) -> Generator[subprocess.Popen,
         shutil.rmtree(E2E_HOME)
     os.makedirs(E2E_HOME, exist_ok=True)
 
-    # Build onwatch
+    # Build oneauthwatch-server
     build_cmd = ["go", "build"]
-    build_tags = os.environ.get("ONWATCH_E2E_GO_BUILD_TAGS", "").strip()
+    build_tags = os.environ.get("ONEAUTHWATCH_E2E_GO_BUILD_TAGS", "").strip()
     if build_tags:
         build_cmd.extend(["-tags", build_tags])
-    build_cmd.extend(["-o", ONWATCH_BINARY, "."])
+    build_cmd.extend(["-o", ONEAUTHWATCH_BINARY, "."])
 
     result = subprocess.run(
         build_cmd,
@@ -129,13 +129,13 @@ def onwatch_server(mock_server: subprocess.Popen) -> Generator[subprocess.Popen,
         text=True,
         timeout=120,
     )
-    assert result.returncode == 0, f"onWatch build failed: {result.stderr}"
+    assert result.returncode == 0, f"OneAuthWatch build failed: {result.stderr}"
 
     env = os.environ.copy()
     env.update({
         "HOME": E2E_HOME,
-        "ONWATCH_ADMIN_PASS": PASSWORD,
-        "ONWATCH_TEST_MODE": "1",
+        "ONEAUTHWATCH_ADMIN_PASS": PASSWORD,
+        "ONEAUTHWATCH_TEST_MODE": "1",
         "SYNTHETIC_API_KEY": "syn_test_e2e_key",
         "ZAI_API_KEY": "zai_test_e2e_key",
         "ZAI_BASE_URL": f"http://localhost:{MOCK_PORT}",
@@ -144,9 +144,9 @@ def onwatch_server(mock_server: subprocess.Popen) -> Generator[subprocess.Popen,
 
     proc = subprocess.Popen(
         [
-            ONWATCH_BINARY,
+            ONEAUTHWATCH_BINARY,
             "--debug",
-            f"--port={ONWATCH_PORT}",
+            f"--port={ONEAUTHWATCH_PORT}",
             "--interval=10",
             "--test",
             f"--db={DB_PATH}",
@@ -156,16 +156,16 @@ def onwatch_server(mock_server: subprocess.Popen) -> Generator[subprocess.Popen,
         stderr=subprocess.PIPE,
     )
 
-    # Wait for onwatch to be ready (login page returns 200)
+    # Wait for oneauthwatch-server to be ready (login page returns 200)
     ready = _wait_for_http(f"{BASE_URL}/login", timeout=30)
-    assert ready, "onWatch server did not start in time"
+    assert ready, "OneAuthWatch server did not start in time"
 
     yield proc
 
     _kill_process(proc)
     # Clean up
     try:
-        os.unlink(ONWATCH_BINARY)
+        os.unlink(ONEAUTHWATCH_BINARY)
     except OSError:
         pass
     for path in [DB_PATH, f"{DB_PATH}-journal", f"{DB_PATH}-wal", f"{DB_PATH}-shm"]:
@@ -179,7 +179,7 @@ def onwatch_server(mock_server: subprocess.Popen) -> Generator[subprocess.Popen,
 
 
 @pytest.fixture(autouse=True, scope="session")
-def servers(mock_server: subprocess.Popen, onwatch_server: subprocess.Popen) -> Generator[None, None, None]:
+def servers(mock_server: subprocess.Popen, oneauthwatch_server: subprocess.Popen) -> Generator[None, None, None]:
     """Ensure both servers are running for all tests."""
     yield
 

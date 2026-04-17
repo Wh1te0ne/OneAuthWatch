@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 )
@@ -235,8 +236,174 @@ type GeminiClientCredentials struct {
 	ClientSecret string
 }
 
+func detectGeminiClientCredentialsFromCLI() *GeminiClientCredentials {
+	for _, bundleDir := range geminiCLIBundleDirs() {
+		creds := detectGeminiClientCredentialsFromBundle(bundleDir)
+		if creds != nil {
+			return creds
+		}
+	}
+
+	return nil
+}
+
+func geminiCLIBundleDirs() []string {
+	seen := make(map[string]struct{})
+	var dirs []string
+	add := func(path string) {
+		path = strings.TrimSpace(path)
+		if path == "" {
+			return
+		}
+		path = filepath.Clean(path)
+		if _, ok := seen[path]; ok {
+			return
+		}
+		if info, err := os.Stat(path); err == nil && info.IsDir() {
+			seen[path] = struct{}{}
+			dirs = append(dirs, path)
+		}
+	}
+
+	if appData := strings.TrimSpace(os.Getenv("APPDATA")); appData != "" {
+		add(filepath.Join(appData, "npm", "node_modules", "@google", "gemini-cli", "bundle"))
+	}
+	if home, err := os.UserHomeDir(); err == nil && home != "" {
+		add(filepath.Join(home, ".npm-global", "lib", "node_modules", "@google", "gemini-cli", "bundle"))
+		add(filepath.Join(home, ".local", "share", "pnpm", "global", "5", "node_modules", "@google", "gemini-cli", "bundle"))
+	}
+	if runtime.GOOS != "windows" {
+		add("/usr/local/lib/node_modules/@google/gemini-cli/bundle")
+		add("/opt/homebrew/lib/node_modules/@google/gemini-cli/bundle")
+		add("/usr/lib/node_modules/@google/gemini-cli/bundle")
+	}
+
+	for _, pathDir := range filepath.SplitList(os.Getenv("PATH")) {
+		pathDir = strings.TrimSpace(pathDir)
+		if pathDir == "" {
+			continue
+		}
+		for _, name := range geminiExecutableNames() {
+			shimPath := filepath.Join(pathDir, name)
+			bundleDir := detectGeminiBundleDirFromShim(shimPath)
+			if bundleDir != "" {
+				add(bundleDir)
+			}
+		}
+	}
+
+	return dirs
+}
+
+func geminiExecutableNames() []string {
+	if runtime.GOOS == "windows" {
+		return []string{"gemini.cmd", "gemini.ps1", "gemini"}
+	}
+	return []string{"gemini"}
+}
+
+func detectGeminiBundleDirFromShim(shimPath string) string {
+	content, err := os.ReadFile(shimPath)
+	if err != nil {
+		return ""
+	}
+
+	text := string(content)
+	if !strings.Contains(text, "@google") || !strings.Contains(text, "gemini-cli") {
+		return ""
+	}
+
+	parent := filepath.Dir(shimPath)
+	bundleDir := filepath.Join(parent, "node_modules", "@google", "gemini-cli", "bundle")
+	if info, err := os.Stat(bundleDir); err == nil && info.IsDir() {
+		return bundleDir
+	}
+
+	return ""
+}
+
+func detectGeminiClientCredentialsFromBundle(bundleDir string) *GeminiClientCredentials {
+	entries, err := os.ReadDir(bundleDir)
+	if err != nil {
+		return nil
+	}
+
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		name := entry.Name()
+		if !strings.HasPrefix(name, "oauth2-provider-") || !strings.HasSuffix(name, ".js") {
+			continue
+		}
+		content, err := os.ReadFile(filepath.Join(bundleDir, name))
+		if err != nil {
+			continue
+		}
+		clientID := extractGeminiGoogleClientID(string(content))
+		clientSecret := extractGeminiGoogleClientSecret(string(content))
+		if clientID != "" && clientSecret != "" {
+			return &GeminiClientCredentials{
+				ClientID:     clientID,
+				ClientSecret: clientSecret,
+			}
+		}
+	}
+
+	return nil
+}
+
+func extractGeminiGoogleClientID(text string) string {
+	const suffix = ".apps.googleusercontent.com"
+
+	idx := strings.Index(text, suffix)
+	for idx >= 0 {
+		start := idx
+		for start > 0 {
+			ch := text[start-1]
+			if (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || ch == '-' || ch == '_' || ch == '.' {
+				start--
+				continue
+			}
+			break
+		}
+		candidate := strings.TrimSpace(text[start : idx+len(suffix)])
+		if strings.Count(candidate, ".apps.googleusercontent.com") == 1 && strings.Contains(candidate, "-") {
+			return candidate
+		}
+		next := strings.Index(text[idx+len(suffix):], suffix)
+		if next < 0 {
+			break
+		}
+		idx += len(suffix) + next
+	}
+
+	return ""
+}
+
+func extractGeminiGoogleClientSecret(text string) string {
+	const prefix = "GOCSPX-"
+
+	idx := strings.Index(text, prefix)
+	if idx < 0 {
+		return ""
+	}
+
+	end := idx + len(prefix)
+	for end < len(text) {
+		ch := text[end]
+		if (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || ch == '-' || ch == '_' {
+			end++
+			continue
+		}
+		break
+	}
+
+	return strings.TrimSpace(text[idx:end])
+}
+
 // DetectGeminiClientCredentials returns client credentials for OAuth refresh.
-// Priority: OneAuthWatch env vars > legacy env vars.
+// Priority: OneAuthWatch env vars > legacy env vars > installed Gemini CLI bundle.
 func DetectGeminiClientCredentials() *GeminiClientCredentials {
 	clientID := strings.TrimSpace(os.Getenv("ONEAUTHWATCH_GEMINI_CLIENT_ID"))
 	if clientID == "" {
@@ -248,7 +415,7 @@ func DetectGeminiClientCredentials() *GeminiClientCredentials {
 	}
 
 	if clientID == "" || clientSecret == "" {
-		return nil
+		return detectGeminiClientCredentialsFromCLI()
 	}
 
 	return &GeminiClientCredentials{

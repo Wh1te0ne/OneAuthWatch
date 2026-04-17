@@ -161,13 +161,13 @@ func TestConfig_DefaultValues(t *testing.T) {
 	// Default DB path depends on HOME availability
 	home, homeErr := os.UserHomeDir()
 	if homeErr == nil && home != "" {
-		expectedDBPath := filepath.Join(home, ".onwatch", "data", "onwatch.db")
+		expectedDBPath := filepath.Join(home, ".oneauthwatch", "data", "oneauthwatch.db")
 		if cfg.DBPath != expectedDBPath {
 			t.Errorf("DBPath = %q, want %q", cfg.DBPath, expectedDBPath)
 		}
 	} else {
-		if cfg.DBPath != "./onwatch.db" {
-			t.Errorf("DBPath = %q, want %q (HOME unavailable fallback)", cfg.DBPath, "./onwatch.db")
+		if cfg.DBPath != "./oneauthwatch.db" {
+			t.Errorf("DBPath = %q, want %q (HOME unavailable fallback)", cfg.DBPath, "./oneauthwatch.db")
 		}
 	}
 	if cfg.LogLevel != "info" {
@@ -513,7 +513,7 @@ func TestConfig_LogWriter(t *testing.T) {
 	tmpDir := t.TempDir()
 	cfg = &Config{
 		DebugMode: true,
-		DBPath:    filepath.Join(tmpDir, "onwatch.db"),
+		DBPath:    filepath.Join(tmpDir, "oneauthwatch.db"),
 	}
 	writer, err = cfg.LogWriter()
 	if err != nil {
@@ -529,7 +529,7 @@ func TestConfig_LogWriter(t *testing.T) {
 	// Background mode: should return log file
 	cfg = &Config{
 		DebugMode: false,
-		DBPath:    filepath.Join(tmpDir, "onwatch.db"),
+		DBPath:    filepath.Join(tmpDir, "oneauthwatch.db"),
 	}
 	writer, err = cfg.LogWriter()
 	if err != nil {
@@ -650,8 +650,8 @@ func TestOpenRotatingLogFile_DoesNotRotateBelowSizeLimit(t *testing.T) {
 
 func TestConfig_LogWriter_RotatesFileWhenAtLimit(t *testing.T) {
 	tmpDir := t.TempDir()
-	dbPath := filepath.Join(tmpDir, "onwatch.db")
-	logPath := filepath.Join(tmpDir, ".onwatch.log")
+	dbPath := filepath.Join(tmpDir, "oneauthwatch.db")
+	logPath := filepath.Join(tmpDir, ".oneauthwatch.log")
 
 	f, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
 	if err != nil {
@@ -1049,7 +1049,7 @@ func TestConfig_LogWriter_TestMode(t *testing.T) {
 		t.Error("TestMode background should not return os.Stdout")
 	}
 	// Verify the test log file was created
-	logPath := filepath.Join(tmpDir, ".onwatch-test.log")
+	logPath := filepath.Join(tmpDir, ".oneauthwatch-test.log")
 	if _, err := os.Stat(logPath); os.IsNotExist(err) {
 		t.Errorf("Expected log file at %s", logPath)
 	}
@@ -1160,7 +1160,7 @@ func TestConfig_IsDefaultPassword(t *testing.T) {
 	}
 }
 
-func TestIsOnwatchEnvFile_WithOnwatchKeys(t *testing.T) {
+func TestIsAppEnvFile_WithAppKeys(t *testing.T) {
 	tmpDir := t.TempDir()
 
 	tests := []struct {
@@ -1194,7 +1194,7 @@ func TestIsOnwatchEnvFile_WithOnwatchKeys(t *testing.T) {
 			want:    true,
 		},
 		{
-			name:    "generic env file without onwatch keys",
+			name:    "generic env file without oneauthwatch-server keys",
 			content: "DATABASE_URL=postgres://localhost\nREDIS_URL=redis://localhost\n",
 			want:    false,
 		},
@@ -1216,18 +1216,18 @@ func TestIsOnwatchEnvFile_WithOnwatchKeys(t *testing.T) {
 			if err := os.WriteFile(envPath, []byte(tt.content), 0644); err != nil {
 				t.Fatalf("Failed to write test file: %v", err)
 			}
-			got := isOnwatchEnvFile(envPath)
+			got := isAppEnvFile(envPath)
 			if got != tt.want {
-				t.Errorf("isOnwatchEnvFile() = %v, want %v for content: %q", got, tt.want, tt.content)
+				t.Errorf("isAppEnvFile() = %v, want %v for content: %q", got, tt.want, tt.content)
 			}
 		})
 	}
 }
 
-func TestIsOnwatchEnvFile_NonexistentFile(t *testing.T) {
-	got := isOnwatchEnvFile("/nonexistent/path/.env")
+func TestIsAppEnvFile_NonexistentFile(t *testing.T) {
+	got := isAppEnvFile("/nonexistent/path/.env")
 	if got {
-		t.Error("isOnwatchEnvFile() should return false for nonexistent file")
+		t.Error("isAppEnvFile() should return false for nonexistent file")
 	}
 }
 
@@ -1240,12 +1240,12 @@ func TestLoadEnvFile_PrefersStandardLocation(t *testing.T) {
 	tmpDir := t.TempDir()
 	os.Setenv("HOME", tmpDir)
 
-	// Create ~/.onwatch/.env
-	onwatchDir := filepath.Join(tmpDir, ".onwatch")
-	if err := os.MkdirAll(onwatchDir, 0755); err != nil {
-		t.Fatalf("Failed to create .onwatch dir: %v", err)
+	// Create ~/.oneauthwatch/.env
+	oneAuthWatchDir := filepath.Join(tmpDir, ".oneauthwatch")
+	if err := os.MkdirAll(oneAuthWatchDir, 0755); err != nil {
+		t.Fatalf("Failed to create .oneauthwatch dir: %v", err)
 	}
-	standardEnv := filepath.Join(onwatchDir, ".env")
+	standardEnv := filepath.Join(oneAuthWatchDir, ".env")
 	envContent := "SYNTHETIC_API_KEY=syn_from_standard_location\nONEAUTHWATCH_PORT=9999\n"
 	if err := os.WriteFile(standardEnv, []byte(envContent), 0644); err != nil {
 		t.Fatalf("Failed to write standard .env: %v", err)
@@ -1265,7 +1265,7 @@ func TestLoadEnvFile_PrefersStandardLocation(t *testing.T) {
 	}
 }
 
-func TestLoadEnvFile_FallsBackToLocalOnwatchEnv(t *testing.T) {
+func TestLoadEnvFile_FallsBackToLocalAppEnv(t *testing.T) {
 	// Save original HOME and cwd
 	origHome := os.Getenv("HOME")
 	origDir, _ := os.Getwd()
@@ -1274,11 +1274,11 @@ func TestLoadEnvFile_FallsBackToLocalOnwatchEnv(t *testing.T) {
 		os.Chdir(origDir)
 	}()
 
-	// Create temp directory with NO ~/.onwatch/.env
+	// Create temp directory with NO ~/.oneauthwatch/.env
 	tmpDir := t.TempDir()
 	os.Setenv("HOME", tmpDir)
 
-	// Create local .env with onwatch-specific keys
+	// Create local .env with oneauthwatch-server-specific keys
 	localDir := filepath.Join(tmpDir, "project")
 	if err := os.MkdirAll(localDir, 0755); err != nil {
 		t.Fatalf("Failed to create project dir: %v", err)
@@ -1305,7 +1305,7 @@ func TestLoadEnvFile_FallsBackToLocalOnwatchEnv(t *testing.T) {
 	}
 }
 
-func TestLoadEnvFile_IgnoresNonOnwatchLocalEnv(t *testing.T) {
+func TestLoadEnvFile_IgnoresNonAppLocalEnv(t *testing.T) {
 	// Save original HOME and cwd
 	origHome := os.Getenv("HOME")
 	origDir, _ := os.Getwd()
@@ -1314,17 +1314,17 @@ func TestLoadEnvFile_IgnoresNonOnwatchLocalEnv(t *testing.T) {
 		os.Chdir(origDir)
 	}()
 
-	// Create temp directory with NO ~/.onwatch/.env
+	// Create temp directory with NO ~/.oneauthwatch/.env
 	tmpDir := t.TempDir()
 	os.Setenv("HOME", tmpDir)
 
-	// Create local .env WITHOUT onwatch-specific keys (generic env file)
+	// Create local .env WITHOUT oneauthwatch-server-specific keys (generic env file)
 	localDir := filepath.Join(tmpDir, "project")
 	if err := os.MkdirAll(localDir, 0755); err != nil {
 		t.Fatalf("Failed to create project dir: %v", err)
 	}
 	localEnv := filepath.Join(localDir, ".env")
-	// This is a generic .env file, not onwatch-specific
+	// This is a generic .env file, not oneauthwatch-server-specific
 	envContent := "DATABASE_URL=postgres://localhost\nREDIS_URL=redis://localhost\n"
 	if err := os.WriteFile(localEnv, []byte(envContent), 0644); err != nil {
 		t.Fatalf("Failed to write local .env: %v", err)
@@ -1340,7 +1340,7 @@ func TestLoadEnvFile_IgnoresNonOnwatchLocalEnv(t *testing.T) {
 	os.Setenv("HOME", tmpDir)
 	loadEnvFile()
 
-	// Verify the local .env was NOT loaded (because it's not onwatch-specific)
+	// Verify the local .env was NOT loaded (because it's not oneauthwatch-server-specific)
 	if got := os.Getenv("DATABASE_URL"); got != "" {
 		t.Errorf("DATABASE_URL should be empty (generic .env should not be loaded), got %q", got)
 	}

@@ -403,8 +403,8 @@ func TestIntegration_DashboardRendersData(t *testing.T) {
 	body := w.Body.String()
 
 	// Check that the page contains expected elements
-	if !strings.Contains(body, "onWatch") {
-		t.Error("Dashboard should contain 'onWatch'")
+	if !strings.Contains(body, "OneAuthWatch") {
+		t.Error("Dashboard should contain 'OneAuthWatch'")
 	}
 	if !strings.Contains(body, "Dashboard") {
 		t.Error("Dashboard should contain 'Dashboard'")
@@ -2161,7 +2161,7 @@ func TestIntegration_Auth_LoginSessionDashboard(t *testing.T) {
 	// Extract session cookie
 	var sessionCookie *http.Cookie
 	for _, c := range loginResp.Cookies() {
-		if c.Name == "onwatch_session" {
+		if c.Name == "oneauthwatch_session" {
 			sessionCookie = c
 			break
 		}
@@ -2389,8 +2389,8 @@ func TestIntegration_API_DashboardRendersWithConfig(t *testing.T) {
 	}
 
 	body := w.Body.String()
-	if !strings.Contains(body, "onWatch") {
-		t.Error("Dashboard missing 'onWatch'")
+	if !strings.Contains(body, "OneAuthWatch") {
+		t.Error("Dashboard missing 'OneAuthWatch'")
 	}
 	if !strings.Contains(body, "app.js") {
 		t.Error("Dashboard missing app.js reference")

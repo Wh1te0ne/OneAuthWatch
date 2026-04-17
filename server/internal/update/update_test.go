@@ -357,8 +357,8 @@ func TestFilterArgs(t *testing.T) {
 
 func TestReplaceBinary(t *testing.T) {
 	dir := t.TempDir()
-	exePath := filepath.Join(dir, "onwatch")
-	tmpPath := filepath.Join(dir, "onwatch.tmp.123")
+	exePath := filepath.Join(dir, "oneauthwatch-server")
+	tmpPath := filepath.Join(dir, "oneauthwatch-server.tmp.123")
 
 	// Create "current" binary (Mach-O magic)
 	if err := os.WriteFile(exePath, []byte("old-binary-content"), 0755); err != nil {
@@ -396,9 +396,9 @@ func TestReplaceBinary(t *testing.T) {
 
 func TestReplaceBinary_LeftoverOldFile(t *testing.T) {
 	dir := t.TempDir()
-	exePath := filepath.Join(dir, "onwatch")
-	tmpPath := filepath.Join(dir, "onwatch.tmp.456")
-	oldPath := filepath.Join(dir, "onwatch.old")
+	exePath := filepath.Join(dir, "oneauthwatch-server")
+	tmpPath := filepath.Join(dir, "oneauthwatch-server.tmp.456")
+	oldPath := filepath.Join(dir, "oneauthwatch-server.old")
 
 	// Create leftover .old from previous failed update
 	if err := os.WriteFile(oldPath, []byte("stale-old"), 0755); err != nil {
@@ -448,7 +448,7 @@ func TestDetectServiceName_Fallback(t *testing.T) {
 		t.Error("expected non-empty service name")
 	}
 	// On non-Linux, falls back to default
-	if name != "onwatch.service" {
+	if name != "oneauthwatch-server.service" {
 		// If we happen to be on Linux with cgroup info, it should end with .service
 		if !strings.HasSuffix(name, ".service") {
 			t.Errorf("expected service name ending in .service, got %q", name)
@@ -473,14 +473,14 @@ func TestFindUnitFile_SystemPath(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	unitFile := filepath.Join(systemDir, "onwatch.service")
+	unitFile := filepath.Join(systemDir, "oneauthwatch-server.service")
 	if err := os.WriteFile(unitFile, []byte("[Service]\nRestart=on-failure\n"), 0644); err != nil {
 		t.Fatal(err)
 	}
 
 	// findUnitFile checks absolute paths, so we can't easily redirect it.
 	// Instead, test that it returns empty for a valid service name not on disk.
-	result := findUnitFile("onwatch-test-phantom.service")
+	result := findUnitFile("oneauthwatch-server-test-phantom.service")
 	if result != "" {
 		t.Errorf("expected empty for phantom service, got %q", result)
 	}
@@ -626,8 +626,8 @@ func TestBinaryDownloadURL_Format(t *testing.T) {
 	if !strings.HasPrefix(url, "https://example.com/download/v3.0.0/") {
 		t.Errorf("unexpected URL format: %s", url)
 	}
-	if !strings.Contains(url, "onwatch-") {
-		t.Errorf("URL should contain 'onwatch-': %s", url)
+	if !strings.Contains(url, "oneauthwatch-server-") {
+		t.Errorf("URL should contain 'oneauthwatch-server-': %s", url)
 	}
 }
 
@@ -721,13 +721,13 @@ func TestCheck_RequestHeaders(t *testing.T) {
 	if gotAccept != "application/vnd.github.v3+json" {
 		t.Fatalf("Accept header = %q, want application/vnd.github.v3+json", gotAccept)
 	}
-	if gotUA != "onwatch/2.2.0" {
-		t.Fatalf("User-Agent header = %q, want onwatch/2.2.0", gotUA)
+	if gotUA != "oneauthwatch-server/2.2.0" {
+		t.Fatalf("User-Agent header = %q, want oneauthwatch-server/2.2.0", gotUA)
 	}
 }
 
 func TestFindUnitFile_UserLevelPath(t *testing.T) {
-	serviceName := "onwatch-user-level-test.service"
+	serviceName := "oneauthwatch-server-user-level-test.service"
 	tmpHome := t.TempDir()
 
 	origHome := os.Getenv("HOME")
@@ -789,12 +789,12 @@ func TestDetectServiceName_FromCgroup(t *testing.T) {
 	defer func() { readCgroupFile = origRead }()
 
 	readCgroupFile = func() ([]byte, error) {
-		return []byte("0::/system.slice/custom-onwatch.service\n"), nil
+		return []byte("0::/system.slice/custom-oneauthwatch-server.service\n"), nil
 	}
 
 	got := DetectServiceName()
-	if got != "custom-onwatch.service" {
-		t.Fatalf("DetectServiceName() = %q, want %q", got, "custom-onwatch.service")
+	if got != "custom-oneauthwatch-server.service" {
+		t.Fatalf("DetectServiceName() = %q, want %q", got, "custom-oneauthwatch-server.service")
 	}
 }
 
@@ -807,15 +807,15 @@ func TestDetectServiceName_FallbackWhenNoServiceUnit(t *testing.T) {
 	}
 
 	got := DetectServiceName()
-	if got != "onwatch.service" {
+	if got != "oneauthwatch-server.service" {
 		t.Fatalf("DetectServiceName() = %q, want default", got)
 	}
 }
 
 func TestReplaceBinary_BackupRenameStrategySuccess(t *testing.T) {
 	dir := t.TempDir()
-	exePath := filepath.Join(dir, "onwatch")
-	tmpPath := filepath.Join(dir, "onwatch.tmp")
+	exePath := filepath.Join(dir, "oneauthwatch-server")
+	tmpPath := filepath.Join(dir, "oneauthwatch-server.tmp")
 
 	if err := os.Mkdir(exePath, 0755); err != nil {
 		t.Fatalf("Mkdir exePath: %v", err)
@@ -843,8 +843,8 @@ func TestReplaceBinary_BackupRenameStrategySuccess(t *testing.T) {
 
 func TestReplaceBinary_BackupRenameFails(t *testing.T) {
 	dir := t.TempDir()
-	exePath := filepath.Join(dir, "onwatch")
-	tmpPath := filepath.Join(dir, "onwatch.tmp")
+	exePath := filepath.Join(dir, "oneauthwatch-server")
+	tmpPath := filepath.Join(dir, "oneauthwatch-server.tmp")
 	backupPath := exePath + ".old"
 
 	if err := os.Mkdir(exePath, 0755); err != nil {
@@ -875,7 +875,7 @@ func TestReplaceBinary_BackupRenameFails(t *testing.T) {
 
 func TestReplaceBinary_SwapRenameFailsRestoresBackup(t *testing.T) {
 	dir := t.TempDir()
-	exePath := filepath.Join(dir, "onwatch")
+	exePath := filepath.Join(dir, "oneauthwatch-server")
 	tmpPath := filepath.Join(dir, "missing.tmp")
 
 	if err := os.Mkdir(exePath, 0755); err != nil {
@@ -906,7 +906,7 @@ func TestMigrateSystemdUnit_UpdatesUserUnitAndReloads(t *testing.T) {
 	origRead := readCgroupFile
 	defer func() { readCgroupFile = origRead }()
 
-	serviceName := "onwatch-migrate-test.service"
+	serviceName := "oneauthwatch-server-migrate-test.service"
 	readCgroupFile = func() ([]byte, error) {
 		return []byte(fmt.Sprintf("0::/system.slice/%s\n", serviceName)), nil
 	}
@@ -969,7 +969,7 @@ func TestRestart_SpawnFailureFallsBackAndReturnsError(t *testing.T) {
 	t.Setenv("PATH", "")
 
 	u := NewUpdater("1.0.0", slog.Default())
-	u.lastAppliedPath = "/definitely/missing/onwatch-binary"
+	u.lastAppliedPath = "/definitely/missing/oneauthwatch-server-binary"
 
 	err := u.Restart()
 	if err == nil {

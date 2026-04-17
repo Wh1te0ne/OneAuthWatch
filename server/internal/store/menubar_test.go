@@ -8,7 +8,7 @@ import (
 )
 
 func TestStoreMenubarSettingsRoundTrip(t *testing.T) {
-	dbPath := filepath.Join(t.TempDir(), "onwatch.db")
+	dbPath := filepath.Join(t.TempDir(), "oneauthwatch.db")
 
 	s, err := New(dbPath)
 	if err != nil {

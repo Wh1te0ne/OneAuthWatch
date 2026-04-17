@@ -87,7 +87,7 @@ func (c *OpenRouterClient) FetchUsage(ctx context.Context) (*OpenRouterAuthKeyRe
 
 	// Set headers - OpenRouter uses Bearer token authentication
 	req.Header.Set("Authorization", "Bearer "+c.apiKey)
-	req.Header.Set("User-Agent", "onwatch/1.0")
+	req.Header.Set("User-Agent", "oneauthwatch/1.0")
 	req.Header.Set("Accept", "application/json")
 
 	// Log request (with redacted API key)

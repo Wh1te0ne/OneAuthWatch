@@ -74,8 +74,8 @@ func TestHandler_Dashboard_ReturnsHTML(t *testing.T) {
 	if !strings.Contains(body, "<!DOCTYPE html>") {
 		t.Error("expected HTML document in response")
 	}
-	if !strings.Contains(body, "onWatch") {
-		t.Error("expected 'onWatch' in response body")
+	if !strings.Contains(body, "OneAuthWatch") {
+		t.Error("expected 'OneAuthWatch' in response body")
 	}
 }
 
@@ -3101,12 +3101,12 @@ func TestHandler_Login_POST_ValidCredentials_Redirects(t *testing.T) {
 	cookies := rr.Result().Cookies()
 	found := false
 	for _, c := range cookies {
-		if c.Name == "onwatch_session" && c.Value != "" {
+		if c.Name == "oneauthwatch_session" && c.Value != "" {
 			found = true
 		}
 	}
 	if !found {
-		t.Error("expected onwatch_session cookie to be set")
+		t.Error("expected oneauthwatch_session cookie to be set")
 	}
 }
 
@@ -3153,7 +3153,7 @@ func TestHandler_Login_GET_AlreadyAuthenticated_RedirectsToDashboard(t *testing.
 	}
 
 	req := httptest.NewRequest(http.MethodGet, "/login", nil)
-	req.AddCookie(&http.Cookie{Name: "onwatch_session", Value: token})
+	req.AddCookie(&http.Cookie{Name: "oneauthwatch_session", Value: token})
 	rr := httptest.NewRecorder()
 
 	h.Login(rr, req)
@@ -3179,7 +3179,7 @@ func TestHandler_Logout_ClearsCookieAndRedirects(t *testing.T) {
 	token, _ := sessions.Authenticate("admin", "test")
 
 	req := httptest.NewRequest(http.MethodGet, "/logout", nil)
-	req.AddCookie(&http.Cookie{Name: "onwatch_session", Value: token})
+	req.AddCookie(&http.Cookie{Name: "oneauthwatch_session", Value: token})
 	rr := httptest.NewRecorder()
 
 	h.Logout(rr, req)
@@ -3192,7 +3192,7 @@ func TestHandler_Logout_ClearsCookieAndRedirects(t *testing.T) {
 	}
 	// Cookie should be expired
 	for _, c := range rr.Result().Cookies() {
-		if c.Name == "onwatch_session" && c.MaxAge >= 0 {
+		if c.Name == "oneauthwatch_session" && c.MaxAge >= 0 {
 			t.Error("expected session cookie to be expired (MaxAge < 0)")
 		}
 	}
@@ -7632,7 +7632,7 @@ func TestHandler_UpdateSettings_SMTP_ValidConfig(t *testing.T) {
 	h := NewHandler(s, nil, nil, sessions, cfg)
 	h.SetNotifier(&mockNotifier{})
 
-	body := `{"smtp":{"host":"smtp.example.com","port":587,"protocol":"starttls","username":"user@example.com","password":"secret","from_address":"noreply@example.com","from_name":"OnWatch","to":"admin@example.com"}}`
+	body := `{"smtp":{"host":"smtp.example.com","port":587,"protocol":"starttls","username":"user@example.com","password":"secret","from_address":"noreply@example.com","from_name":"OneAuthWatch","to":"admin@example.com"}}`
 	req := httptest.NewRequest(http.MethodPut, "/api/settings", strings.NewReader(body))
 	rr := httptest.NewRecorder()
 	h.UpdateSettings(rr, req)
@@ -9593,7 +9593,7 @@ func TestSessionAuthMiddleware_SessionCookie(t *testing.T) {
 	}))
 
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
-	req.AddCookie(&http.Cookie{Name: "onwatch_session", Value: token})
+	req.AddCookie(&http.Cookie{Name: "oneauthwatch_session", Value: token})
 	w := httptest.NewRecorder()
 
 	handler.ServeHTTP(w, req)

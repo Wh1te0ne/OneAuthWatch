@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Playwright script to capture onWatch dashboard screenshots
+// Playwright script to capture OneAuthWatch dashboard screenshots
 // Usage: npx playwright test --config tools/capture-screenshots.mjs
 //   or:  node tools/capture-screenshots.mjs  (requires playwright installed)
 
@@ -11,7 +11,7 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const SCREENSHOTS_DIR = join(__dirname, '..', 'docs', 'screenshots');
 const BASE_URL = 'http://localhost:9211';
 const USERNAME = 'admin';
-const PASSWORD = process.env.ONWATCH_ADMIN_PASS || 'changeme';
+const PASSWORD = process.env.ONEAUTHWATCH_ADMIN_PASS || 'changeme';
 
 // Providers to capture: { filename prefix, tab data-provider value }
 const PROVIDERS = [
@@ -62,7 +62,7 @@ async function run() {
       // Set theme by evaluating JS directly (more reliable than clicking toggle)
       await page.evaluate((t) => {
         document.documentElement.setAttribute('data-theme', t);
-        localStorage.setItem('onwatch-theme', t);
+        localStorage.setItem('oneauthwatch-server-theme', t);
       }, theme);
       await page.waitForTimeout(500);
 

@@ -270,7 +270,7 @@ func createVAPIDJWT(endpoint string, key *ecdsa.PrivateKey) (string, error) {
 
 	// JWT claims - 2 hour expiration
 	now := time.Now().Unix()
-	claims := fmt.Sprintf(`{"aud":"%s","exp":%d,"sub":"mailto:onwatch@localhost"}`, origin, now+7200)
+	claims := fmt.Sprintf(`{"aud":"%s","exp":%d,"sub":"mailto:oneauthwatch@localhost"}`, origin, now+7200)
 	claimsB64 := base64.RawURLEncoding.EncodeToString([]byte(claims))
 
 	// Sign

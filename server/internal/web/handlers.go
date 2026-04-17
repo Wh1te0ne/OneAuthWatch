@@ -3907,7 +3907,7 @@ func (h *Handler) buildOpenRouterInsights(hidden map[string]bool) insightsRespon
 		resp.Insights = append(resp.Insights, insightItem{
 			Type: "info", Severity: "info",
 			Title: "Getting Started",
-			Desc:  "Keep onWatch running to collect OpenRouter usage data. Insights appear after a few snapshots.",
+			Desc:  "Keep OneAuthWatch running to collect OpenRouter usage data. Insights appear after a few snapshots.",
 		})
 		return resp
 	}
@@ -5513,7 +5513,7 @@ func (h *Handler) buildSyntheticInsights(hidden map[string]bool, rangeDur time.D
 		resp.Insights = append(resp.Insights, insightItem{
 			Type: "info", Severity: "info",
 			Title: "Getting Started",
-			Desc:  "Keep onWatch running to build up usage data. Deep insights will appear after a few cycles.",
+			Desc:  "Keep OneAuthWatch running to build up usage data. Deep insights will appear after a few cycles.",
 		})
 	}
 
@@ -5544,7 +5544,7 @@ func (h *Handler) buildZaiInsights(hidden map[string]bool) insightsResponse {
 		resp.Insights = append(resp.Insights, insightItem{
 			Type: "info", Severity: "info",
 			Title: "Getting Started",
-			Desc:  "Keep onWatch running to collect Z.ai usage data. Insights appear after a few snapshots.",
+			Desc:  "Keep OneAuthWatch running to collect Z.ai usage data. Insights appear after a few snapshots.",
 		})
 		return resp
 	}
@@ -6230,7 +6230,7 @@ func (h *Handler) buildAnthropicInsights(hidden map[string]bool, rangeDur time.D
 		resp.Insights = append(resp.Insights, insightItem{
 			Type: "info", Severity: "info",
 			Title: "Getting Started",
-			Desc:  "Keep onWatch running to collect Anthropic usage data. Insights will appear after a few snapshots.",
+			Desc:  "Keep OneAuthWatch running to collect Anthropic usage data. Insights will appear after a few snapshots.",
 		})
 		return resp
 	}
@@ -6473,7 +6473,7 @@ func (h *Handler) buildAnthropicInsights(hidden map[string]bool, rangeDur time.D
 		resp.Insights = append(resp.Insights, insightItem{
 			Type: "info", Severity: "info",
 			Title: "Getting Started",
-			Desc:  "Keep onWatch running to build up usage data. Deep insights will appear after a few cycles.",
+			Desc:  "Keep OneAuthWatch running to build up usage data. Deep insights will appear after a few cycles.",
 		})
 	}
 
@@ -8144,7 +8144,7 @@ func (h *Handler) buildCopilotInsights(hidden map[string]bool, rangeDur time.Dur
 		resp.Insights = append(resp.Insights, insightItem{
 			Type: "info", Severity: "info",
 			Title: "Getting Started",
-			Desc:  "Keep onWatch running to collect Copilot usage data. Insights will appear after a few snapshots.",
+			Desc:  "Keep OneAuthWatch running to collect Copilot usage data. Insights will appear after a few snapshots.",
 		})
 		return resp
 	}
@@ -10112,7 +10112,7 @@ func (h *Handler) buildMiniMaxInsights(accountID int64, hidden map[string]bool, 
 	if err != nil || latest == nil || len(latest.Models) == 0 {
 		resp.Insights = append(resp.Insights, insightItem{
 			Type: "info", Severity: "info", Title: "Getting Started",
-			Desc: "Keep onWatch running to collect MiniMax usage data. Insights will appear after a few snapshots.",
+			Desc: "Keep OneAuthWatch running to collect MiniMax usage data. Insights will appear after a few snapshots.",
 		})
 		return resp
 	}
@@ -10459,7 +10459,7 @@ func (h *Handler) buildCodexInsights(accountID int64, hidden map[string]bool, ra
 	}
 	latest, err := h.store.QueryLatestCodex(accountID)
 	if err != nil || latest == nil {
-		resp.Insights = append(resp.Insights, insightItem{Type: "info", Severity: "info", Title: "Getting Started", Desc: "Keep onWatch running to collect Codex usage data. Insights will appear after a few snapshots."})
+		resp.Insights = append(resp.Insights, insightItem{Type: "info", Severity: "info", Title: "Getting Started", Desc: "Keep OneAuthWatch running to collect Codex usage data. Insights will appear after a few snapshots."})
 		return resp
 	}
 	normalizedLatest := *latest
@@ -10581,7 +10581,7 @@ func (h *Handler) buildCodexInsights(accountID int64, hidden map[string]bool, ra
 			Type:     "info",
 			Severity: "info",
 			Title:    "Collecting Insights",
-			Desc:     "Keep onWatch running to collect enough Codex history for burn-rate and pace analytics.",
+			Desc:     "Keep OneAuthWatch running to collect enough Codex history for burn-rate and pace analytics.",
 		})
 	}
 

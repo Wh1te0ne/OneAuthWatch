@@ -142,7 +142,7 @@ func TestDownloadWithRetry_TimeoutThenSuccess(t *testing.T) {
 }
 
 func TestRestart_SpawnsAppliedBinary(t *testing.T) {
-	exePath := filepath.Join(t.TempDir(), "onwatch")
+	exePath := filepath.Join(t.TempDir(), "oneauthwatch-server")
 	markerPath := filepath.Join(t.TempDir(), "spawned.txt")
 	oldArgs := os.Args
 	oldExecCommand := execCommand
@@ -205,7 +205,7 @@ func TestRestart_SystemdBranchUsesSystemctl(t *testing.T) {
 		t.Fatalf("set INVOCATION_ID: %v", err)
 	}
 	readCgroupFile = func() ([]byte, error) {
-		return []byte("0::/system.slice/onwatch.service"), nil
+		return []byte("0::/system.slice/oneauthwatch-server.service"), nil
 	}
 	execCommand = fakeExecCommandSuccess(t)
 	sleepFn = func(time.Duration) {}
@@ -239,7 +239,7 @@ func TestFallbackSystemctlRestart_Success(t *testing.T) {
 	})
 
 	readCgroupFile = func() ([]byte, error) {
-		return []byte("0::/system.slice/onwatch.service"), nil
+		return []byte("0::/system.slice/oneauthwatch-server.service"), nil
 	}
 	execCommand = fakeExecCommandSuccess(t)
 	sleepFn = func(time.Duration) {}
@@ -340,7 +340,7 @@ func TestMigrateSystemdUnit_ReadAndWriteFailuresAndNoop(t *testing.T) {
 func TestBinaryDownloadURL_CurrentPlatformSuffix(t *testing.T) {
 	u := NewUpdater("1.0.0", slog.Default())
 	got := u.binaryDownloadURL("9.9.9")
-	wantSuffix := fmt.Sprintf("onwatch-%s-%s", runtime.GOOS, runtime.GOARCH)
+	wantSuffix := fmt.Sprintf("oneauthwatch-server-%s-%s", runtime.GOOS, runtime.GOARCH)
 	if runtime.GOOS == "windows" {
 		wantSuffix += ".exe"
 	}
@@ -362,7 +362,7 @@ func TestRestart_StandaloneSpawnFailureFallsBackToSystemctlSuccess(t *testing.T)
 	})
 
 	readCgroupFile = func() ([]byte, error) {
-		return []byte("0::/system.slice/onwatch.service"), nil
+		return []byte("0::/system.slice/oneauthwatch-server.service"), nil
 	}
 	calls := 0
 	execCommand = func(name string, arg ...string) *exec.Cmd {
@@ -393,7 +393,7 @@ func TestRestart_StandaloneSpawnFailureFallsBackToSystemctlSuccess(t *testing.T)
 }
 
 func TestFakeExecCommandHelperSanity(t *testing.T) {
-	cmd := fakeExecCommandSuccess(t)("systemctl", "restart", "onwatch.service")
+	cmd := fakeExecCommandSuccess(t)("systemctl", "restart", "oneauthwatch-server.service")
 	if cmd == nil {
 		t.Fatal("expected helper command")
 	}
@@ -404,7 +404,7 @@ func TestFakeExecCommandHelperSanity(t *testing.T) {
 
 func TestReplaceBinary_RemoveThenRenameFailure(t *testing.T) {
 	dir := t.TempDir()
-	exePath := filepath.Join(dir, "onwatch")
+	exePath := filepath.Join(dir, "oneauthwatch-server")
 	if err := os.WriteFile(exePath, []byte("old"), 0o755); err != nil {
 		t.Fatalf("write exe: %v", err)
 	}
@@ -472,7 +472,7 @@ func TestRestart_SystemdStartFailureCallsExit(t *testing.T) {
 		t.Fatalf("set INVOCATION_ID: %v", err)
 	}
 	readCgroupFile = func() ([]byte, error) {
-		return []byte("0::/system.slice/onwatch.service"), nil
+		return []byte("0::/system.slice/oneauthwatch-server.service"), nil
 	}
 	execCommand = func(name string, arg ...string) *exec.Cmd {
 		return exec.Command("/definitely/missing/systemctl")
@@ -507,7 +507,7 @@ func TestFallbackSystemctlRestart_UserLevelSuccess(t *testing.T) {
 	})
 
 	readCgroupFile = func() ([]byte, error) {
-		return []byte("0::/system.slice/onwatch.service"), nil
+		return []byte("0::/system.slice/oneauthwatch-server.service"), nil
 	}
 	calls := 0
 	execCommand = func(name string, arg ...string) *exec.Cmd {

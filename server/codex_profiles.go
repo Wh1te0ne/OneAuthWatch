@@ -32,7 +32,7 @@ func defaultDBPath() string {
 	if _, err := os.Stat(defaultPath); err == nil {
 		return defaultPath
 	}
-	return filepath.Join(home, ".onwatch", "data", "onwatch.db")
+	return filepath.Join(home, ".oneauthwatch", "data", "oneauthwatch.db")
 }
 
 // withProfileDB opens the database for a best-effort profile operation.
@@ -183,8 +183,8 @@ func legacyCodexProfilesDirs() []string {
 		return nil
 	}
 	return []string{
-		filepath.Join(home, ".onwatch", "codex-profiles"),
-		filepath.Join(home, ".onwatch", "data", "codex-profiles"),
+		filepath.Join(home, ".oneauthwatch", "codex-profiles"),
+		filepath.Join(home, ".oneauthwatch", "data", "codex-profiles"),
 	}
 }
 

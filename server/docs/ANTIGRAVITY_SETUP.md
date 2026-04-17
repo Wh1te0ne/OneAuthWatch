@@ -1,25 +1,25 @@
 # Antigravity Setup Guide
 
-Track your Antigravity AI model quota usage with onWatch.
+Track your Antigravity AI model quota usage with OneAuthWatch.
 
 ---
 
 ## What is Antigravity?
 
-[Antigravity](https://antigravity.google/) is an AI coding assistant that provides access to multiple AI models including Claude, Gemini, and GPT variants. onWatch can monitor your model quotas by connecting to the locally running Antigravity language server process.
+[Antigravity](https://antigravity.google/) is an AI coding assistant that provides access to multiple AI models including Claude, Gemini, and GPT variants. OneAuthWatch can monitor your model quotas by connecting to the locally running Antigravity language server process.
 
 ---
 
 ## Prerequisites
 
 - Antigravity installed and running
-- onWatch installed ([Quick Start](../README.md#quick-start))
+- OneAuthWatch installed ([Quick Start](../README.md#quick-start))
 
 ---
 
 ## How It Works
 
-onWatch automatically detects the Antigravity language server running on your machine by:
+OneAuthWatch automatically detects the Antigravity language server running on your machine by:
 
 1. Scanning for the `antigravity` process
 2. Extracting the CSRF token and port from command-line arguments
@@ -32,12 +32,12 @@ No manual configuration is required for local development.
 
 ## Quick Start (Auto-Detection)
 
-### Step 1: Enable Antigravity in onWatch
+### Step 1: Enable Antigravity in OneAuthWatch
 
 Add to your `.env` file:
 
 ```bash
-cd ~/.onwatch
+cd ~/.oneauthwatch
 ```
 
 Edit `.env` and add:
@@ -52,17 +52,17 @@ Or set it as an environment variable:
 export ANTIGRAVITY_ENABLED=true
 ```
 
-### Step 2: Restart onWatch
+### Step 2: Restart OneAuthWatch
 
 ```bash
-onwatch stop
-onwatch
+oneauthwatch-server stop
+oneauthwatch-server
 ```
 
 Or in debug mode to verify:
 
 ```bash
-onwatch --debug
+oneauthwatch-server --debug
 ```
 
 You should see:
@@ -101,7 +101,7 @@ In containerized environments where process scanning doesn't work, you can manua
 
 ```yaml
 services:
-  onwatch:
+  oneauthwatch-server:
     image: ghcr.io/wh1te0ne/oneauthwatch:latest
     environment:
       - ANTIGRAVITY_ENABLED=true
@@ -148,7 +148,7 @@ The dashboard shows:
 
 ## Supported Models
 
-onWatch tracks all models available in your Antigravity subscription:
+OneAuthWatch tracks all models available in your Antigravity subscription:
 
 | Model ID | Display Name |
 |----------|--------------|
@@ -180,11 +180,11 @@ onWatch tracks all models available in your Antigravity subscription:
 
 - Make sure you're logged into Antigravity
 - Check that your subscription is active
-- Run onWatch in debug mode: `onwatch --debug`
+- Run OneAuthWatch in debug mode: `oneauthwatch-server --debug`
 
 ### "Connection refused"
 
-The language server might be using a self-signed certificate. onWatch handles this automatically, but if you're using manual configuration:
+The language server might be using a self-signed certificate. OneAuthWatch handles this automatically, but if you're using manual configuration:
 
 - Ensure the port is correct
 - Try both `https://` and `http://` protocols
@@ -192,10 +192,10 @@ The language server might be using a self-signed certificate. onWatch handles th
 
 ### "CSRF token invalid"
 
-The token changes when Antigravity restarts. For auto-detection mode, restart onWatch after restarting Antigravity:
+The token changes when Antigravity restarts. For auto-detection mode, restart OneAuthWatch after restarting Antigravity:
 
 ```bash
-onwatch stop && onwatch
+oneauthwatch-server stop && oneauthwatch-server
 ```
 
 For manual configuration, update `ANTIGRAVITY_CSRF_TOKEN` with the new value.
@@ -204,7 +204,7 @@ For manual configuration, update `ANTIGRAVITY_CSRF_TOKEN` with the new value.
 
 ## API Details
 
-onWatch uses the Connect RPC protocol to communicate with the Antigravity language server:
+OneAuthWatch uses the Connect RPC protocol to communicate with the Antigravity language server:
 
 **Endpoint:**
 ```
@@ -250,7 +250,7 @@ X-Codeium-Csrf-Token: <token>
 
 ## Security Notes
 
-- onWatch connects only to localhost (or your configured URL)
+- OneAuthWatch connects only to localhost (or your configured URL)
 - The CSRF token is never sent to external servers
 - All data stays on your machine (SQLite database)
 - Auto-detection only reads process arguments, not memory

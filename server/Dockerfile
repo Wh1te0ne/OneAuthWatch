@@ -62,8 +62,8 @@ COPY --from=builder --chown=65532:65532 /data /data
 
 EXPOSE 9211
 ENV ONEAUTHWATCH_DB_PATH=/data/oneauthwatch.db \
-    ONWATCH_PORT=9211 \
-    ONWATCH_LOG_LEVEL=info
+    ONEAUTHWATCH_PORT=9211 \
+    ONEAUTHWATCH_LOG_LEVEL=info
 
 USER nonroot
 ENTRYPOINT ["/app/oneauthwatch-server"]
@@ -83,8 +83,8 @@ COPY --from=builder --chown=65532:65532 /data /data
 
 EXPOSE 9211
 ENV ONEAUTHWATCH_DB_PATH=/data/oneauthwatch.db \
-    ONWATCH_PORT=9211 \
-    ONWATCH_LOG_LEVEL=info
+    ONEAUTHWATCH_PORT=9211 \
+    ONEAUTHWATCH_LOG_LEVEL=info
 
 # distroless has no shell, use exec form
 ENTRYPOINT ["/app/oneauthwatch-server"]

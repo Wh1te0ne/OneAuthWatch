@@ -199,7 +199,7 @@ func isAppEnvFile(path string) bool {
 // loadEnvFile loads the .env file from the appropriate location.
 // Priority:
 //  1. ~/.oneauthwatch/.env
-//  2. ~/.onwatch/.env (legacy)
+//  2. ~/.oneauthwatch/.env (legacy)
 //  3. ./.env (current directory) - only if it contains app-specific keys
 func loadEnvFile() {
 	// Try standard install location first: ~/.oneauthwatch/.env
@@ -212,7 +212,7 @@ func loadEnvFile() {
 			}
 		}
 
-		legacyPath := filepath.Join(home, ".onwatch", ".env")
+		legacyPath := filepath.Join(home, ".oneauthwatch", ".env")
 		if _, err := os.Stat(legacyPath); err == nil {
 			if err := godotenv.Load(legacyPath); err == nil {
 				fmt.Fprintf(os.Stderr, "  config: loaded %s\n", legacyPath)

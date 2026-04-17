@@ -44,8 +44,8 @@ source_functions() {
     head -n "$keep" "$INSTALL_SCRIPT" > "$func_script"
     # Override platform/download so they don't do real work
     cat >> "$func_script" <<'OVERRIDES'
-detect_platform() { OS="darwin"; ARCH="arm64"; PLATFORM="darwin-arm64"; ASSET_NAME="onwatch-darwin-arm64"; }
-download() { touch "${BIN_DIR}/onwatch"; chmod +x "${BIN_DIR}/onwatch"; }
+detect_platform() { OS="darwin"; ARCH="arm64"; PLATFORM="darwin-arm64"; ASSET_NAME="oneauthwatch-server-darwin-arm64"; }
+download() { touch "${BIN_DIR}/oneauthwatch-server"; chmod +x "${BIN_DIR}/oneauthwatch-server"; }
 OVERRIDES
     source "$func_script"
 }

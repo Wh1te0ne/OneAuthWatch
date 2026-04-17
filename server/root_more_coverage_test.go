@@ -19,25 +19,25 @@ func setTestArgs(t *testing.T, args []string) {
 
 func TestRun_CommandDispatchDeterministic(t *testing.T) {
 	t.Run("help command", func(t *testing.T) {
-		setTestArgs(t, []string{"onwatch", "--help"})
+		setTestArgs(t, []string{"oneauthwatch-server", "--help"})
 		out := captureStdout(t, func() {
 			if err := run(); err != nil {
 				t.Fatalf("run help error: %v", err)
 			}
 		})
-		if !strings.Contains(out, "Usage: onwatch") {
+		if !strings.Contains(out, "Usage: oneauthwatch-server") {
 			t.Fatalf("expected help output, got: %s", out)
 		}
 	})
 
 	t.Run("version command", func(t *testing.T) {
-		setTestArgs(t, []string{"onwatch", "version"})
+		setTestArgs(t, []string{"oneauthwatch-server", "version"})
 		out := captureStdout(t, func() {
 			if err := run(); err != nil {
 				t.Fatalf("run version error: %v", err)
 			}
 		})
-		if !strings.Contains(out, "onWatch v") {
+		if !strings.Contains(out, "OneAuthWatch v") {
 			t.Fatalf("expected version output, got: %s", out)
 		}
 	})
@@ -47,7 +47,7 @@ func TestRun_CommandDispatchDeterministic(t *testing.T) {
 		version = "dev"
 		t.Cleanup(func() { version = origVersion })
 
-		setTestArgs(t, []string{"onwatch", "update"})
+		setTestArgs(t, []string{"oneauthwatch-server", "update"})
 		out := captureStdout(t, func() {
 			if err := run(); err != nil {
 				t.Fatalf("run update error: %v", err)
@@ -61,7 +61,7 @@ func TestRun_CommandDispatchDeterministic(t *testing.T) {
 
 func TestStopPreviousInstance_SelfPIDFileIsSafeAndRemoved(t *testing.T) {
 	oldPIDFile := pidFile
-	pidFile = filepath.Join(t.TempDir(), "onwatch.pid")
+	pidFile = filepath.Join(t.TempDir(), "oneauthwatch-server.pid")
 	t.Cleanup(func() { pidFile = oldPIDFile })
 
 	self := os.Getpid()
@@ -78,7 +78,7 @@ func TestStopPreviousInstance_SelfPIDFileIsSafeAndRemoved(t *testing.T) {
 
 func TestRunStopAndStatus_StalePIDBranches(t *testing.T) {
 	oldPIDFile := pidFile
-	pidFile = filepath.Join(t.TempDir(), "onwatch.pid")
+	pidFile = filepath.Join(t.TempDir(), "oneauthwatch-server.pid")
 	t.Cleanup(func() { pidFile = oldPIDFile })
 
 	stalePID := 999999
@@ -179,13 +179,13 @@ func TestDaemonSysProcAttr_UnixSetsid(t *testing.T) {
 }
 
 func TestRun_HelpCommand(t *testing.T) {
-	setTestArgs(t, []string{"onwatch", "--help"})
+	setTestArgs(t, []string{"oneauthwatch-server", "--help"})
 	out := captureStdout(t, func() {
 		if err := run(); err != nil {
 			t.Fatalf("run --help error: %v", err)
 		}
 	})
-	if !strings.Contains(out, "Usage: onwatch") {
+	if !strings.Contains(out, "Usage: oneauthwatch-server") {
 		t.Fatalf("expected help output, got:\n%s", out)
 	}
 }
@@ -205,10 +205,10 @@ func TestMain_ErrorPath(t *testing.T) {
 	}
 
 	oldPIDFile := pidFile
-	pidFile = filepath.Join(t.TempDir(), "onwatch.pid")
+	pidFile = filepath.Join(t.TempDir(), "oneauthwatch-server.pid")
 	t.Cleanup(func() { pidFile = oldPIDFile })
 
-	setTestArgs(t, []string{"onwatch"})
+	setTestArgs(t, []string{"oneauthwatch-server"})
 
 	err := run()
 	if err == nil {

@@ -1,4 +1,4 @@
-// onWatch Dashboard JavaScript
+// OneAuthWatch Dashboard JavaScript
 
 const BASE_PATH = (document.querySelector('meta[name="base-path"]') || {}).content || '';
 const API_BASE = BASE_PATH;
@@ -167,7 +167,7 @@ const State = {
 
 function loadHiddenQuotas() {
   try {
-    const stored = localStorage.getItem('onwatch-hidden-quotas');
+    const stored = localStorage.getItem('oneauthwatch-server-hidden-quotas');
     if (stored) {
       State.hiddenQuotas = new Set(JSON.parse(stored));
     }
@@ -179,7 +179,7 @@ function loadHiddenQuotas() {
 
 function saveHiddenQuotas() {
   try {
-    localStorage.setItem('onwatch-hidden-quotas', JSON.stringify([...State.hiddenQuotas]));
+    localStorage.setItem('oneauthwatch-server-hidden-quotas', JSON.stringify([...State.hiddenQuotas]));
   } catch (e) {
     // silent
   }
@@ -189,7 +189,7 @@ function saveHiddenQuotas() {
 
 function loadCodexAccount() {
   try {
-    const stored = localStorage.getItem('onwatch-codex-account');
+    const stored = localStorage.getItem('oneauthwatch-server-codex-account');
     if (stored) {
       const parsed = parseInt(stored, 10);
       State.codexAccount = isNaN(parsed) ? 1 : parsed;
@@ -202,7 +202,7 @@ function loadCodexAccount() {
 function saveCodexAccount(account) {
   State.codexAccount = account;
   try {
-    localStorage.setItem('onwatch-codex-account', account);
+    localStorage.setItem('oneauthwatch-server-codex-account', account);
   } catch (e) {
     // silent
   }
@@ -358,7 +358,7 @@ function codexAccountParam() {
 
 function loadMiniMaxAccount() {
   try {
-    const stored = localStorage.getItem('onwatch-minimax-account');
+    const stored = localStorage.getItem('oneauthwatch-server-minimax-account');
     if (stored) {
       const parsed = parseInt(stored, 10);
       State.minimaxAccount = isNaN(parsed) ? null : parsed;
@@ -371,7 +371,7 @@ function loadMiniMaxAccount() {
 function saveMiniMaxAccount(account) {
   State.minimaxAccount = account;
   try {
-    localStorage.setItem('onwatch-minimax-account', account);
+    localStorage.setItem('oneauthwatch-server-minimax-account', account);
   } catch (e) {
     // silent
   }
@@ -584,7 +584,7 @@ async function unhideInsight(key) {
 
 function loadDefaultProvider() {
   try {
-    return localStorage.getItem('onwatch-default-provider') || '';
+    return localStorage.getItem('oneauthwatch-server-default-provider') || '';
   } catch (e) {
     return '';
   }
@@ -592,7 +592,7 @@ function loadDefaultProvider() {
 
 function saveDefaultProvider(provider) {
   try {
-    localStorage.setItem('onwatch-default-provider', provider);
+    localStorage.setItem('oneauthwatch-server-default-provider', provider);
   } catch (e) {
     // silent
   }
@@ -2905,7 +2905,7 @@ function initTheme() {
     const current = document.documentElement.getAttribute('data-theme');
     const next = current === 'light' ? 'dark' : 'light';
     document.documentElement.setAttribute('data-theme', next);
-    localStorage.setItem('onwatch-theme', next);
+    localStorage.setItem('oneauthwatch-server-theme', next);
     updateChartTheme();
   });
 }
@@ -2937,7 +2937,7 @@ function setLayoutDensity(mode) {
   }
 
   try {
-    localStorage.setItem('onwatch-layout', next);
+    localStorage.setItem('oneauthwatch-server-layout', next);
   } catch (e) {
     // silent
   }
@@ -2957,7 +2957,7 @@ function setLayoutDensity(mode) {
 function initLayoutToggle() {
   let saved = 'normal';
   try {
-    const stored = localStorage.getItem('onwatch-layout');
+    const stored = localStorage.getItem('oneauthwatch-server-layout');
     if (stored) saved = stored;
   } catch (e) {
     // silent
@@ -4185,7 +4185,7 @@ function sanitizeProviderCardKey(value) {
 
 function loadProviderCardCollapseState() {
   try {
-    const raw = localStorage.getItem('onwatch-provider-card-collapsed');
+    const raw = localStorage.getItem('oneauthwatch-server-provider-card-collapsed');
     return raw ? JSON.parse(raw) : {};
   } catch (e) {
     return {};
@@ -4194,7 +4194,7 @@ function loadProviderCardCollapseState() {
 
 function saveProviderCardCollapseState(state) {
   try {
-    localStorage.setItem('onwatch-provider-card-collapsed', JSON.stringify(state));
+    localStorage.setItem('oneauthwatch-server-provider-card-collapsed', JSON.stringify(state));
   } catch (e) {
     // silent
   }
@@ -6345,7 +6345,7 @@ function setupCycleFilters() {
 }
 
 function initCollapsibleSections() {
-  const storageKey = 'onwatch-collapsed-sections';
+  const storageKey = 'oneauthwatch-server-collapsed-sections';
   let stored = {};
   try {
     const raw = localStorage.getItem(storageKey);
@@ -7822,7 +7822,7 @@ function createProviderToggleRow({ key, name, desc, vis, configured, autoDetecta
 const providerSettingsConfig = {
   anthropic: {
     title: 'Anthropic',
-    desc: 'Configure how onWatch collects Anthropic usage data. Changes take effect after daemon restart.',
+    desc: 'Configure how OneAuthWatch collects Anthropic usage data. Changes take effect after daemon restart.',
     fields: [
       { id: 'source', label: 'Data Source', type: 'select', options: [
         { value: 'auto', text: 'Auto (statusline + API fallback)' },
@@ -7834,7 +7834,7 @@ const providerSettingsConfig = {
       { id: 'cc_detection', label: 'Claude Code Detection', type: 'select', options: [
         { value: 'on', text: 'On (skip OAuth refresh when CC is running)' },
         { value: 'off', text: 'Off (always attempt OAuth refresh)' },
-      ], default: 'on', hint: 'When enabled, onWatch skips OAuth token refresh while Claude Code is running to prevent login disruption.' },
+      ], default: 'on', hint: 'When enabled, OneAuthWatch skips OAuth token refresh while Claude Code is running to prevent login disruption.' },
     ],
   },
   codex: {
@@ -7977,7 +7977,7 @@ async function openProviderSettingsModal(providerKey) {
         const data = await res.json();
         const profiles = Array.isArray(data.profiles) ? data.profiles : [];
         if (profiles.length === 0) {
-          profilesList.innerHTML = '<p style="color:var(--text-secondary);font-size:13px;margin:0">No profiles saved. Save your first profile using the CLI: <code>onwatch codex profile save &lt;name&gt;</code></p>';
+          profilesList.innerHTML = '<p style="color:var(--text-secondary);font-size:13px;margin:0">No profiles saved. Save your first profile using the CLI: <code>oneauthwatch-server codex profile save &lt;name&gt;</code></p>';
         } else {
           let html = '';
           profiles.forEach(profile => {

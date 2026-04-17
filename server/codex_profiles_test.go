@@ -62,7 +62,7 @@ func writeProfileFileWithUser(t *testing.T, home, name, access, refresh, account
 
 func writeProfileFile(t *testing.T, home, name, access, refresh, idToken, account string) string {
 	t.Helper()
-	profilesDir := filepath.Join(home, ".onwatch", "data", "codex-profiles")
+	profilesDir := filepath.Join(home, ".oneauthwatch", "data", "codex-profiles")
 	if err := os.MkdirAll(profilesDir, 0o700); err != nil {
 		t.Fatalf("mkdir profiles dir: %v", err)
 	}
@@ -103,7 +103,7 @@ func withStdinInput(t *testing.T, input string) func() {
 
 func loadProfileForTest(t *testing.T, home, name string) *CodexProfile {
 	t.Helper()
-	path := filepath.Join(home, ".onwatch", "data", "codex-profiles", name+".json")
+	path := filepath.Join(home, ".oneauthwatch", "data", "codex-profiles", name+".json")
 	profile, err := loadCodexProfile(path)
 	if err != nil {
 		t.Fatalf("load profile: %v", err)
@@ -140,7 +140,7 @@ func TestRefreshCodexProfile_SameAccount(t *testing.T) {
 		t.Fatalf("SavedAt should be updated recently, got %v", profile.SavedAt)
 	}
 
-	path := filepath.Join(home, ".onwatch", "data", "codex-profiles", "work.json")
+	path := filepath.Join(home, ".oneauthwatch", "data", "codex-profiles", "work.json")
 	info, err := os.Stat(path)
 	if err != nil {
 		t.Fatalf("stat profile: %v", err)
@@ -244,7 +244,7 @@ func TestCodexProfilesDir(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 
-	if got := codexProfilesDir(); got != filepath.Join(home, ".onwatch", "data", "codex-profiles") {
+	if got := codexProfilesDir(); got != filepath.Join(home, ".oneauthwatch", "data", "codex-profiles") {
 		t.Fatalf("codexProfilesDir() = %q", got)
 	}
 }
@@ -278,7 +278,7 @@ func TestRunCodexCommand(t *testing.T) {
 	t.Cleanup(func() { os.Args = origArgs })
 
 	t.Run("missing subcommand prints help", func(t *testing.T) {
-		os.Args = []string{"onwatch", "codex"}
+		os.Args = []string{"oneauthwatch-server", "codex"}
 		out := captureStdout(t, func() {
 			if err := runCodexCommand(); err != nil {
 				t.Fatalf("runCodexCommand returned error: %v", err)
@@ -290,7 +290,7 @@ func TestRunCodexCommand(t *testing.T) {
 	})
 
 	t.Run("list dispatch", func(t *testing.T) {
-		os.Args = []string{"onwatch", "codex", "profile", "list"}
+		os.Args = []string{"oneauthwatch-server", "codex", "profile", "list"}
 		out := captureStdout(t, func() {
 			if err := runCodexCommand(); err != nil {
 				t.Fatalf("runCodexCommand(list) returned error: %v", err)
@@ -302,7 +302,7 @@ func TestRunCodexCommand(t *testing.T) {
 	})
 
 	t.Run("status dispatch", func(t *testing.T) {
-		os.Args = []string{"onwatch", "codex", "profile", "status"}
+		os.Args = []string{"oneauthwatch-server", "codex", "profile", "status"}
 		out := captureStdout(t, func() {
 			if err := runCodexCommand(); err != nil {
 				t.Fatalf("runCodexCommand(status) returned error: %v", err)
@@ -314,31 +314,31 @@ func TestRunCodexCommand(t *testing.T) {
 	})
 
 	t.Run("save missing name returns usage error", func(t *testing.T) {
-		os.Args = []string{"onwatch", "codex", "profile", "save"}
+		os.Args = []string{"oneauthwatch-server", "codex", "profile", "save"}
 		err := runCodexCommand()
-		if err == nil || !strings.Contains(err.Error(), "usage: onwatch codex profile save <name>") {
+		if err == nil || !strings.Contains(err.Error(), "usage: oneauthwatch-server codex profile save <name>") {
 			t.Fatalf("save missing name error = %v", err)
 		}
 	})
 
 	t.Run("delete missing name returns usage error", func(t *testing.T) {
-		os.Args = []string{"onwatch", "codex", "profile", "delete"}
+		os.Args = []string{"oneauthwatch-server", "codex", "profile", "delete"}
 		err := runCodexCommand()
-		if err == nil || !strings.Contains(err.Error(), "usage: onwatch codex profile delete <name>") {
+		if err == nil || !strings.Contains(err.Error(), "usage: oneauthwatch-server codex profile delete <name>") {
 			t.Fatalf("delete missing name error = %v", err)
 		}
 	})
 
 	t.Run("refresh missing name returns usage error", func(t *testing.T) {
-		os.Args = []string{"onwatch", "codex", "profile", "refresh"}
+		os.Args = []string{"oneauthwatch-server", "codex", "profile", "refresh"}
 		err := runCodexCommand()
-		if err == nil || !strings.Contains(err.Error(), "usage: onwatch codex profile refresh <name>") {
+		if err == nil || !strings.Contains(err.Error(), "usage: oneauthwatch-server codex profile refresh <name>") {
 			t.Fatalf("refresh missing name error = %v", err)
 		}
 	})
 
 	t.Run("unknown subcommand prints help", func(t *testing.T) {
-		os.Args = []string{"onwatch", "codex", "profile", "unknown"}
+		os.Args = []string{"oneauthwatch-server", "codex", "profile", "unknown"}
 		out := captureStdout(t, func() {
 			if err := runCodexCommand(); err != nil {
 				t.Fatalf("runCodexCommand returned error: %v", err)
@@ -401,7 +401,7 @@ func TestCodexProfileSaveListStatusDeleteFlow(t *testing.T) {
 		t.Fatalf("unexpected delete output:\n%s", deleteOut)
 	}
 
-	if _, err := os.Stat(filepath.Join(home, ".onwatch", "data", "codex-profiles", "work.json")); !os.IsNotExist(err) {
+	if _, err := os.Stat(filepath.Join(home, ".oneauthwatch", "data", "codex-profiles", "work.json")); !os.IsNotExist(err) {
 		t.Fatalf("expected profile to be deleted, stat err=%v", err)
 	}
 }
@@ -446,7 +446,7 @@ func TestListCodexProfiles_SkipsInvalidFilesAndDerivesName(t *testing.T) {
 	t.Setenv("HOME", home)
 	t.Setenv("CODEX_HOME", "")
 
-	profilesDir := filepath.Join(home, ".onwatch", "data", "codex-profiles")
+	profilesDir := filepath.Join(home, ".oneauthwatch", "data", "codex-profiles")
 	if err := os.MkdirAll(profilesDir, 0o700); err != nil {
 		t.Fatalf("mkdir profiles dir: %v", err)
 	}
@@ -475,7 +475,7 @@ func TestCodexProfileStatus_NoCredentials(t *testing.T) {
 	t.Setenv("HOME", home)
 	t.Setenv("CODEX_HOME", "")
 
-	profilesDir := filepath.Join(home, ".onwatch", "data", "codex-profiles")
+	profilesDir := filepath.Join(home, ".oneauthwatch", "data", "codex-profiles")
 	if err := os.MkdirAll(profilesDir, 0o700); err != nil {
 		t.Fatalf("mkdir profiles dir: %v", err)
 	}
@@ -571,7 +571,7 @@ func TestRunCodexCommand_AdditionalHelpPaths(t *testing.T) {
 	t.Cleanup(func() { os.Args = origArgs })
 
 	t.Run("non profile subcommand prints help", func(t *testing.T) {
-		os.Args = []string{"onwatch", "codex", "other"}
+		os.Args = []string{"oneauthwatch-server", "codex", "other"}
 		out := captureStdout(t, func() {
 			if err := runCodexCommand(); err != nil {
 				t.Fatalf("runCodexCommand returned error: %v", err)
@@ -583,7 +583,7 @@ func TestRunCodexCommand_AdditionalHelpPaths(t *testing.T) {
 	})
 
 	t.Run("profile without command prints help", func(t *testing.T) {
-		os.Args = []string{"onwatch", "codex", "profile"}
+		os.Args = []string{"oneauthwatch-server", "codex", "profile"}
 		out := captureStdout(t, func() {
 			if err := runCodexCommand(); err != nil {
 				t.Fatalf("runCodexCommand returned error: %v", err)
@@ -600,9 +600,9 @@ func TestListCodexProfiles_ReadDirError(t *testing.T) {
 	t.Setenv("HOME", home)
 	t.Setenv("CODEX_HOME", "")
 
-	dataDir := filepath.Join(home, ".onwatch", "data")
+	dataDir := filepath.Join(home, ".oneauthwatch", "data")
 	if err := os.MkdirAll(dataDir, 0o700); err != nil {
-		t.Fatalf("mkdir .onwatch/data: %v", err)
+		t.Fatalf("mkdir .oneauthwatch/data: %v", err)
 	}
 	profilesPath := filepath.Join(dataDir, "codex-profiles")
 	if err := os.WriteFile(profilesPath, []byte("not-a-directory"), 0o600); err != nil {
@@ -1007,7 +1007,7 @@ func TestCodexProfileRefreshWithAuthFile(t *testing.T) {
 	t.Setenv("CODEX_TOKEN", "")
 
 	// Create an existing profile first
-	profilesDir := filepath.Join(home, ".onwatch", "data", "codex-profiles")
+	profilesDir := filepath.Join(home, ".oneauthwatch", "data", "codex-profiles")
 	if err := os.MkdirAll(profilesDir, 0o700); err != nil {
 		t.Fatal(err)
 	}

@@ -1,6 +1,6 @@
 # Gemini CLI Quota Tracking
 
-onWatch can track your Google Gemini CLI quota usage, showing per-model remaining quota, reset times, and usage trends.
+OneAuthWatch can track your Google Gemini CLI quota usage, showing per-model remaining quota, reset times, and usage trends.
 
 ## Prerequisites
 
@@ -10,7 +10,7 @@ onWatch can track your Google Gemini CLI quota usage, showing per-model remainin
 
 ## Auto-Detection
 
-onWatch automatically detects Gemini credentials from `~/.gemini/oauth_creds.json`. No configuration needed - just install and authenticate with the Gemini CLI.
+OneAuthWatch automatically detects Gemini credentials from `~/.gemini/oauth_creds.json`. No configuration needed - just install and authenticate with the Gemini CLI.
 
 ## Docker / Headless Setup
 
@@ -35,7 +35,7 @@ For Docker or headless environments where Gemini CLI isn't installed, you can pa
      - GEMINI_REFRESH_TOKEN=1//0gXXXXXXXXXXXXX
    ```
 
-   onWatch will automatically exchange the refresh token for access tokens. Google refresh tokens don't expire unless revoked.
+   OneAuthWatch will automatically exchange the refresh token for access tokens. Google refresh tokens don't expire unless revoked.
 
 ### Option 2: File Mount
 
@@ -61,11 +61,11 @@ Setting `GEMINI_REFRESH_TOKEN` or `GEMINI_ACCESS_TOKEN` automatically enables Ge
 
 ## How It Works
 
-onWatch uses the same internal Google APIs as the Gemini CLI `/stats` command:
+OneAuthWatch uses the same internal Google APIs as the Gemini CLI `/stats` command:
 - `cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota` - per-model remaining quota
 - `cloudcode-pa.googleapis.com/v1internal:loadCodeAssist` - tier and project detection
 
-Token refresh is handled automatically. Google OAuth tokens expire in ~1 hour, and onWatch proactively refreshes them 15 minutes before expiry.
+Token refresh is handled automatically. Google OAuth tokens expire in ~1 hour, and OneAuthWatch proactively refreshes them 15 minutes before expiry.
 
 ## Tracked Models
 
@@ -92,16 +92,16 @@ gemini
 
 Or update your `GEMINI_REFRESH_TOKEN` environment variable with a fresh token.
 
-onWatch will automatically detect the new credentials and resume polling.
+OneAuthWatch will automatically detect the new credentials and resume polling.
 
 ### No Gemini Data in Dashboard
 
 1. Check that credentials are available (file or env vars)
 2. Check that `GEMINI_ENABLED` is not set to `false`
-3. Check the onWatch logs for errors:
+3. Check the OneAuthWatch logs for errors:
    ```bash
    # Local
-   tail -f ~/.onwatch/data/.onwatch.log | grep -i gemini
+   tail -f ~/.oneauthwatch/data/.oneauthwatch.log | grep -i gemini
 
    # Docker
    docker compose logs | grep -i gemini

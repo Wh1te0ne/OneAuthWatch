@@ -11,8 +11,8 @@
 *.db-shm
 
 # Binary
-/onwatch
-/onwatch.exe
+/oneauthwatch-server
+/oneauthwatch-server.exe
 /bin/
 /dist/
 
@@ -20,7 +20,7 @@
 /static/
 
 # Docker data directory
-onwatch-data/
+oneauthwatch-data/
 
 # OS
 .DS_Store
@@ -56,10 +56,10 @@ coverage.html
 
 # Logs
 *.log
-.onwatch.log
+.oneauthwatch.log
 logs/
 opencode.json
-.onwatch.pid
+.oneauthwatch.pid
 
 # Node.js (dev tools)
 node_modules/
@@ -70,7 +70,8 @@ package-lock.json
 # All research, analysis, and working docs go in temp/ which is gitignored above
 
 # Performance monitoring artifacts
-tools/perf-monitor/onwatch
+tools/perf-monitor/oneauthwatch-server
+tools/perf-monitor/*.exe
 tools/perf-monitor/*.json
 
 # Python E2E tests
@@ -81,7 +82,7 @@ __pycache__/
 
 # Mock server binary
 /mockserver
-onwatch-test
+oneauthwatch-server-test
 
 # Claude Code session artifacts
 .omc/

@@ -253,7 +253,7 @@ func isOneAuthWatchProcess(pid int) bool {
 		return false
 	}
 	cmd := strings.ToLower(strings.TrimSpace(string(out)))
-	return strings.Contains(cmd, "oneauthwatch") || strings.Contains(cmd, "onwatch") || strings.Contains(cmd, "syntrack")
+	return strings.Contains(cmd, "oneauthwatch") || strings.Contains(cmd, "oneauthwatch-server") || strings.Contains(cmd, "syntrack")
 }
 
 func ensurePIDDir() error {
@@ -287,15 +287,15 @@ func deriveLegacyEncryptionKey(passwordHash string) string {
 // Only runs when no explicit --db or ONEAUTHWATCH_DB_PATH was set.
 func migrateDBLocation(newPath string, logger *slog.Logger) {
 	oldPaths := []string{
-		"./onwatch.db",
+		"./oneauthwatch.db",
 		"./oneauthwatch.db",
 	}
 	oldHome, err := os.UserHomeDir()
 	if err == nil && oldHome != "" {
 		oldPaths = append(oldPaths,
-			filepath.Join(oldHome, ".onwatch", "onwatch.db"),
-			filepath.Join(oldHome, ".onwatch", "data", "onwatch.db"),
-			filepath.Join(oldHome, ".oneauthwatch", "onwatch.db"),
+			filepath.Join(oldHome, ".oneauthwatch", "oneauthwatch.db"),
+			filepath.Join(oldHome, ".oneauthwatch", "data", "oneauthwatch.db"),
+			filepath.Join(oldHome, ".oneauthwatch", "oneauthwatch.db"),
 		)
 	}
 
@@ -329,7 +329,7 @@ func migrateDBLocation(newPath string, logger *slog.Logger) {
 }
 
 // fixExplicitDBPath detects when a user's .env has a misconfigured DB_PATH
-// (e.g., ./onwatch.db or ./syntrack.db) while the canonical data/ path holds
+// (e.g., ./oneauthwatch.db or ./syntrack.db) while the canonical data/ path holds
 // the actual historical data. It redirects to the canonical path so the
 // dashboard shows existing data instead of appearing empty.
 func fixExplicitDBPath(cfg *config.Config, logger *slog.Logger) {
@@ -340,7 +340,7 @@ func fixExplicitDBPath(cfg *config.Config, logger *slog.Logger) {
 
 	canonicalPath := filepath.Join(home, ".oneauthwatch", "data", "oneauthwatch.db")
 	if _, err := os.Stat(canonicalPath); err != nil {
-		legacyPath := filepath.Join(home, ".onwatch", "data", "onwatch.db")
+		legacyPath := filepath.Join(home, ".oneauthwatch", "data", "oneauthwatch.db")
 		if _, legacyErr := os.Stat(legacyPath); legacyErr == nil {
 			canonicalPath = legacyPath
 		}
@@ -649,12 +649,12 @@ func run() error {
 		migrateDBLocation(cfg.DBPath, logger)
 	} else {
 		// Fix for misconfigured DB_PATH: if the user's .env has a relative path
-		// like ./onwatch.db or ./syntrack.db but the canonical data/ path has
+		// like ./oneauthwatch.db or ./syntrack.db but the canonical data/ path has
 		// existing data, redirect to the canonical path to avoid empty dashboard.
 		fixExplicitDBPath(cfg, logger)
 	}
 
-	// Migrate Codex profiles from legacy ~/.onwatch/codex-profiles/ to data directory
+	// Migrate Codex profiles from legacy ~/.oneauthwatch/codex-profiles/ to data directory
 	migrateCodexProfiles()
 
 	// Open database
@@ -868,7 +868,7 @@ func run() error {
 			}
 		}
 
-		// ANTHROPIC_SOURCE controls how onWatch gets Anthropic usage data:
+		// ANTHROPIC_SOURCE controls how OneAuthWatch gets Anthropic usage data:
 		//   "auto"       - statusline when fresh, API polling as fallback (default)
 		//   "statusline" - statusline only, no API polling
 		//   "api"        - API polling only, no statusline
@@ -1504,7 +1504,7 @@ func statusLogCandidates(dbPath string, names ...string) []string {
 	if err == nil && home != "" {
 		for _, name := range names {
 			appendPath(filepath.Join(home, ".oneauthwatch", name))
-			appendPath(filepath.Join(home, ".onwatch", name))
+			appendPath(filepath.Join(home, ".oneauthwatch", name))
 		}
 	}
 
@@ -1586,10 +1586,10 @@ func runStatus(testMode bool) error {
 					dbCandidates := []string{}
 					if home != "" {
 						dbCandidates = append(dbCandidates, filepath.Join(home, ".oneauthwatch", "data", "oneauthwatch.db"))
-						dbCandidates = append(dbCandidates, filepath.Join(home, ".onwatch", "data", "onwatch.db"))
+						dbCandidates = append(dbCandidates, filepath.Join(home, ".oneauthwatch", "data", "oneauthwatch.db"))
 					}
 					dbCandidates = append(dbCandidates, "./oneauthwatch.db")
-					dbCandidates = append(dbCandidates, "./onwatch.db")
+					dbCandidates = append(dbCandidates, "./oneauthwatch.db")
 					dbPath := ""
 					var dbSize int64
 					for _, candidate := range dbCandidates {

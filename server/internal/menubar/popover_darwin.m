@@ -3,10 +3,10 @@
 #import <Cocoa/Cocoa.h>
 #import <WebKit/WebKit.h>
 
-@interface OnWatchBorderlessPanel : NSPanel
+@interface OneAuthWatchBorderlessPanel : NSPanel
 @end
 
-@implementation OnWatchBorderlessPanel
+@implementation OneAuthWatchBorderlessPanel
 - (BOOL)canBecomeKeyWindow {
   return YES;
 }
@@ -20,7 +20,7 @@
 }
 @end
 
-static void onwatch_run_on_main_sync(dispatch_block_t block) {
+static void oneauthwatch_run_on_main_sync(dispatch_block_t block) {
   if ([NSThread isMainThread]) {
     block();
     return;
@@ -28,8 +28,8 @@ static void onwatch_run_on_main_sync(dispatch_block_t block) {
   dispatch_sync(dispatch_get_main_queue(), block);
 }
 
-@interface OnWatchPopoverController : NSObject <WKNavigationDelegate, WKUIDelegate, WKScriptMessageHandler>
-@property(nonatomic, strong) OnWatchBorderlessPanel *panel;
+@interface OneAuthWatchPopoverController : NSObject <WKNavigationDelegate, WKUIDelegate, WKScriptMessageHandler>
+@property(nonatomic, strong) OneAuthWatchBorderlessPanel *panel;
 @property(nonatomic, strong) NSView *containerView;
 @property(nonatomic, strong) WKWebView *webView;
 @property(nonatomic, strong) id globalMouseMonitor;
@@ -46,7 +46,7 @@ static void onwatch_run_on_main_sync(dispatch_block_t block) {
 - (BOOL)isShown;
 @end
 
-@implementation OnWatchPopoverController
+@implementation OneAuthWatchPopoverController
 
 - (instancetype)initWithWidth:(CGFloat)width height:(CGFloat)height {
   self = [super init];
@@ -59,8 +59,8 @@ static void onwatch_run_on_main_sync(dispatch_block_t block) {
 
   WKWebViewConfiguration *configuration = [[WKWebViewConfiguration alloc] init];
   WKUserContentController *userContentController = [[WKUserContentController alloc] init];
-  [userContentController addScriptMessageHandler:self name:@"onwatchResize"];
-  [userContentController addScriptMessageHandler:self name:@"onwatchAction"];
+  [userContentController addScriptMessageHandler:self name:@"oneauthwatchResize"];
+  [userContentController addScriptMessageHandler:self name:@"oneauthwatchAction"];
   configuration.userContentController = userContentController;
 
   self.webView = [[WKWebView alloc] initWithFrame:NSMakeRect(0, 0, width, height)
@@ -84,7 +84,7 @@ static void onwatch_run_on_main_sync(dispatch_block_t block) {
   [self.containerView addSubview:self.webView];
 
   NSWindowStyleMask styleMask = NSWindowStyleMaskBorderless | NSWindowStyleMaskNonactivatingPanel;
-  self.panel = [[OnWatchBorderlessPanel alloc] initWithContentRect:NSMakeRect(0, 0, width, height)
+  self.panel = [[OneAuthWatchBorderlessPanel alloc] initWithContentRect:NSMakeRect(0, 0, width, height)
                                                           styleMask:styleMask
                                                             backing:NSBackingStoreBuffered
                                                               defer:YES];
@@ -104,8 +104,8 @@ static void onwatch_run_on_main_sync(dispatch_block_t block) {
 
 - (void)dealloc {
   [self stopTransientCloseMonitoring];
-  [self.webView.configuration.userContentController removeScriptMessageHandlerForName:@"onwatchResize"];
-  [self.webView.configuration.userContentController removeScriptMessageHandlerForName:@"onwatchAction"];
+  [self.webView.configuration.userContentController removeScriptMessageHandlerForName:@"oneauthwatchResize"];
+  [self.webView.configuration.userContentController removeScriptMessageHandlerForName:@"oneauthwatchAction"];
 }
 
 - (void)stopTransientCloseMonitoring {
@@ -386,7 +386,7 @@ static void onwatch_run_on_main_sync(dispatch_block_t block) {
 
 - (void)userContentController:(WKUserContentController *)userContentController
       didReceiveScriptMessage:(WKScriptMessage *)message {
-  if ([message.name isEqualToString:@"onwatchResize"]) {
+  if ([message.name isEqualToString:@"oneauthwatchResize"]) {
     CGFloat nextHeight = self.height;
     id body = message.body;
     if ([body isKindOfClass:[NSNumber class]]) {
@@ -401,7 +401,7 @@ static void onwatch_run_on_main_sync(dispatch_block_t block) {
     return;
   }
 
-  if (![message.name isEqualToString:@"onwatchAction"]) {
+  if (![message.name isEqualToString:@"oneauthwatchAction"]) {
     return;
   }
 
@@ -436,76 +436,76 @@ static void onwatch_run_on_main_sync(dispatch_block_t block) {
 
 @end
 
-static OnWatchPopoverController *onwatch_popover_controller(void *handle) {
+static OneAuthWatchPopoverController *oneauthwatch_popover_controller(void *handle) {
   if (!handle) {
     return nil;
   }
-  return (__bridge OnWatchPopoverController *)handle;
+  return (__bridge OneAuthWatchPopoverController *)handle;
 }
 
-void *onwatch_popover_create(int width, int height) {
+void *oneauthwatch_popover_create(int width, int height) {
   __block void *handle = nil;
-  onwatch_run_on_main_sync(^{
+  oneauthwatch_run_on_main_sync(^{
     [NSApplication sharedApplication];
-    OnWatchPopoverController *controller =
-        [[OnWatchPopoverController alloc] initWithWidth:width height:height];
+    OneAuthWatchPopoverController *controller =
+        [[OneAuthWatchPopoverController alloc] initWithWidth:width height:height];
     handle = (__bridge_retained void *)controller;
   });
   return handle;
 }
 
-void onwatch_popover_destroy(void *handle) {
+void oneauthwatch_popover_destroy(void *handle) {
   if (!handle) {
     return;
   }
 
-  onwatch_run_on_main_sync(^{
-    OnWatchPopoverController *controller = (__bridge_transfer OnWatchPopoverController *)handle;
+  oneauthwatch_run_on_main_sync(^{
+    OneAuthWatchPopoverController *controller = (__bridge_transfer OneAuthWatchPopoverController *)handle;
     [controller close];
   });
 }
 
-bool onwatch_popover_show(void *handle) {
+bool oneauthwatch_popover_show(void *handle) {
   __block BOOL shown = NO;
-  onwatch_run_on_main_sync(^{
-    shown = [onwatch_popover_controller(handle) show];
+  oneauthwatch_run_on_main_sync(^{
+    shown = [oneauthwatch_popover_controller(handle) show];
   });
   return shown;
 }
 
-bool onwatch_popover_toggle(void *handle) {
+bool oneauthwatch_popover_toggle(void *handle) {
   __block BOOL toggled = NO;
-  onwatch_run_on_main_sync(^{
-    toggled = [onwatch_popover_controller(handle) toggle];
+  oneauthwatch_run_on_main_sync(^{
+    toggled = [oneauthwatch_popover_controller(handle) toggle];
   });
   return toggled;
 }
 
-void onwatch_popover_load_url(void *handle, const char *url) {
+void oneauthwatch_popover_load_url(void *handle, const char *url) {
   if (!handle || !url) {
     return;
   }
 
-  onwatch_run_on_main_sync(^{
+  oneauthwatch_run_on_main_sync(^{
     NSString *urlString = [[NSString alloc] initWithUTF8String:url];
-    [onwatch_popover_controller(handle) loadURLString:urlString];
+    [oneauthwatch_popover_controller(handle) loadURLString:urlString];
   });
 }
 
-void onwatch_popover_close(void *handle) {
+void oneauthwatch_popover_close(void *handle) {
   if (!handle) {
     return;
   }
 
-  onwatch_run_on_main_sync(^{
-    [onwatch_popover_controller(handle) close];
+  oneauthwatch_run_on_main_sync(^{
+    [oneauthwatch_popover_controller(handle) close];
   });
 }
 
-bool onwatch_popover_is_shown(void *handle) {
+bool oneauthwatch_popover_is_shown(void *handle) {
   __block BOOL shown = NO;
-  onwatch_run_on_main_sync(^{
-    shown = [onwatch_popover_controller(handle) isShown];
+  oneauthwatch_run_on_main_sync(^{
+    shown = [oneauthwatch_popover_controller(handle) isShown];
   });
   return shown;
 }

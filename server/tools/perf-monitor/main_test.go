@@ -185,7 +185,7 @@ func TestSaveReport_WritesJSONFile(t *testing.T) {
 	}
 }
 
-func TestFindOnWatchProcess_InvalidPidFileFallsBackToPortScanAndReturnsZero(t *testing.T) {
+func TestFindOneAuthWatchProcess_InvalidPidFileFallsBackToPortScanAndReturnsZero(t *testing.T) {
 	home := t.TempDir()
 	if err := os.Setenv("HOME", home); err != nil {
 		t.Fatalf("set HOME: %v", err)
@@ -193,19 +193,19 @@ func TestFindOnWatchProcess_InvalidPidFileFallsBackToPortScanAndReturnsZero(t *t
 
 	var pidDir string
 	if runtime.GOOS == "darwin" {
-		pidDir = filepath.Join(home, "Library", "Application Support", "onwatch")
+		pidDir = filepath.Join(home, "Library", "Application Support", "oneauthwatch-server")
 	} else {
-		pidDir = filepath.Join(home, ".local", "share", "onwatch")
+		pidDir = filepath.Join(home, ".local", "share", "oneauthwatch-server")
 	}
 	if err := os.MkdirAll(pidDir, 0o755); err != nil {
 		t.Fatalf("mkdir pid dir: %v", err)
 	}
-	pidFile := filepath.Join(pidDir, "onwatch.pid")
+	pidFile := filepath.Join(pidDir, "oneauthwatch-server.pid")
 	if err := os.WriteFile(pidFile, []byte("not-a-pid"), 0o644); err != nil {
 		t.Fatalf("write pid file: %v", err)
 	}
 
-	got := findonWatchProcess(65530)
+	got := findOneAuthWatchProcess(65530)
 	if got != 0 {
 		t.Fatalf("expected no process found, got %d", got)
 	}
@@ -235,25 +235,25 @@ func TestGetProcessMemory_NonexistentPidReturnsZero(t *testing.T) {
 	}
 }
 
-func TestIsOnwatchProcess_UnknownPidReturnsFalse(t *testing.T) {
-	if isOnwatchProcess(999999) {
-		t.Fatal("expected unknown pid to not be identified as onwatch")
+func TestIsOneAuthWatchProcess_UnknownPidReturnsFalse(t *testing.T) {
+	if isOneAuthWatchProcess(999999) {
+		t.Fatal("expected unknown pid to not be identified as oneauthwatch-server")
 	}
 }
 
-func TestIsOnwatchProcess_ProcessNameCoverageForCurrentProcess(t *testing.T) {
+func TestIsOneAuthWatchProcess_ProcessNameCoverageForCurrentProcess(t *testing.T) {
 	if runtime.GOOS != "darwin" && runtime.GOOS != "linux" {
 		t.Skip("ps-based process checks are only used on darwin/linux")
 	}
 
-	currentIsOnwatch := isOnwatchProcess(os.Getpid())
+	currentIsOneAuthWatch := isOneAuthWatchProcess(os.Getpid())
 	out, err := exec.Command("ps", "-p", strconv.Itoa(os.Getpid()), "-o", "comm=").Output()
 	if err != nil {
 		t.Fatalf("read current process name: %v", err)
 	}
-	want := strings.Contains(strings.ToLower(string(out)), "onwatch")
-	if currentIsOnwatch != want {
-		t.Fatalf("expected %v for current process name %q, got %v", want, string(out), currentIsOnwatch)
+	want := strings.Contains(strings.ToLower(string(out)), "oneauthwatch-server")
+	if currentIsOneAuthWatch != want {
+		t.Fatalf("expected %v for current process name %q, got %v", want, string(out), currentIsOneAuthWatch)
 	}
 }
 
@@ -309,7 +309,7 @@ func TestIsProcessRunning_CurrentAndNonexistentPID(t *testing.T) {
 	}
 }
 
-func TestFindOnWatchProcess_ValidPIDInFileUsesIsProcessRunningBranch(t *testing.T) {
+func TestFindOneAuthWatchProcess_ValidPIDInFileUsesIsProcessRunningBranch(t *testing.T) {
 	home := t.TempDir()
 	oldHome := os.Getenv("HOME")
 	t.Cleanup(func() {
@@ -321,25 +321,25 @@ func TestFindOnWatchProcess_ValidPIDInFileUsesIsProcessRunningBranch(t *testing.
 
 	var pidDir string
 	if runtime.GOOS == "darwin" {
-		pidDir = filepath.Join(home, "Library", "Application Support", "onwatch")
+		pidDir = filepath.Join(home, "Library", "Application Support", "oneauthwatch-server")
 	} else {
-		pidDir = filepath.Join(home, ".local", "share", "onwatch")
+		pidDir = filepath.Join(home, ".local", "share", "oneauthwatch-server")
 	}
 	if err := os.MkdirAll(pidDir, 0o755); err != nil {
 		t.Fatalf("mkdir pid dir: %v", err)
 	}
-	pidFile := filepath.Join(pidDir, "onwatch.pid")
+	pidFile := filepath.Join(pidDir, "oneauthwatch-server.pid")
 	if err := os.WriteFile(pidFile, []byte(strconv.Itoa(os.Getpid())), 0o644); err != nil {
 		t.Fatalf("write pid file: %v", err)
 	}
 
-	got := findonWatchProcess(65529)
+	got := findOneAuthWatchProcess(65529)
 	if got != 0 && got != os.Getpid() {
 		t.Fatalf("expected pid file branch to return 0 or current pid, got %d", got)
 	}
 }
 
-func TestStopOnWatch_RemovesInvalidPIDFileSafely(t *testing.T) {
+func TestStopOneAuthWatch_RemovesInvalidPIDFileSafely(t *testing.T) {
 	home := t.TempDir()
 	oldHome := os.Getenv("HOME")
 	t.Cleanup(func() {
@@ -351,26 +351,26 @@ func TestStopOnWatch_RemovesInvalidPIDFileSafely(t *testing.T) {
 
 	var pidDir string
 	if runtime.GOOS == "darwin" {
-		pidDir = filepath.Join(home, "Library", "Application Support", "onwatch")
+		pidDir = filepath.Join(home, "Library", "Application Support", "oneauthwatch-server")
 	} else {
-		pidDir = filepath.Join(home, ".local", "share", "onwatch")
+		pidDir = filepath.Join(home, ".local", "share", "oneauthwatch-server")
 	}
 	if err := os.MkdirAll(pidDir, 0o755); err != nil {
 		t.Fatalf("mkdir pid dir: %v", err)
 	}
-	pidFile := filepath.Join(pidDir, "onwatch.pid")
+	pidFile := filepath.Join(pidDir, "oneauthwatch-server.pid")
 	if err := os.WriteFile(pidFile, []byte("invalid-pid"), 0o644); err != nil {
 		t.Fatalf("write pid file: %v", err)
 	}
 
-	stoponWatch(65528)
+	stopOneAuthWatch(65528)
 
 	if _, err := os.Stat(pidFile); !os.IsNotExist(err) {
 		t.Fatalf("expected pid file removed, stat err=%v", err)
 	}
 }
 
-func TestStartOnWatch_BinaryMissingReturnsZero(t *testing.T) {
+func TestStartOneAuthWatch_BinaryMissingReturnsZero(t *testing.T) {
 	tempDir := t.TempDir()
 	oldWD, err := os.Getwd()
 	if err != nil {
@@ -383,9 +383,9 @@ func TestStartOnWatch_BinaryMissingReturnsZero(t *testing.T) {
 		_ = os.Chdir(oldWD)
 	}()
 
-	pid := startonWatch(65527)
+	pid := startOneAuthWatch(65527)
 	if pid != 0 {
-		t.Fatalf("expected startonWatch to fail with missing binary, got pid %d", pid)
+		t.Fatalf("expected startOneAuthWatch to fail with missing binary, got pid %d", pid)
 	}
 }
 
@@ -474,7 +474,7 @@ func TestRunMonitoring_ZeroDurationReturnsDeterministicReport(t *testing.T) {
 	}
 }
 
-func TestStartOnWatch_ProcessDiesDuringStartupReturnsZero(t *testing.T) {
+func TestStartOneAuthWatch_ProcessDiesDuringStartupReturnsZero(t *testing.T) {
 	tempDir := t.TempDir()
 	oldWD, err := os.Getwd()
 	if err != nil {
@@ -485,17 +485,17 @@ func TestStartOnWatch_ProcessDiesDuringStartupReturnsZero(t *testing.T) {
 	}
 	defer func() { _ = os.Chdir(oldWD) }()
 
-	if err := os.WriteFile(filepath.Join(tempDir, "onwatch"), []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
-		t.Fatalf("write failing onwatch script: %v", err)
+	if err := os.WriteFile(filepath.Join(tempDir, "oneauthwatch-server"), []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatalf("write failing oneauthwatch-server script: %v", err)
 	}
 
-	pid := startonWatch(65524)
+	pid := startOneAuthWatch(65524)
 	if pid != 0 {
 		t.Fatalf("expected zero pid when process dies during startup, got %d", pid)
 	}
 }
 
-func TestStopOnWatch_ValidPIDFileSignalsProcess(t *testing.T) {
+func TestStopOneAuthWatch_ValidPIDFileSignalsProcess(t *testing.T) {
 	home := t.TempDir()
 	oldHome := os.Getenv("HOME")
 	t.Cleanup(func() {
@@ -507,9 +507,9 @@ func TestStopOnWatch_ValidPIDFileSignalsProcess(t *testing.T) {
 
 	var pidDir string
 	if runtime.GOOS == "darwin" {
-		pidDir = filepath.Join(home, "Library", "Application Support", "onwatch")
+		pidDir = filepath.Join(home, "Library", "Application Support", "oneauthwatch-server")
 	} else {
-		pidDir = filepath.Join(home, ".local", "share", "onwatch")
+		pidDir = filepath.Join(home, ".local", "share", "oneauthwatch-server")
 	}
 	if err := os.MkdirAll(pidDir, 0o755); err != nil {
 		t.Fatalf("mkdir pid dir: %v", err)
@@ -526,12 +526,12 @@ func TestStopOnWatch_ValidPIDFileSignalsProcess(t *testing.T) {
 		}
 	})
 
-	pidFile := filepath.Join(pidDir, "onwatch.pid")
+	pidFile := filepath.Join(pidDir, "oneauthwatch-server.pid")
 	if err := os.WriteFile(pidFile, []byte(strconv.Itoa(helpCmd.Process.Pid)), 0o644); err != nil {
 		t.Fatalf("write pid file: %v", err)
 	}
 
-	stoponWatch(65523)
+	stopOneAuthWatch(65523)
 
 	if isProcessRunning(helpCmd.Process.Pid) {
 		t.Fatalf("expected helper process %d to be stopped", helpCmd.Process.Pid)
@@ -559,7 +559,7 @@ func TestMain_NoProcessFoundExitsWithHelp(t *testing.T) {
 	if exitErr.ExitCode() != 1 {
 		t.Fatalf("expected exit code 1, got %d; output=%s", exitErr.ExitCode(), string(output))
 	}
-	if !strings.Contains(string(output), "onWatch process not found") {
+	if !strings.Contains(string(output), "OneAuthWatch process not found") {
 		t.Fatalf("expected missing-process message, got %s", string(output))
 	}
 }
@@ -585,7 +585,7 @@ func TestMain_RestartFailureExitsWithError(t *testing.T) {
 	if exitErr.ExitCode() != 1 {
 		t.Fatalf("expected exit code 1, got %d; output=%s", exitErr.ExitCode(), string(output))
 	}
-	if !strings.Contains(string(output), "Failed to start onWatch") {
+	if !strings.Contains(string(output), "Failed to start OneAuthWatch") {
 		t.Fatalf("expected restart failure message, got %s", string(output))
 	}
 }

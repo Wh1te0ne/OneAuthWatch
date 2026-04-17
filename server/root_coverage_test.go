@@ -80,7 +80,7 @@ func TestPIDFileLifecycle(t *testing.T) {
 	})
 
 	pidDir = filepath.Join(t.TempDir(), "pid")
-	pidFile = filepath.Join(pidDir, "onwatch.pid")
+	pidFile = filepath.Join(pidDir, "oneauthwatch-server.pid")
 
 	if err := ensurePIDDir(); err != nil {
 		t.Fatalf("ensurePIDDir error: %v", err)
@@ -111,8 +111,8 @@ func TestMigrateDBLocation_MovesDBAndSidecars(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 
-	oldDB := filepath.Join(home, ".onwatch", "onwatch.db")
-	newDB := filepath.Join(home, ".onwatch", "data", "onwatch.db")
+	oldDB := filepath.Join(home, ".oneauthwatch", "oneauthwatch.db")
+	newDB := filepath.Join(home, ".oneauthwatch", "data", "oneauthwatch.db")
 	if err := os.MkdirAll(filepath.Dir(oldDB), 0o755); err != nil {
 		t.Fatalf("mkdir old db dir: %v", err)
 	}
@@ -145,7 +145,7 @@ func TestMigrateDBLocation_MovesDBAndSidecars(t *testing.T) {
 func TestFixExplicitDBPath_RedirectsToCanonicalWhenBetter(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
-	canonical := filepath.Join(home, ".onwatch", "data", "onwatch.db")
+	canonical := filepath.Join(home, ".oneauthwatch", "data", "oneauthwatch.db")
 	if err := os.MkdirAll(filepath.Dir(canonical), 0o755); err != nil {
 		t.Fatalf("mkdir canonical dir: %v", err)
 	}
@@ -186,7 +186,7 @@ func TestPrintBannerAndHelp(t *testing.T) {
 		AntigravityEnabled: true,
 		PollInterval:       60 * time.Second,
 		Port:               9211,
-		DBPath:             "/tmp/onwatch.db",
+		DBPath:             "/tmp/oneauthwatch.db",
 		AdminUser:          "admin",
 		TestMode:           true,
 	}
@@ -194,7 +194,7 @@ func TestPrintBannerAndHelp(t *testing.T) {
 	banner := captureStdout(t, func() {
 		printBanner(cfg, "1.2.3")
 	})
-	for _, want := range []string{"onWatch v1.2.3", "Providers:", "Synthetic API Key:", "Codex (auto):", "Mode:      TEST"} {
+	for _, want := range []string{"OneAuthWatch v1.2.3", "Providers:", "Synthetic API Key:", "Codex (auto):", "Mode:      TEST"} {
 		if !strings.Contains(banner, want) {
 			t.Fatalf("banner should contain %q, got:\n%s", want, banner)
 		}
@@ -203,7 +203,7 @@ func TestPrintBannerAndHelp(t *testing.T) {
 	help := captureStdout(t, func() {
 		printHelp()
 	})
-	for _, want := range []string{"onWatch - Multi-Provider API Usage Tracker", "Commands:", "Test Mode (--test):"} {
+	for _, want := range []string{"OneAuthWatch - Multi-Provider API Usage Tracker", "Commands:", "Test Mode (--test):"} {
 		if !strings.Contains(help, want) {
 			t.Fatalf("help should contain %q, got:\n%s", want, help)
 		}
@@ -400,7 +400,7 @@ func TestPrintSummaryAndNextSteps(t *testing.T) {
 		printNextSteps()
 	})
 
-	for _, want := range []string{"Configuration Summary", "Provider:", "onwatch stop", "onwatch --debug"} {
+	for _, want := range []string{"Configuration Summary", "Provider:", "oneauthwatch-server stop", "oneauthwatch-server --debug"} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("summary/next steps should contain %q, got:\n%s", want, out)
 		}
@@ -411,7 +411,7 @@ func TestRunSetupEarlyPathsAndSafeRunCommands(t *testing.T) {
 	t.Run("runSetup returns early when all providers already configured", func(t *testing.T) {
 		home := t.TempDir()
 		t.Setenv("HOME", home)
-		installDir := filepath.Join(home, ".onwatch")
+		installDir := filepath.Join(home, ".oneauthwatch")
 		envFile := filepath.Join(installDir, ".env")
 		if err := os.MkdirAll(filepath.Join(installDir, "data"), 0o755); err != nil {
 			t.Fatalf("mkdir install dir: %v", err)
@@ -453,7 +453,7 @@ func TestRunSetupEarlyPathsAndSafeRunCommands(t *testing.T) {
 
 	t.Run("runStop and runStatus test-mode safe branches", func(t *testing.T) {
 		oldPIDFile := pidFile
-		pidFile = filepath.Join(t.TempDir(), "onwatch-test.pid")
+		pidFile = filepath.Join(t.TempDir(), "oneauthwatch-server-test.pid")
 		t.Cleanup(func() { pidFile = oldPIDFile })
 
 		outStop := captureStdout(t, func() {
@@ -461,7 +461,7 @@ func TestRunSetupEarlyPathsAndSafeRunCommands(t *testing.T) {
 				t.Fatalf("runStop error: %v", err)
 			}
 		})
-		if !strings.Contains(outStop, "No running onwatch (test) instance found") {
+		if !strings.Contains(outStop, "No running oneauthwatch-server (test) instance found") {
 			t.Fatalf("unexpected runStop output: %s", outStop)
 		}
 
@@ -470,15 +470,15 @@ func TestRunSetupEarlyPathsAndSafeRunCommands(t *testing.T) {
 				t.Fatalf("runStatus error: %v", err)
 			}
 		})
-		if !strings.Contains(outStatus, "onwatch (test) is not running") {
+		if !strings.Contains(outStatus, "oneauthwatch-server (test) is not running") {
 			t.Fatalf("unexpected runStatus output: %s", outStatus)
 		}
 	})
 
-	t.Run("findOnwatchOnPort and isOnwatchProcess safe checks", func(t *testing.T) {
-		_ = findOnwatchOnPort(1)
-		if isOnwatchProcess(-1) {
-			t.Fatal("invalid PID should not be identified as onwatch")
+	t.Run("findOneAuthWatchOnPort and isOneAuthWatchProcess safe checks", func(t *testing.T) {
+		_ = findOneAuthWatchOnPort(1)
+		if isOneAuthWatchProcess(-1) {
+			t.Fatal("invalid PID should not be identified as oneauthwatch-server")
 		}
 	})
 }
@@ -489,7 +489,7 @@ func TestRunStopAndStatus_WithPIDFileProcess(t *testing.T) {
 	}
 
 	oldPIDFile := pidFile
-	pidFile = filepath.Join(t.TempDir(), "onwatch-test.pid")
+	pidFile = filepath.Join(t.TempDir(), "oneauthwatch-server-test.pid")
 	t.Cleanup(func() { pidFile = oldPIDFile })
 
 	cmd := exec.Command("sleep", "30")
@@ -512,7 +512,7 @@ func TestRunStopAndStatus_WithPIDFileProcess(t *testing.T) {
 			t.Fatalf("runStatus error: %v", err)
 		}
 	})
-	if !strings.Contains(statusOut, "onwatch (test) is running") {
+	if !strings.Contains(statusOut, "oneauthwatch-server (test) is running") {
 		t.Fatalf("unexpected runStatus output: %s", statusOut)
 	}
 	if !strings.Contains(statusOut, "Dashboard: http://localhost:9211") {
@@ -524,7 +524,7 @@ func TestRunStopAndStatus_WithPIDFileProcess(t *testing.T) {
 			t.Fatalf("runStop error: %v", err)
 		}
 	})
-	if !strings.Contains(stopOut, "Stopped onwatch (test)") {
+	if !strings.Contains(stopOut, "Stopped oneauthwatch-server (test)") {
 		t.Fatalf("unexpected runStop output: %s", stopOut)
 	}
 
@@ -541,7 +541,7 @@ func TestRunStopAndStatus_WithPIDFileProcess(t *testing.T) {
 
 func TestRunStatus_StalePIDFile(t *testing.T) {
 	oldPIDFile := pidFile
-	pidFile = filepath.Join(t.TempDir(), "onwatch-test.pid")
+	pidFile = filepath.Join(t.TempDir(), "oneauthwatch-server-test.pid")
 	t.Cleanup(func() { pidFile = oldPIDFile })
 
 	if err := os.WriteFile(pidFile, []byte("999999:9211"), 0o600); err != nil {
@@ -558,7 +558,7 @@ func TestRunStatus_StalePIDFile(t *testing.T) {
 	}
 }
 
-func startOnwatchNCListener(t *testing.T, port int) *exec.Cmd {
+func startOneAuthWatchNCListener(t *testing.T, port int) *exec.Cmd {
 	t.Helper()
 
 	ncPath, err := exec.LookPath("nc")
@@ -566,12 +566,12 @@ func startOnwatchNCListener(t *testing.T, port int) *exec.Cmd {
 		t.Skip("nc not available")
 	}
 
-	onwatchNC := filepath.Join(t.TempDir(), "onwatch")
-	if err := os.Symlink(ncPath, onwatchNC); err != nil {
-		t.Skipf("cannot create onwatch symlink for nc: %v", err)
+	oneAuthWatchNC := filepath.Join(t.TempDir(), "oneauthwatch-server")
+	if err := os.Symlink(ncPath, oneAuthWatchNC); err != nil {
+		t.Skipf("cannot create oneauthwatch-server symlink for nc: %v", err)
 	}
 
-	cmd := exec.Command(onwatchNC, "-lk", "127.0.0.1", strconv.Itoa(port))
+	cmd := exec.Command(oneAuthWatchNC, "-lk", "127.0.0.1", strconv.Itoa(port))
 	cmd.Stdout = io.Discard
 	cmd.Stderr = io.Discard
 	if err := cmd.Start(); err != nil {
@@ -612,24 +612,24 @@ func pickAvailableDefaultPort(t *testing.T) int {
 	return 0
 }
 
-func TestRunStatus_PortFallbackDetectsOnwatchProcess(t *testing.T) {
+func TestRunStatus_PortFallbackDetectsOneAuthWatchProcess(t *testing.T) {
 	if runtime.GOOS != "darwin" && runtime.GOOS != "linux" {
 		t.Skip("port process detection uses lsof on unix")
 	}
 
 	oldPIDFile := pidFile
-	pidFile = filepath.Join(t.TempDir(), "onwatch.pid")
+	pidFile = filepath.Join(t.TempDir(), "oneauthwatch-server.pid")
 	t.Cleanup(func() { pidFile = oldPIDFile })
 
 	port := pickAvailableDefaultPort(t)
-	_ = startOnwatchNCListener(t, port)
+	_ = startOneAuthWatchNCListener(t, port)
 
 	out := captureStdout(t, func() {
 		if err := runStatus(false); err != nil {
 			t.Fatalf("runStatus error: %v", err)
 		}
 	})
-	if !strings.Contains(out, "onwatch is running (PID") {
+	if !strings.Contains(out, "oneauthwatch-server is running (PID") {
 		t.Fatalf("expected running output, got: %s", out)
 	}
 	if !strings.Contains(out, fmt.Sprintf("on port %d", port)) {
@@ -637,13 +637,13 @@ func TestRunStatus_PortFallbackDetectsOnwatchProcess(t *testing.T) {
 	}
 }
 
-func TestRunStop_PortFromPIDFileFallbackStopsOnwatchProcess(t *testing.T) {
+func TestRunStop_PortFromPIDFileFallbackStopsOneAuthWatchProcess(t *testing.T) {
 	if runtime.GOOS != "darwin" && runtime.GOOS != "linux" {
 		t.Skip("port process detection uses lsof on unix")
 	}
 
 	oldPIDFile := pidFile
-	pidFile = filepath.Join(t.TempDir(), "onwatch.pid")
+	pidFile = filepath.Join(t.TempDir(), "oneauthwatch-server.pid")
 	t.Cleanup(func() { pidFile = oldPIDFile })
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -653,7 +653,7 @@ func TestRunStop_PortFromPIDFileFallbackStopsOnwatchProcess(t *testing.T) {
 	port := ln.Addr().(*net.TCPAddr).Port
 	_ = ln.Close()
 
-	cmd := startOnwatchNCListener(t, port)
+	cmd := startOneAuthWatchNCListener(t, port)
 	if cmd == nil || cmd.Process == nil {
 		t.Skip("listener process unavailable")
 	}
@@ -668,7 +668,7 @@ func TestRunStop_PortFromPIDFileFallbackStopsOnwatchProcess(t *testing.T) {
 			t.Fatalf("runStop error: %v", err)
 		}
 	})
-	if !strings.Contains(out, "Stopped onwatch (PID") || !strings.Contains(out, fmt.Sprintf("on port %d", port)) {
+	if !strings.Contains(out, "Stopped oneauthwatch-server (PID") || !strings.Contains(out, fmt.Sprintf("on port %d", port)) {
 		t.Fatalf("expected port-fallback stop output, got: %s", out)
 	}
 }
@@ -676,7 +676,7 @@ func TestRunStop_PortFromPIDFileFallbackStopsOnwatchProcess(t *testing.T) {
 func TestDaemonize_SuccessAndLogOpenError(t *testing.T) {
 	oldPIDFile := pidFile
 	oldArgs := os.Args
-	pidFile = filepath.Join(t.TempDir(), "onwatch-daemon.pid")
+	pidFile = filepath.Join(t.TempDir(), "oneauthwatch-server-daemon.pid")
 	t.Cleanup(func() {
 		pidFile = oldPIDFile
 		os.Args = oldArgs
@@ -684,7 +684,7 @@ func TestDaemonize_SuccessAndLogOpenError(t *testing.T) {
 
 	t.Run("success", func(t *testing.T) {
 		tmp := t.TempDir()
-		dbPath := filepath.Join(tmp, "data", "onwatch.db")
+		dbPath := filepath.Join(tmp, "data", "oneauthwatch.db")
 		if err := os.MkdirAll(filepath.Dir(dbPath), 0o755); err != nil {
 			t.Fatalf("mkdir db dir: %v", err)
 		}
@@ -712,7 +712,7 @@ func TestDaemonize_SuccessAndLogOpenError(t *testing.T) {
 		if _, err := os.Stat(pidFile); err != nil {
 			t.Fatalf("pid file should exist: %v", err)
 		}
-		logPath := filepath.Join(filepath.Dir(dbPath), ".onwatch-test.log")
+		logPath := filepath.Join(filepath.Dir(dbPath), ".oneauthwatch-test.log")
 		if _, err := os.Stat(logPath); err != nil {
 			t.Fatalf("daemon log file should exist: %v", err)
 		}
@@ -723,7 +723,7 @@ func TestDaemonize_SuccessAndLogOpenError(t *testing.T) {
 		os.Args = []string{oldArgs[0], "-test.run=TestDaemonizeHelperProcess"}
 
 		cfg := &config.Config{
-			DBPath:   filepath.Join(t.TempDir(), "missing", "nested", "onwatch.db"),
+			DBPath:   filepath.Join(t.TempDir(), "missing", "nested", "oneauthwatch.db"),
 			Port:     9211,
 			TestMode: true,
 		}
@@ -782,7 +782,7 @@ func TestRunUpdate_WithMockedUpdater(t *testing.T) {
 		pidFile = oldPIDFile
 	})
 
-	pidFile = filepath.Join(t.TempDir(), "onwatch.pid")
+	pidFile = filepath.Join(t.TempDir(), "oneauthwatch-server.pid")
 	version = "1.2.3"
 
 	t.Run("check error", func(t *testing.T) {
@@ -827,7 +827,7 @@ func TestRunUpdate_WithMockedUpdater(t *testing.T) {
 				Available:      true,
 				CurrentVersion: "1.2.3",
 				LatestVersion:  "1.2.4",
-				DownloadURL:    "https://example.com/onwatch",
+				DownloadURL:    "https://example.com/oneauthwatch-server",
 			},
 			applyErr: fmt.Errorf("cannot replace binary"),
 		}
@@ -853,7 +853,7 @@ func TestRunUpdate_WithMockedUpdater(t *testing.T) {
 				Available:      true,
 				CurrentVersion: "1.2.3",
 				LatestVersion:  "1.2.4",
-				DownloadURL:    "https://example.com/onwatch",
+				DownloadURL:    "https://example.com/oneauthwatch-server",
 			},
 		}
 		newCLIUpdater = func(v string, logger *slog.Logger) cliUpdater { return stub }

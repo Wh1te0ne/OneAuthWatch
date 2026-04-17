@@ -344,7 +344,7 @@ func (e *NotificationEngine) ConfigurePush() error {
 		e.logger.Info("Generated new VAPID key pair for push notifications")
 	}
 
-	sender, err := NewPushSender(pub, priv, "mailto:onwatch@localhost")
+	sender, err := NewPushSender(pub, priv, "mailto:oneauthwatch@localhost")
 	if err != nil {
 		return fmt.Errorf("notify.ConfigurePush: %w", err)
 	}
@@ -389,7 +389,7 @@ func (e *NotificationEngine) SendTestPush() error {
 		ps := PushSubscription{Endpoint: sub.Endpoint}
 		ps.Keys.P256dh = sub.P256dh
 		ps.Keys.Auth = sub.Auth
-		if err := sender.Send(ps, "[onWatch] Test Push", "Push notifications are working correctly."); err != nil {
+		if err := sender.Send(ps, "[OneAuthWatch] Test Push", "Push notifications are working correctly."); err != nil {
 			lastErr = err
 			e.logger.Error("test push failed", "endpoint", sub.Endpoint, "error", err)
 		} else {
@@ -481,8 +481,8 @@ func (e *NotificationEngine) SendTestEmail() error {
 		return fmt.Errorf("SMTP not configured")
 	}
 
-	subject := "[onWatch] Test Email"
-	body := "This is a test email from onWatch.\n\nIf you received this, your SMTP settings are configured correctly.\n\n-- Sent by onWatch"
+	subject := "[OneAuthWatch] Test Email"
+	body := "This is a test email from OneAuthWatch.\n\nIf you received this, your SMTP settings are configured correctly.\n\n-- Sent by OneAuthWatch"
 	return mailer.Send(subject, body)
 }
 
@@ -497,8 +497,8 @@ func (e *NotificationEngine) TestSMTPDiag() (string, error) {
 		return "", fmt.Errorf("SMTP not configured")
 	}
 
-	subject := "[onWatch] Test Email"
-	body := "This is a test email from onWatch.\n\nIf you received this, your SMTP settings are configured correctly.\n\n-- Sent by onWatch"
+	subject := "[OneAuthWatch] Test Email"
+	body := "This is a test email from OneAuthWatch.\n\nIf you received this, your SMTP settings are configured correctly.\n\n-- Sent by OneAuthWatch"
 	res := mailer.SendWithDiag(subject, body)
 	return res.Diagnostics, res.Error
 }
@@ -628,7 +628,7 @@ func (e *NotificationEngine) buildBody(status QuotaStatus, notifType string) str
 	}
 	sb.WriteString(fmt.Sprintf("Alert Type: %s\n", notifType))
 	sb.WriteString(fmt.Sprintf("Time: %s\n", time.Now().UTC().Format(time.RFC3339)))
-	sb.WriteString("\n-- Sent by onWatch")
+	sb.WriteString("\n-- Sent by OneAuthWatch")
 	return sb.String()
 }
 
@@ -740,6 +740,6 @@ func (e *NotificationEngine) buildAuthErrorBody(alert AuthErrorAlert) string {
 	} else {
 		sb.WriteString("ACTION REQUIRED: Please re-authenticate to resume quota tracking.\n")
 	}
-	sb.WriteString("\n-- Sent by onWatch")
+	sb.WriteString("\n-- Sent by OneAuthWatch")
 	return sb.String()
 }

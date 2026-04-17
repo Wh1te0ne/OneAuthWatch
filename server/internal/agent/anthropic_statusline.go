@@ -34,7 +34,7 @@ const statuslineFileName = "anthropic-statusline.json"
 //   2. Saves $I to ~/.oneauthwatch/data/anthropic-statusline.json (atomic via temp+mv)
 //   3. Pipes $I to stdout (so the next command in the pipe gets it)
 const bridgeSnippet = `bash -c 'I=$(cat);D=$HOME/.oneauthwatch/data;mkdir -p "$D" 2>/dev/null;T="$D/.sl-$$";printf "%s" "$I">"$T"&&mv -f "$T" "$D/anthropic-statusline.json" 2>/dev/null||rm -f "$T" 2>/dev/null;printf "%s" "$I"'`
-const legacyBridgeSnippet = `bash -c 'I=$(cat);D=$HOME/.onwatch/data;mkdir -p "$D" 2>/dev/null;T="$D/.sl-$$";printf "%s" "$I">"$T"&&mv -f "$T" "$D/anthropic-statusline.json" 2>/dev/null||rm -f "$T" 2>/dev/null;printf "%s" "$I"'`
+const legacyBridgeSnippet = `bash -c 'I=$(cat);D=$HOME/.oneauthwatch/data;mkdir -p "$D" 2>/dev/null;T="$D/.sl-$$";printf "%s" "$I">"$T"&&mv -f "$T" "$D/anthropic-statusline.json" 2>/dev/null||rm -f "$T" 2>/dev/null;printf "%s" "$I"'`
 
 // bridgeMarker is a substring used to detect if the bridge snippet is already
 // present in the user's statusline command.
@@ -242,7 +242,7 @@ func hasBridgeSnippet(command string) bool {
 }
 
 func hasLegacyBridgeSnippet(command string) bool {
-	return strings.Contains(command, legacyBridgeSnippet) || (strings.Contains(command, bridgeMarker) && strings.Contains(command, ".onwatch/data"))
+	return strings.Contains(command, legacyBridgeSnippet) || (strings.Contains(command, bridgeMarker) && strings.Contains(command, ".oneauthwatch/data"))
 }
 
 // addBridgeSnippet prepends the save snippet to the user's command via a pipe.

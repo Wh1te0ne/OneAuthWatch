@@ -11,8 +11,8 @@ import (
 func TestMenubarHelpText(t *testing.T) {
 	help := menubarHelpText()
 	for _, fragment := range []string{
-		"onWatch Menubar Companion",
-		"Usage: onwatch menubar [OPTIONS]",
+		"OneAuthWatch Menubar Companion",
+		"Usage: oneauthwatch-server menubar [OPTIONS]",
 		"--port PORT",
 		"--debug",
 		"--help",
@@ -25,7 +25,7 @@ func TestMenubarHelpText(t *testing.T) {
 
 func TestMenubarLogPath_UsesNewName(t *testing.T) {
 	dir := t.TempDir()
-	cfg := &config.Config{DBPath: filepath.Join(dir, "onwatch.db")}
+	cfg := &config.Config{DBPath: filepath.Join(dir, "oneauthwatch.db")}
 
 	want := filepath.Join(dir, "menubar.log")
 	if got := menubarLogPath(cfg); got != want {
@@ -35,7 +35,7 @@ func TestMenubarLogPath_UsesNewName(t *testing.T) {
 
 func TestMenubarLogPath_TestModeUsesNewTestName(t *testing.T) {
 	dir := t.TempDir()
-	cfg := &config.Config{DBPath: filepath.Join(dir, "onwatch.db"), TestMode: true}
+	cfg := &config.Config{DBPath: filepath.Join(dir, "oneauthwatch.db"), TestMode: true}
 
 	want := filepath.Join(dir, "menubar-test.log")
 	if got := menubarLogPath(cfg); got != want {

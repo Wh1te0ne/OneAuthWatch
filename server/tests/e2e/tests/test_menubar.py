@@ -37,8 +37,8 @@ class TestMenubarStandardView:
     def test_footer_refresh_and_links_are_visible(self, authenticated_page: Page) -> None:
         open_menubar(authenticated_page, "standard")
         expect(authenticated_page.locator("#refresh-button")).to_be_visible()
-        expect(authenticated_page.locator("#footer-github")).to_have_attribute("href", "https://github.com/onllm-dev/onwatch")
-        expect(authenticated_page.locator("#footer-support")).to_have_attribute("href", "https://github.com/onllm-dev/onwatch/issues")
+        expect(authenticated_page.locator("#footer-github")).to_have_attribute("href", "https://github.com/Wh1te0ne/OneAuthWatch")
+        expect(authenticated_page.locator("#footer-support")).to_have_attribute("href", "https://github.com/Wh1te0ne/OneAuthWatch/issues")
         expect(authenticated_page.locator("#footer-onllm")).to_have_attribute("href", "https://onllm.dev")
 
     def test_settings_panel_only_shows_supported_status_modes(self, authenticated_page: Page) -> None:

@@ -6,10 +6,6 @@
 .npm-cache/
 .playwright/
 
-# Reference source trees kept locally for comparison only
-codex-auth-manager-main/
-onWatch-main/
-
 # Environment files
 **/.env
 **/.env.local

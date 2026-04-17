@@ -1,11 +1,11 @@
 # MiniMax Setup Guide
 
-This guide configures MiniMax Coding Plan usage tracking in onWatch.
+This guide configures MiniMax Coding Plan usage tracking in OneAuthWatch.
 
 ## Prerequisites
 
 - Active MiniMax Coding Plan subscription
-- onWatch v2.11+
+- OneAuthWatch v2.11+
 
 ## 1. Get a MiniMax API Key
 
@@ -13,9 +13,9 @@ This guide configures MiniMax Coding Plan usage tracking in onWatch.
 2. Go to **API Keys**
 3. Create or copy an API key
 
-## 2. Configure onWatch
+## 2. Configure OneAuthWatch
 
-Add this to your environment file (`~/.onwatch/.env` for local installs):
+Add this to your environment file (`~/.oneauthwatch/.env` for local installs):
 
 ```env
 MINIMAX_API_KEY=sk-cp-your_key_here
@@ -37,11 +37,11 @@ You can apply the new key without full restart:
 2. Click **Reload Providers From .env**
 3. Enable **MiniMax** telemetry and dashboard toggle
 
-Or restart onWatch:
+Or restart OneAuthWatch:
 
 ```bash
-onwatch stop
-onwatch
+oneauthwatch-server stop
+oneauthwatch-server
 ```
 
 ## 4. Verify
@@ -52,7 +52,7 @@ onwatch
 
 ## Notes
 
-- MiniMax endpoint used by onWatch:
+- MiniMax endpoint used by OneAuthWatch:
   `https://api.minimax.io/v1/api/openplatform/coding_plan/remains`
 - Auth is sent as a `Bearer` token.
-- onWatch stores usage snapshots locally in SQLite.
+- OneAuthWatch stores usage snapshots locally in SQLite.

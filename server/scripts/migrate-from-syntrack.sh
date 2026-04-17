@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
-# migrate-from-syntrack.sh - Migrate SynTrack data to onWatch
+# migrate-from-syntrack.sh - Migrate SynTrack data to OneAuthWatch
 #
 # This script migrates configuration, database, and service files
-# from the old SynTrack (~/.syntrack/) layout to onWatch (~/.onwatch/).
+# from the old SynTrack (~/.syntrack/) layout to OneAuthWatch (~/.oneauthwatch/).
 # It is designed to be run once and deletes itself upon completion.
 
 set -euo pipefail
 
 OLD_DIR="$HOME/.syntrack"
-NEW_DIR="$HOME/.onwatch"
+NEW_DIR="$HOME/.oneauthwatch"
 
 # -------------------------------------------------------------------
 # 1. Check if migration is needed
@@ -19,16 +19,16 @@ if [ ! -d "$OLD_DIR" ]; then
 fi
 
 if [ -d "$NEW_DIR" ]; then
-    echo "[migrate] ~/.onwatch/ already exists. Skipping migration."
+    echo "[migrate] ~/.oneauthwatch/ already exists. Skipping migration."
     exit 0
 fi
 
-echo "[migrate] Migrating SynTrack -> onWatch ..."
+echo "[migrate] Migrating SynTrack -> OneAuthWatch ..."
 
 # -------------------------------------------------------------------
 # 2. Create new directory structure
 # -------------------------------------------------------------------
-echo "[migrate] Creating ~/.onwatch/ directory structure ..."
+echo "[migrate] Creating ~/.oneauthwatch/ directory structure ..."
 mkdir -p "$NEW_DIR/bin"
 mkdir -p "$NEW_DIR/data"
 
@@ -39,8 +39,8 @@ if [ -f "$OLD_DIR/.env" ]; then
     echo "[migrate] Migrating .env file ..."
     sed \
         -e 's/SYNTRACK_/ONEAUTHWATCH_/g' \
-        -e 's/SynTrack/onWatch/g' \
-        -e 's/syntrack/onwatch/g' \
+        -e 's/SynTrack/OneAuthWatch/g' \
+        -e 's/syntrack/oneauthwatch/g' \
         "$OLD_DIR/.env" > "$NEW_DIR/.env"
     chmod 600 "$NEW_DIR/.env"
     echo "[migrate] .env migrated: $NEW_DIR/.env"
@@ -56,32 +56,32 @@ DB_FOUND=false
 # Check ~/.syntrack/data/syntrack.db first (canonical path)
 if [ -f "$OLD_DIR/data/syntrack.db" ]; then
     echo "[migrate] Moving database from $OLD_DIR/data/syntrack.db ..."
-    mv "$OLD_DIR/data/syntrack.db" "$NEW_DIR/data/onwatch.db"
-    [ -f "$OLD_DIR/data/syntrack.db-wal" ] && mv "$OLD_DIR/data/syntrack.db-wal" "$NEW_DIR/data/onwatch.db-wal"
-    [ -f "$OLD_DIR/data/syntrack.db-shm" ] && mv "$OLD_DIR/data/syntrack.db-shm" "$NEW_DIR/data/onwatch.db-shm"
+    mv "$OLD_DIR/data/syntrack.db" "$NEW_DIR/data/oneauthwatch.db"
+    [ -f "$OLD_DIR/data/syntrack.db-wal" ] && mv "$OLD_DIR/data/syntrack.db-wal" "$NEW_DIR/data/oneauthwatch.db-wal"
+    [ -f "$OLD_DIR/data/syntrack.db-shm" ] && mv "$OLD_DIR/data/syntrack.db-shm" "$NEW_DIR/data/oneauthwatch.db-shm"
     DB_FOUND=true
 fi
 
 # Check ~/.syntrack/syntrack.db (old default)
 if [ "$DB_FOUND" = false ] && [ -f "$OLD_DIR/syntrack.db" ]; then
     echo "[migrate] Moving database from $OLD_DIR/syntrack.db ..."
-    mv "$OLD_DIR/syntrack.db" "$NEW_DIR/data/onwatch.db"
-    [ -f "$OLD_DIR/syntrack.db-wal" ] && mv "$OLD_DIR/syntrack.db-wal" "$NEW_DIR/data/onwatch.db-wal"
-    [ -f "$OLD_DIR/syntrack.db-shm" ] && mv "$OLD_DIR/syntrack.db-shm" "$NEW_DIR/data/onwatch.db-shm"
+    mv "$OLD_DIR/syntrack.db" "$NEW_DIR/data/oneauthwatch.db"
+    [ -f "$OLD_DIR/syntrack.db-wal" ] && mv "$OLD_DIR/syntrack.db-wal" "$NEW_DIR/data/oneauthwatch.db-wal"
+    [ -f "$OLD_DIR/syntrack.db-shm" ] && mv "$OLD_DIR/syntrack.db-shm" "$NEW_DIR/data/oneauthwatch.db-shm"
     DB_FOUND=true
 fi
 
 # Check ./syntrack.db (working directory)
 if [ "$DB_FOUND" = false ] && [ -f "./syntrack.db" ]; then
     echo "[migrate] Moving database from ./syntrack.db ..."
-    mv "./syntrack.db" "$NEW_DIR/data/onwatch.db"
-    [ -f "./syntrack.db-wal" ] && mv "./syntrack.db-wal" "$NEW_DIR/data/onwatch.db-wal"
-    [ -f "./syntrack.db-shm" ] && mv "./syntrack.db-shm" "$NEW_DIR/data/onwatch.db-shm"
+    mv "./syntrack.db" "$NEW_DIR/data/oneauthwatch.db"
+    [ -f "./syntrack.db-wal" ] && mv "./syntrack.db-wal" "$NEW_DIR/data/oneauthwatch.db-wal"
+    [ -f "./syntrack.db-shm" ] && mv "./syntrack.db-shm" "$NEW_DIR/data/oneauthwatch.db-shm"
     DB_FOUND=true
 fi
 
 if [ "$DB_FOUND" = true ]; then
-    echo "[migrate] Database migrated to $NEW_DIR/data/onwatch.db"
+    echo "[migrate] Database migrated to $NEW_DIR/data/oneauthwatch.db"
 else
     echo "[migrate] No database found to migrate."
 fi
@@ -125,7 +125,7 @@ if [ -f "$SYSTEM_SERVICE" ]; then
 fi
 
 # -------------------------------------------------------------------
-# 7. Update shell rc files (PATH exports: .syntrack -> .onwatch)
+# 7. Update shell rc files (PATH exports: .syntrack -> .oneauthwatch)
 # -------------------------------------------------------------------
 RC_FILES=(
     "$HOME/.bashrc"
@@ -136,7 +136,7 @@ RC_FILES=(
 for rc in "${RC_FILES[@]}"; do
     if [ -f "$rc" ] && grep -q '\.syntrack' "$rc"; then
         echo "[migrate] Updating PATH in $rc ..."
-        sed -i.bak 's/\.syntrack/\.onwatch/g' "$rc"
+        sed -i.bak 's/\.syntrack/\.oneauthwatch/g' "$rc"
         rm -f "${rc}.bak"
     fi
 done
@@ -150,7 +150,7 @@ rm -rf "$OLD_DIR"
 echo "[migrate] Migration complete!"
 echo "[migrate]   Config: $NEW_DIR/.env"
 if [ "$DB_FOUND" = true ]; then
-    echo "[migrate]   Database: $NEW_DIR/data/onwatch.db"
+    echo "[migrate]   Database: $NEW_DIR/data/oneauthwatch.db"
 fi
 echo "[migrate]   Old directory removed: $OLD_DIR"
 

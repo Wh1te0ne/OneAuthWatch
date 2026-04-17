@@ -1,0 +1,18 @@
+services:
+  oneauthwatch:
+    image: ghcr.io/wh1te0ne/oneauthwatch-server:latest
+    container_name: oneauthwatch
+    ports:
+      - "${ONEAUTHWATCH_PORT:-9211}:9211"
+    volumes:
+      - ./oneauthwatch-data:/data
+    env_file:
+      - .env
+    environment:
+      ONEAUTHWATCH_DB_PATH: /data/oneauthwatch.db
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"

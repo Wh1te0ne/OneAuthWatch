@@ -39,9 +39,9 @@ _systemctl() {
 
 _journalctl() {
     if [[ "$SYSTEMD_MODE" == "system" ]]; then
-        journalctl -u onwatch "$@"
+        journalctl -u oneauthwatch-server "$@"
     else
-        journalctl --user -u onwatch "$@"
+        journalctl --user -u oneauthwatch-server "$@"
     fi
 }
 
@@ -55,9 +55,9 @@ _sctl_cmd() {
 
 _jctl_cmd() {
     if [[ "$SYSTEMD_MODE" == "system" ]]; then
-        echo "journalctl -u onwatch"
+        echo "journalctl -u oneauthwatch-server"
     else
-        echo "journalctl --user -u onwatch"
+        echo "journalctl --user -u oneauthwatch-server"
     fi
 }
 
@@ -232,7 +232,7 @@ detect_platform() {
 }
 
 resolve_asset_name() {
-    ASSET_NAME="onwatch-${PLATFORM}"
+    ASSET_NAME="oneauthwatch-server-${PLATFORM}"
 }
 
 # ─── Migrate from SynTrack ──────────────────────────────────────────
@@ -243,7 +243,7 @@ migrate_from_syntrack() {
     fi
 
     info "Found existing SynTrack installation at ${old_dir}"
-    info "Migrating to onWatch..."
+    info "Migrating to OneAuthWatch..."
 
     # Stop old service
     if [[ "$OS" == "linux" ]] && command -v systemctl &>/dev/null; then
@@ -263,21 +263,21 @@ migrate_from_syntrack() {
     mkdir -p "${INSTALL_DIR}" "${BIN_DIR}" "${INSTALL_DIR}/data"
 
     # Copy and transform .env (SYNTRACK_ -> ONEAUTHWATCH_)
-    # Also remove DB_PATH so the default (~/.onwatch/data/onwatch.db) takes effect
+    # Also remove DB_PATH so the default (~/.oneauthwatch/data/oneauthwatch.db) takes effect
     if [[ -f "${old_dir}/.env" ]]; then
         sed -e 's/SYNTRACK_/ONEAUTHWATCH_/g' -e '/^ONEAUTHWATCH_DB_PATH=/d' -e '/^SYNTRACK_DB_PATH=/d' "${old_dir}/.env" > "${INSTALL_DIR}/.env"
         ok "Migrated .env (SYNTRACK_* -> ONEAUTHWATCH_*, removed DB_PATH override)"
     fi
 
-    # Move DB files (rename syntrack.db -> onwatch.db)
+    # Move DB files (rename syntrack.db -> oneauthwatch.db)
     for ext in "" "-journal" "-wal" "-shm"; do
         if [[ -f "${old_dir}/data/syntrack.db${ext}" ]]; then
-            cp "${old_dir}/data/syntrack.db${ext}" "${INSTALL_DIR}/data/onwatch.db${ext}"
+            cp "${old_dir}/data/syntrack.db${ext}" "${INSTALL_DIR}/data/oneauthwatch.db${ext}"
         elif [[ -f "${old_dir}/syntrack.db${ext}" ]]; then
-            cp "${old_dir}/syntrack.db${ext}" "${INSTALL_DIR}/data/onwatch.db${ext}"
+            cp "${old_dir}/syntrack.db${ext}" "${INSTALL_DIR}/data/oneauthwatch.db${ext}"
         fi
     done
-    ok "Migrated database files (syntrack.db -> onwatch.db)"
+    ok "Migrated database files (syntrack.db -> oneauthwatch.db)"
 
     # Remove old systemd service
     if [[ "$OS" == "linux" ]] && command -v systemctl &>/dev/null; then
@@ -305,26 +305,26 @@ migrate_from_syntrack() {
     ok "Removed old SynTrack directory"
 
     echo ""
-    printf "  ${GREEN}${BOLD}Migration complete: SynTrack -> onWatch${NC}\n"
+    printf "  ${GREEN}${BOLD}Migration complete: SynTrack -> OneAuthWatch${NC}\n"
     printf "  ${DIM}Old directory ${old_dir} has been removed${NC}\n"
     echo ""
 }
 
 # ─── Stop Existing Instance ──────────────────────────────────────────
 stop_existing() {
-    if [[ -f "${BIN_DIR}/onwatch" ]]; then
+    if [[ -f "${BIN_DIR}/oneauthwatch-server" ]]; then
         if [[ "$OS" == "linux" ]] && command -v systemctl &>/dev/null; then
-            _systemctl stop onwatch 2>/dev/null || true
+            _systemctl stop oneauthwatch-server 2>/dev/null || true
         else
-            "${BIN_DIR}/onwatch" stop 2>/dev/null || true
+            "${BIN_DIR}/oneauthwatch-server" stop 2>/dev/null || true
         fi
         # Wait up to 5 seconds for the process to die.
         # On Linux, writing to a running binary returns ETXTBSY,
         # so we must ensure it's stopped before replacing.
         local waited=0
         while [[ $waited -lt 5 ]]; do
-            # Check if any onwatch process is still running from BIN_DIR
-            if ! pgrep -f "${BIN_DIR}/onwatch" >/dev/null 2>&1; then
+            # Check if any oneauthwatch-server process is still running from BIN_DIR
+            if ! pgrep -f "${BIN_DIR}/oneauthwatch-server" >/dev/null 2>&1; then
                 break
             fi
             sleep 1
@@ -341,10 +341,10 @@ download() {
     if [[ "$INSTALL_VERSION" != "latest" ]]; then
         url="https://github.com/${REPO}/releases/download/${INSTALL_VERSION}/${ASSET_NAME}"
     fi
-    local dest="${BIN_DIR}/onwatch"
-    local tmp_dest="/tmp/onwatch-download-$$"
+    local dest="${BIN_DIR}/oneauthwatch-server"
+    local tmp_dest="/tmp/oneauthwatch-server-download-$$"
 
-    info "Downloading onwatch for ${BOLD}${PLATFORM}${NC}..."
+    info "Downloading oneauthwatch-server for ${BOLD}${PLATFORM}${NC}..."
     info "  URL:  $url"
     info "  Dest: $dest"
 
@@ -394,18 +394,18 @@ download() {
 
     local ver
     ver="$("$dest" --version 2>/dev/null | head -1 || echo "unknown")"
-    ok "Installed ${BOLD}onwatch ${ver}${NC}"
+    ok "Installed ${BOLD}oneauthwatch-server ${ver}${NC}"
 }
 
 # ─── Create Wrapper Script ───────────────────────────────────────────
 # The binary loads .env from the working directory. This wrapper ensures
-# we always cd to ~/.onwatch before running, so .env is always found.
+# we always cd to ~/.oneauthwatch before running, so .env is always found.
 create_wrapper() {
-    local wrapper="${INSTALL_DIR}/onwatch"
+    local wrapper="${INSTALL_DIR}/oneauthwatch-server"
 
     cat > "$wrapper" <<WRAPPER
 #!/usr/bin/env bash
-cd "\$HOME/.onwatch" 2>/dev/null && exec "\$HOME/.onwatch/bin/onwatch" "\$@"
+cd "\$HOME/.oneauthwatch" 2>/dev/null && exec "\$HOME/.oneauthwatch/bin/oneauthwatch-server" "\$@"
 WRAPPER
     chmod +x "$wrapper"
 }
@@ -480,7 +480,7 @@ collect_codex_config() {
     local _codex_token=""
 
     printf "\n  ${BOLD}Codex Token Setup${NC}\n" >&2
-    printf "  ${DIM}onWatch can auto-detect your Codex OAuth token from auth.json.${NC}\n\n" >&2
+    printf "  ${DIM}OneAuthWatch can auto-detect your Codex OAuth token from auth.json.${NC}\n\n" >&2
 
     local auto_token=""
     auto_token=$(detect_codex_token 2>/dev/null) || true
@@ -525,7 +525,7 @@ collect_anthropic_config() {
 
     # Try auto-detection first
     printf "\n  ${BOLD}Anthropic (Claude Code) Token Setup${NC}\n" >&2
-    printf "  ${DIM}onWatch can auto-detect your Claude Code credentials.${NC}\n\n" >&2
+    printf "  ${DIM}OneAuthWatch can auto-detect your Claude Code credentials.${NC}\n\n" >&2
 
     local auto_token=""
     auto_token=$(detect_anthropic_token 2>/dev/null) || true
@@ -1038,7 +1038,7 @@ interactive_setup() {
     # ── Write .env ──
     {
         echo "# ═══════════════════════════════════════════════════════════════"
-        echo "# onWatch Configuration"
+        echo "# OneAuthWatch Configuration"
         echo "# Generated by installer on $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
         echo "# ═══════════════════════════════════════════════════════════════"
         echo ""
@@ -1144,7 +1144,7 @@ setup_systemd() {
 
         cat > "$svc_file" <<EOF
 [Unit]
-Description=onWatch - AI API Quota Tracker
+Description=OneAuthWatch - AI API Quota Tracker
 Documentation=https://github.com/${REPO}
 After=network-online.target
 Wants=network-online.target
@@ -1154,19 +1154,19 @@ StartLimitIntervalSec=120
 [Service]
 Type=simple
 WorkingDirectory=${INSTALL_DIR}
-ExecStart=${BIN_DIR}/onwatch --debug
+ExecStart=${BIN_DIR}/oneauthwatch-server --debug
 Restart=always
 RestartSec=5
 StandardOutput=journal
 StandardError=journal
-SyslogIdentifier=onwatch
+SyslogIdentifier=oneauthwatch-server
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
         systemctl daemon-reload 2>/dev/null || true
-        systemctl enable onwatch 2>/dev/null || true
+        systemctl enable oneauthwatch-server 2>/dev/null || true
 
         ok "Created system-wide systemd service"
     else
@@ -1183,7 +1183,7 @@ EOF
 
         cat > "$svc_file" <<EOF
 [Unit]
-Description=onWatch - AI API Quota Tracker
+Description=OneAuthWatch - AI API Quota Tracker
 Documentation=https://github.com/${REPO}
 After=network-online.target
 Wants=network-online.target
@@ -1193,19 +1193,19 @@ StartLimitIntervalSec=120
 [Service]
 Type=simple
 WorkingDirectory=${INSTALL_DIR}
-ExecStart=${BIN_DIR}/onwatch --debug
+ExecStart=${BIN_DIR}/oneauthwatch-server --debug
 Restart=always
 RestartSec=5
 StandardOutput=journal
 StandardError=journal
-SyslogIdentifier=onwatch
+SyslogIdentifier=oneauthwatch-server
 
 [Install]
 WantedBy=default.target
 EOF
 
         systemctl --user daemon-reload 2>/dev/null || true
-        systemctl --user enable onwatch 2>/dev/null || true
+        systemctl --user enable oneauthwatch-server 2>/dev/null || true
 
         ok "Created systemd user service"
     fi
@@ -1216,10 +1216,10 @@ EOF
 
     echo ""
     printf "  ${DIM}Manage with:${NC}\n"
-    printf "    ${CYAN}${sctl} start onwatch${NC}    # Start\n"
-    printf "    ${CYAN}${sctl} stop onwatch${NC}     # Stop\n"
-    printf "    ${CYAN}${sctl} status onwatch${NC}   # Status\n"
-    printf "    ${CYAN}${sctl} restart onwatch${NC}  # Restart\n"
+    printf "    ${CYAN}${sctl} start oneauthwatch-server${NC}    # Start\n"
+    printf "    ${CYAN}${sctl} stop oneauthwatch-server${NC}     # Stop\n"
+    printf "    ${CYAN}${sctl} status oneauthwatch-server${NC}   # Status\n"
+    printf "    ${CYAN}${sctl} restart oneauthwatch-server${NC}  # Restart\n"
     printf "    ${CYAN}${jctl} -f${NC}   # Logs\n"
     return 0
 }
@@ -1229,22 +1229,22 @@ setup_launchd() {
     if [[ "$OS" != "darwin" ]]; then return 1; fi
 
     echo ""
-    ok "macOS detected — onWatch self-daemonizes"
+    ok "macOS detected — OneAuthWatch self-daemonizes"
     printf "  ${DIM}Manage with:${NC}\n"
-    printf "    ${CYAN}onwatch${NC}           # Start (runs in background)\n"
-    printf "    ${CYAN}onwatch stop${NC}      # Stop\n"
-    printf "    ${CYAN}onwatch status${NC}    # Status\n"
-    printf "    ${CYAN}onwatch --debug${NC}   # Run in foreground (logs to stdout)\n"
+    printf "    ${CYAN}oneauthwatch-server${NC}           # Start (runs in background)\n"
+    printf "    ${CYAN}oneauthwatch-server stop${NC}      # Stop\n"
+    printf "    ${CYAN}oneauthwatch-server status${NC}    # Status\n"
+    printf "    ${CYAN}oneauthwatch-server --debug${NC}   # Run in foreground (logs to stdout)\n"
     return 0
 }
 
 # ─── PATH Setup ──────────────────────────────────────────────────────
 setup_path() {
-    local path_line="export PATH=\"\$HOME/.onwatch:\$PATH\""
+    local path_line="export PATH=\"\$HOME/.oneauthwatch:\$PATH\""
     local shell_rc=""
 
     # Already in PATH?
-    if command -v onwatch &>/dev/null 2>&1; then
+    if command -v oneauthwatch-server &>/dev/null 2>&1; then
         return
     fi
 
@@ -1260,8 +1260,8 @@ setup_path() {
     esac
 
     if [[ -n "$shell_rc" && -f "$shell_rc" ]]; then
-        if ! grep -q '\.onwatch' "$shell_rc" 2>/dev/null; then
-            printf '\n# onWatch\n%s\n' "$path_line" >> "$shell_rc"
+        if ! grep -q '\.oneauthwatch' "$shell_rc" 2>/dev/null; then
+            printf '\n# OneAuthWatch\n%s\n' "$path_line" >> "$shell_rc"
             ok "Added to PATH in ${shell_rc}"
         fi
     else
@@ -1278,19 +1278,19 @@ start_service() {
     local username="${SETUP_USERNAME:-admin}"
     local password="${SETUP_PASSWORD}"
 
-    info "Starting onWatch..."
+    info "Starting OneAuthWatch..."
 
     if [[ "$OS" == "linux" ]] && command -v systemctl &>/dev/null; then
         # ── systemd start ──
-        if ! _systemctl start onwatch 2>/dev/null; then
+        if ! _systemctl start oneauthwatch-server 2>/dev/null; then
             print_errors "$port"
             return 1
         fi
 
         sleep 2
 
-        if _systemctl is-active --quiet onwatch 2>/dev/null; then
-            ok "onWatch is running"
+        if _systemctl is-active --quiet oneauthwatch-server 2>/dev/null; then
+            ok "OneAuthWatch is running"
         else
             print_errors "$port"
             return 1
@@ -1298,9 +1298,9 @@ start_service() {
     else
         # ── Direct start (macOS / Linux without systemd) ──
         cd "$INSTALL_DIR"
-        if "${BIN_DIR}/onwatch" 2>&1; then
+        if "${BIN_DIR}/oneauthwatch-server" 2>&1; then
             sleep 1
-            ok "onWatch is running in background"
+            ok "OneAuthWatch is running in background"
         else
             print_errors "$port"
             return 1
@@ -1322,13 +1322,13 @@ print_errors() {
     local port="${1:-9211}"
 
     echo ""
-    printf "  ${RED}${BOLD}onWatch failed to start${NC}\n"
+    printf "  ${RED}${BOLD}OneAuthWatch failed to start${NC}\n"
 
     # Show systemd status/logs on Linux
     if [[ "$OS" == "linux" ]] && command -v systemctl &>/dev/null; then
         echo ""
         printf "  ${DIM}Service status:${NC}\n"
-        _systemctl status onwatch --no-pager 2>&1 | head -12 | sed 's/^/    /' || true
+        _systemctl status oneauthwatch-server --no-pager 2>&1 | head -12 | sed 's/^/    /' || true
         echo ""
         printf "  ${DIM}Recent logs:${NC}\n"
         _journalctl -n 10 --no-pager 2>&1 | sed 's/^/    /' || true
@@ -1351,7 +1351,7 @@ print_errors() {
     if [[ "$OS" == "linux" ]] && command -v systemctl &>/dev/null; then
         printf "  ${DIM}Full logs: $(_jctl_cmd) -f${NC}\n"
     else
-        printf "  ${DIM}Debug mode: onwatch --debug${NC}\n"
+        printf "  ${DIM}Debug mode: oneauthwatch-server --debug${NC}\n"
     fi
 }
 
@@ -1360,7 +1360,7 @@ main() {
     parse_args "$@"
 
     printf "\n"
-    printf "  ${BOLD}onWatch Installer${NC}\n"
+    printf "  ${BOLD}OneAuthWatch Installer${NC}\n"
     printf "  ${DIM}https://github.com/${REPO}${NC}\n"
     printf "\n"
 

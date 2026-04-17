@@ -2,11 +2,11 @@
 
 > **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
-**Goal:** Add Codex as a first-class onWatch provider using OAuth auth-state detection and usage polling, with uniform backend/API/UI behavior matching Anthropic/Copilot.
+**Goal:** Add Codex as a first-class OneAuthWatch provider using OAuth auth-state detection and usage polling, with uniform backend/API/UI behavior matching Anthropic/Copilot.
 
 **Architecture:** Implement Codex as a dynamic-quota provider (`five_hour`, `seven_day`) with provider-specific API/store/tracker/agent modules, then wire it through existing provider dispatch (`current/history/cycles/summary/sessions/insights/cycle-overview`) and dashboard rendering. Reuse Anthropic/Copilot patterns for snapshot normalization, cycle tracking, and dynamic cards/charts. Keep V1 OAuth-only and resilient: no CLI fallback path.
 
-**Tech Stack:** Go 1.25+, net/http, SQLite (`modernc.org/sqlite`), html/template + embedded static JS, existing onWatch agent/tracker/store architecture, TDD with `go test`.
+**Tech Stack:** Go 1.25+, net/http, SQLite (`modernc.org/sqlite`), html/template + embedded static JS, existing OneAuthWatch agent/tracker/store architecture, TDD with `go test`.
 
 ---
 

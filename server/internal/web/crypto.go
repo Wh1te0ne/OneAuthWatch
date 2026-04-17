@@ -44,7 +44,7 @@ func DeriveEncryptionKey(passwordHash string, salt []byte) string {
 	// Use HKDF-SHA256 for secure key derivation
 	// secret = passwordHash bytes
 	// salt = stored salt from database (or nil to use package-level salt)
-	// info = "onwatch-smtp-encryption" (domain separation)
+	// info = "oneauthwatch-smtp-encryption" (domain separation)
 
 	// Use package-level salt if none provided
 	if salt == nil {
@@ -61,7 +61,7 @@ func DeriveEncryptionKey(passwordHash string, salt []byte) string {
 		return hex.EncodeToString(h[:])
 	}
 
-	hkdfReader := hkdf.New(sha256.New, []byte(passwordHash), salt, []byte("onwatch-smtp-encryption"))
+	hkdfReader := hkdf.New(sha256.New, []byte(passwordHash), salt, []byte("oneauthwatch-smtp-encryption"))
 	key := make([]byte, 32)
 	if _, err := io.ReadFull(hkdfReader, key); err != nil {
 		// Fallback to legacy on error

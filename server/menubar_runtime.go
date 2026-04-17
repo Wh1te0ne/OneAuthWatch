@@ -75,9 +75,9 @@ func processZombie(pid int) bool {
 
 func menubarLogNames(testMode bool) []string {
 	if testMode {
-		return []string{"menubar-test.log", ".oneauthwatch-menubar-test.log", ".onwatch-menubar-test.log"}
+		return []string{"menubar-test.log", ".oneauthwatch-menubar-test.log", ".oneauthwatch-menubar-test.log"}
 	}
-	return []string{"menubar.log", ".oneauthwatch-menubar.log", ".onwatch-menubar.log"}
+	return []string{"menubar.log", ".oneauthwatch-menubar.log", ".oneauthwatch-menubar.log"}
 }
 
 func menubarLogPath(cfg *config.Config) string {

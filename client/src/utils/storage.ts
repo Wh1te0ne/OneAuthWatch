@@ -82,7 +82,6 @@ type GeminiCredentialsFile = {
 };
 
 const CURRENT_BACKUP_FORMAT = 'oneauthwatch-backup';
-const LEGACY_BACKUP_FORMAT = 'codex' + '-manager-backup';
 let lastWorkspaceMetadataRefreshAt = 0;
 let workspaceMetadataRefreshPromise: Promise<StoredAccount[]> | null = null;
 
@@ -385,7 +384,7 @@ function parseAccountsBackup(data: string): AccountsBackupFile {
     throw new Error('备份文件不是有效的 JSON');
   }
 
-  if (parsed.format !== CURRENT_BACKUP_FORMAT && parsed.format !== LEGACY_BACKUP_FORMAT) {
+  if (parsed.format !== CURRENT_BACKUP_FORMAT) {
     throw new Error('无效的备份格式');
   }
 

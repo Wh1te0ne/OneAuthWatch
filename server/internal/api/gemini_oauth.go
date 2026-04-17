@@ -74,7 +74,7 @@ func RefreshGeminiTokenWithURL(ctx context.Context, refreshToken, clientID, clie
 	}
 
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	req.Header.Set("User-Agent", "onwatch/1.0")
+	req.Header.Set("User-Agent", "oneauthwatch/1.0")
 
 	client := &http.Client{Timeout: 30 * time.Second}
 	resp, err := client.Do(req)

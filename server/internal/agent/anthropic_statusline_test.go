@@ -463,7 +463,7 @@ func TestSetupStatuslineBridge_Disabled(t *testing.T) {
 		t.Fatalf("mkdir: %v", err)
 	}
 
-	configDir := filepath.Join(home, ".onwatch")
+	configDir := filepath.Join(home, ".oneauthwatch")
 	os.MkdirAll(configDir, 0o700)
 	os.WriteFile(filepath.Join(configDir, "config.json"), []byte(`{"statusline_bridge": false}`), 0o600)
 

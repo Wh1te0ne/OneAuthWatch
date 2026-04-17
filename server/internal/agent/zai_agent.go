@@ -1,4 +1,4 @@
-// Package agent provides the background polling agent for onWatch.
+// Package agent provides the background polling agent for OneAuthWatch.
 package agent
 
 import (

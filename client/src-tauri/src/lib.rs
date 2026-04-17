@@ -1616,20 +1616,198 @@ fn detect_gemini_family(model_id: &str) -> &'static str {
     "other"
 }
 
+fn detect_gemini_cli_bundle_dirs() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+
+    let mut push_dir = |path: PathBuf| {
+        if path.is_dir() && !dirs.iter().any(|existing| existing == &path) {
+            dirs.push(path);
+        }
+    };
+
+    if let Ok(app_data) = std::env::var("APPDATA") {
+        push_dir(
+            PathBuf::from(app_data)
+                .join("npm")
+                .join("node_modules")
+                .join("@google")
+                .join("gemini-cli")
+                .join("bundle"),
+        );
+    }
+
+    if let Some(home) = dirs::home_dir() {
+        push_dir(
+            home.join(".npm-global")
+                .join("lib")
+                .join("node_modules")
+                .join("@google")
+                .join("gemini-cli")
+                .join("bundle"),
+        );
+        push_dir(
+            home.join(".local")
+                .join("share")
+                .join("pnpm")
+                .join("global")
+                .join("5")
+                .join("node_modules")
+                .join("@google")
+                .join("gemini-cli")
+                .join("bundle"),
+        );
+    }
+
+    if let Some(path_var) = std::env::var_os("PATH") {
+        for path_dir in std::env::split_paths(&path_var) {
+            for shim_name in gemini_cli_shim_names() {
+                let shim_path = path_dir.join(shim_name);
+                if let Some(bundle_dir) = detect_gemini_bundle_dir_from_shim(&shim_path) {
+                    push_dir(bundle_dir);
+                }
+            }
+        }
+    }
+
+    #[cfg(not(windows))]
+    {
+        push_dir(
+            PathBuf::from("/usr/local/lib/node_modules/@google/gemini-cli/bundle"),
+        );
+        push_dir(
+            PathBuf::from("/opt/homebrew/lib/node_modules/@google/gemini-cli/bundle"),
+        );
+        push_dir(PathBuf::from("/usr/lib/node_modules/@google/gemini-cli/bundle"));
+    }
+
+    dirs
+}
+
+#[cfg(windows)]
+fn gemini_cli_shim_names() -> &'static [&'static str] {
+    &["gemini.cmd", "gemini.ps1", "gemini"]
+}
+
+#[cfg(not(windows))]
+fn gemini_cli_shim_names() -> &'static [&'static str] {
+    &["gemini"]
+}
+
+fn detect_gemini_bundle_dir_from_shim(shim_path: &Path) -> Option<PathBuf> {
+    let contents = fs::read_to_string(shim_path).ok()?;
+    if !contents.contains("@google") || !contents.contains("gemini-cli") {
+        return None;
+    }
+
+    let bundle_dir = shim_path
+        .parent()?
+        .join("node_modules")
+        .join("@google")
+        .join("gemini-cli")
+        .join("bundle");
+    if bundle_dir.is_dir() {
+        Some(bundle_dir)
+    } else {
+        None
+    }
+}
+
+fn extract_gemini_google_client_id(text: &str) -> Option<String> {
+    const SUFFIX: &str = ".apps.googleusercontent.com";
+    let mut search_start = 0;
+
+    while let Some(relative_idx) = text[search_start..].find(SUFFIX) {
+        let idx = search_start + relative_idx;
+        let mut start = idx;
+        while start > 0 {
+            let ch = text.as_bytes()[start - 1] as char;
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' || ch == '.' {
+                start -= 1;
+            } else {
+                break;
+            }
+        }
+
+        let candidate = text[start..idx + SUFFIX.len()].trim().to_string();
+        if candidate.contains('-') {
+            return Some(candidate);
+        }
+
+        search_start = idx + SUFFIX.len();
+    }
+
+    None
+}
+
+fn extract_gemini_google_client_secret(text: &str) -> Option<String> {
+    const PREFIX: &str = "GOCSPX-";
+    let idx = text.find(PREFIX)?;
+    let mut end = idx + PREFIX.len();
+    while end < text.len() {
+        let ch = text.as_bytes()[end] as char;
+        if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+            end += 1;
+        } else {
+            break;
+        }
+    }
+
+    Some(text[idx..end].trim().to_string())
+}
+
+fn detect_gemini_oauth_client_credentials_from_cli() -> Option<(String, String)> {
+    for bundle_dir in detect_gemini_cli_bundle_dirs() {
+        let entries = match fs::read_dir(&bundle_dir) {
+            Ok(entries) => entries,
+            Err(_) => continue,
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Some(file_name) = path.file_name() else {
+                continue;
+            };
+            let file_name = file_name.to_string_lossy();
+            if !file_name.starts_with("oauth2-provider-") || !file_name.ends_with(".js") {
+                continue;
+            }
+
+            let contents = match fs::read_to_string(&path) {
+                Ok(contents) => contents,
+                Err(_) => continue,
+            };
+            let Some(client_id) = extract_gemini_google_client_id(&contents) else {
+                continue;
+            };
+            let Some(client_secret) = extract_gemini_google_client_secret(&contents) else {
+                continue;
+            };
+            return Some((client_id, client_secret));
+        }
+    }
+
+    None
+}
+
 fn read_gemini_oauth_client_credentials() -> Result<(String, String), String> {
     let client_id = std::env::var("ONEAUTHWATCH_GEMINI_CLIENT_ID")
         .or_else(|_| std::env::var("GEMINI_CLIENT_ID"))
-        .map_err(|_| {
-            "missing Gemini OAuth client id: set ONEAUTHWATCH_GEMINI_CLIENT_ID".to_string()
-        })?;
+        .ok()
+        .map(|value| value.trim().to_string());
     let client_secret = std::env::var("ONEAUTHWATCH_GEMINI_CLIENT_SECRET")
         .or_else(|_| std::env::var("GEMINI_CLIENT_SECRET"))
-        .map_err(|_| {
-            "missing Gemini OAuth client secret: set ONEAUTHWATCH_GEMINI_CLIENT_SECRET"
-                .to_string()
-        })?;
+        .ok()
+        .map(|value| value.trim().to_string());
 
-    Ok((client_id.trim().to_string(), client_secret.trim().to_string()))
+    match (client_id, client_secret) {
+        (Some(client_id), Some(client_secret))
+            if !client_id.is_empty() && !client_secret.is_empty() =>
+        {
+            Ok((client_id, client_secret))
+        }
+        _ => detect_gemini_oauth_client_credentials_from_cli().ok_or_else(|| {
+            "missing Gemini OAuth client credentials: install Gemini CLI or set ONEAUTHWATCH_GEMINI_CLIENT_ID and ONEAUTHWATCH_GEMINI_CLIENT_SECRET".to_string()
+        }),
+    }
 }
 
 async fn refresh_claude_access_token(

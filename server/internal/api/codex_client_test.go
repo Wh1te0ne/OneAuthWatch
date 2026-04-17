@@ -47,8 +47,8 @@ func TestCodexClient_FetchUsage_Success(t *testing.T) {
 		t.Fatalf("Authorization = %q, want Bearer oauth_token", auth)
 	}
 	ua, _ := gotUA.Load().(string)
-	if ua != "onwatch/1.0" {
-		t.Fatalf("User-Agent = %q, want onwatch/1.0", ua)
+	if ua != "oneauthwatch-server/1.0" {
+		t.Fatalf("User-Agent = %q, want oneauthwatch-server/1.0", ua)
 	}
 }
 

@@ -168,7 +168,7 @@ func TestPreflightDatabasePath_UnwritableExistingFile(t *testing.T) {
 	}
 
 	base := t.TempDir()
-	dbPath := filepath.Join(base, "onwatch.db")
+	dbPath := filepath.Join(base, "oneauthwatch.db")
 	if err := os.WriteFile(dbPath, []byte("seed"), 0o444); err != nil {
 		t.Fatalf("write dbPath: %v", err)
 	}
@@ -202,7 +202,7 @@ func TestPreflightDatabasePath_UnwritableDirectory(t *testing.T) {
 		_ = os.Chmod(readOnlyDir, 0o755)
 	})
 
-	err := preflightDatabasePath(filepath.Join(readOnlyDir, "onwatch.db"))
+	err := preflightDatabasePath(filepath.Join(readOnlyDir, "oneauthwatch.db"))
 	if err == nil {
 		t.Fatal("preflightDatabasePath should fail for unwritable directory")
 	}

@@ -31,7 +31,7 @@ type Server struct {
 
 // NewServer creates a new Server instance.
 // passwordHash should be a SHA-256 hex hash of the admin password.
-// basePath is the URL prefix for subdirectory hosting (e.g. "/onwatch"), empty for root.
+// basePath is the URL prefix for subdirectory hosting (e.g. "/oneauthwatch"), empty for root.
 func NewServer(port int, handler *Handler, logger *slog.Logger, username, passwordHash, host, basePath string) *Server {
 	if port == 0 {
 		port = 9211 // default port
@@ -41,7 +41,7 @@ func NewServer(port int, handler *Handler, logger *slog.Logger, username, passwo
 	}
 
 	// Helper to prefix routes with base path
-	bp := basePath // e.g. "" or "/onwatch"
+	bp := basePath // e.g. "" or "/oneauthwatch"
 	p := func(path string) string { return bp + path }
 
 	mux := http.NewServeMux()

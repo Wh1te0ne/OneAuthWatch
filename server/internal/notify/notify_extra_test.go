@@ -463,8 +463,8 @@ func TestConfigureSMTP_DecryptionFailure(t *testing.T) {
 		Username:    "user@test.com",
 		Password:    fakeEncryptedPass,
 		Protocol:    "none",
-		FromAddress: "alerts@onwatch.dev",
-		FromName:    "onWatch",
+		FromAddress: "alerts@oneauthwatch-server.dev",
+		FromName:    "OneAuthWatch",
 		To:          "admin@example.com",
 	})
 	s.SetSetting("smtp", string(smtpJSON))
