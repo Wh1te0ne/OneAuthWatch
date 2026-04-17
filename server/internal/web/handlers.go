@@ -420,6 +420,10 @@ func applyPublicSyncHeaders(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Vary", "Origin")
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, OPTIONS")
 		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, X-Requested-With, Authorization")
+		if strings.EqualFold(strings.TrimSpace(r.Header.Get("Access-Control-Request-Private-Network")), "true") {
+			w.Header().Set("Access-Control-Allow-Private-Network", "true")
+			w.Header().Add("Vary", "Access-Control-Request-Private-Network")
+		}
 	}
 }
 

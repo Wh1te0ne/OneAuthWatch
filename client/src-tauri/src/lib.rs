@@ -1423,20 +1423,20 @@ struct ClaudeOauthTokens {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "snake_case")]
 struct ClaudeStatuslineSnapshot {
     rate_limits: Option<ClaudeStatuslineRateLimits>,
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "snake_case")]
 struct ClaudeStatuslineRateLimits {
     five_hour: Option<ClaudeStatuslineWindow>,
     seven_day: Option<ClaudeStatuslineWindow>,
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "snake_case")]
 struct ClaudeStatuslineWindow {
     used_percentage: Option<f64>,
     resets_at: Option<i64>,
