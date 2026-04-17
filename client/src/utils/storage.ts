@@ -1,4 +1,4 @@
-import { safeInvoke as invoke } from './invoke';
+import { isTauri, safeInvoke as invoke } from './invoke';
 import type {
   AccountsStore,
   StoredAccount,
@@ -498,15 +498,23 @@ export async function loadServerAccountsStore(serverUrl: string): Promise<Accoun
     return DEFAULT_STORE;
   }
 
-  const response = await fetch(`${normalizedUrl}/api/client/state`, {
-    headers: {
-      Accept: 'application/json',
-    },
-  });
-  if (!response.ok) {
-    throw new Error(`加载服务器数据失败: ${response.status} ${response.statusText}`);
+  let payload: unknown;
+  if (isTauri()) {
+    const raw = await invoke<string>('load_remote_accounts_store', {
+      serverUrl: normalizedUrl,
+    });
+    payload = JSON.parse(raw) as unknown;
+  } else {
+    const response = await fetch(`${normalizedUrl}/api/client/state`, {
+      headers: {
+        Accept: 'application/json',
+      },
+    });
+    if (!response.ok) {
+      throw new Error(`加载服务器数据失败: ${response.status} ${response.statusText}`);
+    }
+    payload = await response.json();
   }
-  const payload: unknown = await response.json();
 
   const parsed = payload as Partial<AccountsStore>;
   return {

@@ -1,4 +1,5 @@
 use chrono::{Local, TimeZone};
+use base64::Engine;
 use std::collections::HashMap;
 use std::fs;
 use std::io::{BufRead, BufReader};
@@ -702,6 +703,61 @@ fn delete_account_auth(account_id: String) -> Result<(), String> {
 #[tauri::command]
 fn read_file_content(file_path: String) -> Result<String, String> {
     fs::read_to_string(&file_path).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn load_remote_accounts_store(server_url: String) -> Result<String, String> {
+    let normalized = server_url.trim().trim_end_matches('/').to_string();
+    if normalized.is_empty() {
+        return Err("服务器地址为空".to_string());
+    }
+
+    let client = build_http_client()?;
+    let response = client
+        .get(format!("{}/api/client/state", normalized))
+        .header("Accept", "application/json")
+        .send()
+        .await
+        .map_err(|e| format!("请求服务器状态失败: {}", e))?;
+
+    let status = response.status();
+    let body = response.text().await.map_err(|e| e.to_string())?;
+    if !status.is_success() {
+        return Err(format!("加载服务器数据失败: {} {}", status.as_u16(), status));
+    }
+
+    Ok(body)
+}
+
+#[tauri::command]
+async fn sync_remote_accounts_store(server_url: String, payload: String) -> Result<(), String> {
+    let normalized = server_url.trim().trim_end_matches('/').to_string();
+    if normalized.is_empty() {
+        return Err("服务器地址为空".to_string());
+    }
+
+    let client = build_http_client()?;
+    let response = client
+        .post(format!("{}/api/credentials", normalized))
+        .header("Content-Type", "application/json")
+        .header("X-Requested-With", "XMLHttpRequest")
+        .body(payload)
+        .send()
+        .await
+        .map_err(|e| format!("同步服务器失败: {}", e))?;
+
+    let status = response.status();
+    let body = response.text().await.unwrap_or_default();
+    if !status.is_success() {
+        let detail = if body.trim().is_empty() {
+            format!("{} {}", status.as_u16(), status)
+        } else {
+            format!("{} {} - {}", status.as_u16(), status, body.trim())
+        };
+        return Err(format!("同步失败: {}", detail));
+    }
+
+    Ok(())
 }
 
 /// 写入文件内容
@@ -1788,7 +1844,26 @@ fn detect_gemini_oauth_client_credentials_from_cli() -> Option<(String, String)>
     None
 }
 
-fn read_gemini_oauth_client_credentials() -> Result<(String, String), String> {
+fn extract_jwt_claim_string(token: &str, claim: &str) -> Option<String> {
+    let mut parts = token.split('.');
+    let _header = parts.next()?;
+    let payload = parts.next()?;
+    let mut normalized = payload.replace('-', "+").replace('_', "/");
+    while normalized.len() % 4 != 0 {
+        normalized.push('=');
+    }
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(normalized)
+        .ok()?;
+    let value: serde_json::Value = serde_json::from_slice(&decoded).ok()?;
+    value
+        .get(claim)
+        .and_then(|v| v.as_str())
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
+fn read_gemini_oauth_client_credentials(auth: Option<&GeminiStoredAuth>) -> Result<(String, Option<String>), String> {
     let client_id = std::env::var("ONEAUTHWATCH_GEMINI_CLIENT_ID")
         .or_else(|_| std::env::var("GEMINI_CLIENT_ID"))
         .ok()
@@ -1802,11 +1877,22 @@ fn read_gemini_oauth_client_credentials() -> Result<(String, String), String> {
         (Some(client_id), Some(client_secret))
             if !client_id.is_empty() && !client_secret.is_empty() =>
         {
-            Ok((client_id, client_secret))
+            Ok((client_id, Some(client_secret)))
         }
-        _ => detect_gemini_oauth_client_credentials_from_cli().ok_or_else(|| {
-            "missing Gemini OAuth client credentials: install Gemini CLI or set ONEAUTHWATCH_GEMINI_CLIENT_ID and ONEAUTHWATCH_GEMINI_CLIENT_SECRET".to_string()
-        }),
+        _ => {
+            if let Some((client_id, client_secret)) = detect_gemini_oauth_client_credentials_from_cli() {
+                return Ok((client_id, Some(client_secret)));
+            }
+
+            if let Some(aud) = auth
+                .and_then(|value| value.id_token.as_deref())
+                .and_then(|token| extract_jwt_claim_string(token, "aud"))
+            {
+                return Ok((aud, None));
+            }
+
+            Err("missing Gemini OAuth client credentials: install Gemini CLI or set ONEAUTHWATCH_GEMINI_CLIENT_ID and ONEAUTHWATCH_GEMINI_CLIENT_SECRET".to_string())
+        }
     }
 }
 
@@ -1838,15 +1924,20 @@ async fn refresh_claude_access_token(
 
 async fn refresh_gemini_access_token(
     client: &Client,
+    auth: Option<&GeminiStoredAuth>,
     refresh_token: &str,
 ) -> Result<GeminiStoredAuth, String> {
-    let (client_id, client_secret) = read_gemini_oauth_client_credentials()?;
-    let params = [
-        ("grant_type", "refresh_token"),
-        ("refresh_token", refresh_token),
-        ("client_id", client_id.as_str()),
-        ("client_secret", client_secret.as_str()),
+    let (client_id, client_secret) = read_gemini_oauth_client_credentials(auth)?;
+    let mut params = vec![
+        ("grant_type", "refresh_token".to_string()),
+        ("refresh_token", refresh_token.to_string()),
+        ("client_id", client_id),
     ];
+    if let Some(client_secret) = client_secret {
+        if !client_secret.trim().is_empty() {
+            params.push(("client_secret", client_secret));
+        }
+    }
 
     let response = client
         .post("https://oauth2.googleapis.com/token")
@@ -3005,7 +3096,7 @@ async fn get_gemini_usage(account_id: String) -> Result<UsageResult, String> {
         || (expires_at > 0 && expires_at <= chrono::Utc::now().timestamp_millis() + 60_000);
 
     if should_refresh && !refresh_token.is_empty() {
-        if let Ok(refreshed) = refresh_gemini_access_token(&client, &refresh_token).await {
+        if let Ok(refreshed) = refresh_gemini_access_token(&client, Some(&auth), &refresh_token).await {
             access_token = refreshed.access_token.clone().unwrap_or_default();
             auth.access_token = refreshed.access_token;
             auth.refresh_token = refreshed.refresh_token;
@@ -3332,6 +3423,8 @@ pub fn run() {
             read_account_auth,
             delete_account_auth,
             read_file_content,
+            load_remote_accounts_store,
+            sync_remote_accounts_store,
             write_file_content,
             get_home_dir,
             get_wham_account_metadata,

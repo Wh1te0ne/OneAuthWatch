@@ -366,23 +366,34 @@ export const useAccountStore = create<AccountState>((set, get) => ({
         );
       }
 
-      const headers: Record<string, string> = {
-        'Content-Type': 'application/json',
-        'X-Requested-With': 'XMLHttpRequest',
-      };
-
-      const res = await fetch(`${config.serverUrl.replace(/\/$/, '')}/api/credentials`, {
-        method: 'POST',
-        headers,
-        body: JSON.stringify({
-          codex_token: codexToken || undefined,
-          client_state: snapshot,
-          account_auths: accountAuths,
-        }),
+      const normalizedServerUrl = config.serverUrl.replace(/\/$/, '');
+      const payload = JSON.stringify({
+        codex_token: codexToken || undefined,
+        client_state: snapshot,
+        account_auths: accountAuths,
       });
 
-      if (!res.ok) {
-        throw new Error(`同步失败: ${res.status} ${res.statusText}`);
+      if (isTauri()) {
+        const { invoke } = await import('@tauri-apps/api/core');
+        await invoke('sync_remote_accounts_store', {
+          serverUrl: normalizedServerUrl,
+          payload,
+        });
+      } else {
+        const headers: Record<string, string> = {
+          'Content-Type': 'application/json',
+          'X-Requested-With': 'XMLHttpRequest',
+        };
+
+        const res = await fetch(`${normalizedServerUrl}/api/credentials`, {
+          method: 'POST',
+          headers,
+          body: payload,
+        });
+
+        if (!res.ok) {
+          throw new Error(`同步失败: ${res.status} ${res.statusText}`);
+        }
       }
     } catch (error) {
       if (error instanceof Error) {
