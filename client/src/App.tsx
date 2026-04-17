@@ -105,8 +105,8 @@ const providerSections: Array<{
   description: string;
 }> = [
   { key: 'codex', title: 'Codex', description: '本地账号与工作区 auth' },
-  { key: 'claude', title: 'Claude Code', description: '服务器持续轮询额度快照' },
-  { key: 'gemini', title: 'Gemini', description: '服务器持续轮询额度快照' },
+  { key: 'claude', title: 'Claude Code', description: '本地 Claude 凭据与额度快照' },
+  { key: 'gemini', title: 'Gemini', description: '本地 Gemini 凭据与额度快照' },
 ];
 
 const FOCUS_RELOAD_INTERVAL_MS = 60_000;
@@ -143,6 +143,7 @@ function App() {
     gemini: true,
   });
   const autoImportInFlightRef = useRef(false);
+  const providerBootstrapSyncRef = useRef(false);
   const lastFocusReloadAtRef = useRef(0);
   const toastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const isHandlingWindowCloseRef = useRef(false);
@@ -239,6 +240,36 @@ function App() {
     void refreshSingleAccount(targetId);
     setShouldInitialRefresh(false);
   }, [managedCodexAccounts, refreshSingleAccount, shouldInitialRefresh]);
+
+  useEffect(() => {
+    if (!hasLoadedAccounts || !isDesktopMode || isInitializing || providerBootstrapSyncRef.current) {
+      return;
+    }
+
+    providerBootstrapSyncRef.current = true;
+    let active = true;
+
+    const runProviderBootstrapSync = async () => {
+      const [syncedClaude, syncedGemini] = await Promise.all([
+        syncCurrentClaudeAccount(),
+        syncCurrentGeminiAccount(),
+      ]);
+
+      if (!active) return;
+
+      if (syncedClaude || syncedGemini) {
+        await loadAccounts();
+      }
+
+      await refreshAllUsage();
+    };
+
+    void runProviderBootstrapSync();
+
+    return () => {
+      active = false;
+    };
+  }, [hasLoadedAccounts, isDesktopMode, isInitializing, loadAccounts, refreshAllUsage]);
 
   useEffect(() => {
     if (!error) return;

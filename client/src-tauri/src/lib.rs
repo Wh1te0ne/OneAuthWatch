@@ -1887,6 +1887,74 @@ async fn refresh_gemini_access_token(
     })
 }
 
+fn merge_claude_auth(
+    stored_auth: ClaudeStoredAuth,
+    current_auth: Option<ClaudeStoredAuth>,
+) -> ClaudeStoredAuth {
+    let Some(mut current_auth) = current_auth else {
+        return stored_auth;
+    };
+
+    match (&stored_auth.claude_ai_oauth, &mut current_auth.claude_ai_oauth) {
+        (Some(stored_oauth), Some(current_oauth)) => {
+            if current_oauth.access_token.is_none() {
+                current_oauth.access_token = stored_oauth.access_token.clone();
+            }
+            if current_oauth.refresh_token.is_none() {
+                current_oauth.refresh_token = stored_oauth.refresh_token.clone();
+            }
+            if current_oauth.expires_at.is_none() {
+                current_oauth.expires_at = stored_oauth.expires_at;
+            }
+            if current_oauth.subscription_type.is_none() {
+                current_oauth.subscription_type = stored_oauth.subscription_type.clone();
+            }
+        }
+        (Some(stored_oauth), None) => {
+            current_auth.claude_ai_oauth = Some(stored_oauth.clone());
+        }
+        _ => {}
+    }
+
+    current_auth
+}
+
+fn read_current_claude_auth() -> Option<ClaudeStoredAuth> {
+    let path = get_claude_credentials_path().ok()?;
+    let contents = fs::read_to_string(path).ok()?;
+    serde_json::from_str(&contents).ok()
+}
+
+fn merge_gemini_auth(
+    stored_auth: GeminiStoredAuth,
+    current_auth: Option<GeminiStoredAuth>,
+) -> GeminiStoredAuth {
+    let Some(mut current_auth) = current_auth else {
+        return stored_auth;
+    };
+
+    if current_auth.access_token.is_none() {
+        current_auth.access_token = stored_auth.access_token.clone();
+    }
+    if current_auth.refresh_token.is_none() {
+        current_auth.refresh_token = stored_auth.refresh_token.clone();
+    }
+    if current_auth.expiry_date.is_none() {
+        current_auth.expiry_date = stored_auth.expiry_date;
+    }
+    if current_auth.id_token.is_none() {
+        current_auth.id_token = stored_auth.id_token.clone();
+    }
+
+    current_auth
+}
+
+fn read_current_gemini_auth() -> Option<GeminiStoredAuth> {
+    let path = dirs::home_dir()?.join(".gemini").join("oauth_creds.json");
+    let contents = fs::read_to_string(path).ok()?;
+    serde_json::from_str(&contents).ok()
+}
+
 fn extract_auth_credentials(auth_json: &str) -> Result<(String, String), String> {
     let auth: AuthConfig = serde_json::from_str(auth_json).map_err(|e| e.to_string())?;
     let tokens = auth
@@ -2709,7 +2777,9 @@ async fn get_claude_usage(account_id: String) -> Result<UsageResult, String> {
     }
 
     let auth_json = read_account_auth(account_id.clone())?;
-    let mut auth: ClaudeStoredAuth = serde_json::from_str(&auth_json).map_err(|e| e.to_string())?;
+    let stored_auth: ClaudeStoredAuth =
+        serde_json::from_str(&auth_json).map_err(|e| e.to_string())?;
+    let mut auth = merge_claude_auth(stored_auth, read_current_claude_auth());
     let local_auth_path = get_claude_credentials_path()?;
     if local_auth_path.exists() {
         if let Ok(local_auth_json) = fs::read_to_string(&local_auth_path) {
@@ -2789,6 +2859,10 @@ async fn get_claude_usage(account_id: String) -> Result<UsageResult, String> {
     }
 
     if access_token.is_empty() {
+        if let Some(cached_result) = build_claude_cached_usage_result(plan_type.clone())? {
+            return Ok(cached_result);
+        }
+
         return Ok(UsageResult {
             status: "missing_token".to_string(),
             message: Some("缺少 Claude access token".to_string()),
@@ -2811,6 +2885,10 @@ async fn get_claude_usage(account_id: String) -> Result<UsageResult, String> {
     let body = response.text().await.map_err(|e| e.to_string())?;
 
     if status == reqwest::StatusCode::UNAUTHORIZED {
+        if let Some(cached_result) = build_claude_cached_usage_result(plan_type.clone())? {
+            return Ok(cached_result);
+        }
+
         return Ok(UsageResult {
             status: "expired".to_string(),
             message: Some("Claude token 已过期或无效".to_string()),
@@ -2915,7 +2993,9 @@ async fn get_gemini_usage(account_id: String) -> Result<UsageResult, String> {
     }
 
     let auth_json = read_account_auth(account_id.clone())?;
-    let mut auth: GeminiStoredAuth = serde_json::from_str(&auth_json).map_err(|e| e.to_string())?;
+    let stored_auth: GeminiStoredAuth =
+        serde_json::from_str(&auth_json).map_err(|e| e.to_string())?;
+    let mut auth = merge_gemini_auth(stored_auth, read_current_gemini_auth());
     let client = build_http_client()?;
 
     let mut access_token = auth.access_token.clone().unwrap_or_default();

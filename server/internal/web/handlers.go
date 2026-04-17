@@ -415,12 +415,26 @@ func applyPublicSyncHeaders(w http.ResponseWriter, r *http.Request) {
 	if origin == "" {
 		return
 	}
-	if strings.HasPrefix(origin, "http://127.0.0.1:") || strings.HasPrefix(origin, "http://localhost:") {
+	if isAllowedPublicSyncOrigin(origin) {
 		w.Header().Set("Access-Control-Allow-Origin", origin)
 		w.Header().Set("Vary", "Origin")
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, OPTIONS")
 		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, X-Requested-With, Authorization")
 	}
+}
+
+func isAllowedPublicSyncOrigin(origin string) bool {
+	if origin == "tauri://localhost" ||
+		origin == "http://tauri.localhost" ||
+		origin == "https://tauri.localhost" ||
+		origin == "app://localhost" {
+		return true
+	}
+
+	return strings.HasPrefix(origin, "http://127.0.0.1:") ||
+		strings.HasPrefix(origin, "http://localhost:") ||
+		strings.HasPrefix(origin, "https://127.0.0.1:") ||
+		strings.HasPrefix(origin, "https://localhost:")
 }
 
 func defaultClientStateSnapshot() string {
