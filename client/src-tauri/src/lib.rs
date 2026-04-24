@@ -26,6 +26,9 @@ const TRAY_MENU_EXIT_ID: &str = "tray-exit";
 const MIN_VALID_EPOCH_MS: i64 = 946684800000; // 2000-01-01T00:00:00Z
 const MAX_VALID_EPOCH_MS: i64 = 4102444800000; // 2100-01-01T00:00:00Z
 const DEFAULT_LOGIN_TIMEOUT_SECONDS: u64 = 180;
+// Claude Code OAuth refresh tokens are single-use. Quota polling must not rotate
+// the shared token that Claude Code relies on for its own refresh.
+const CLAUDE_USAGE_OAUTH_REFRESH_ENABLED: bool = false;
 
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
@@ -1938,6 +1941,14 @@ async fn refresh_claude_access_token(
     serde_json::from_str::<ClaudeRefreshResponse>(&body).map_err(|e| e.to_string())
 }
 
+fn should_refresh_claude_oauth_for_usage(access_token: &str, expires_at: i64, now_ms: i64) -> bool {
+    if !CLAUDE_USAGE_OAUTH_REFRESH_ENABLED {
+        return false;
+    }
+
+    access_token.trim().is_empty() || (expires_at > 0 && expires_at <= now_ms + 60_000)
+}
+
 async fn refresh_gemini_access_token(
     client: &Client,
     auth: Option<&GeminiStoredAuth>,
@@ -2946,8 +2957,11 @@ async fn get_claude_usage(account_id: String) -> Result<UsageResult, String> {
     };
 
     let client = build_http_client()?;
-    let should_refresh = access_token.is_empty()
-        || (expires_at > 0 && expires_at <= chrono::Utc::now().timestamp_millis() + 60_000);
+    let should_refresh = should_refresh_claude_oauth_for_usage(
+        &access_token,
+        expires_at,
+        chrono::Utc::now().timestamp_millis(),
+    );
 
     if should_refresh && !refresh_token.is_empty() {
         if let Ok(refreshed) = refresh_claude_access_token(&client, &refresh_token).await {
@@ -3573,6 +3587,7 @@ mod tests {
     fn tray_account_title_includes_quota_summary() {
         let account = TrayStoredAccount {
             id: "1".to_string(),
+            provider: Some("codex".to_string()),
             alias: "测试账号".to_string(),
             account_info: TrayAccountInfo {
                 email: "test@example.com".to_string(),
@@ -3615,5 +3630,22 @@ mod tests {
         assert!(!should_run_background_auto_refresh(0, 0, 1));
         assert!(!should_run_background_auto_refresh(30, 60_000, 1_800_000));
         assert!(should_run_background_auto_refresh(30, 60_000, 1_900_000));
+    }
+
+    #[test]
+    fn claude_usage_does_not_rotate_shared_refresh_token() {
+        let now_ms = 1_800_000_000_000;
+
+        assert!(!should_refresh_claude_oauth_for_usage("", 0, now_ms));
+        assert!(!should_refresh_claude_oauth_for_usage(
+            "access-token",
+            now_ms + 30_000,
+            now_ms
+        ));
+        assert!(!should_refresh_claude_oauth_for_usage(
+            "access-token",
+            now_ms - 30_000,
+            now_ms
+        ));
     }
 }

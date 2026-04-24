@@ -43,6 +43,65 @@ func anthropicResponse(fiveHour, sevenDay float64) string {
 	return string(data)
 }
 
+func TestIsClaudeCodeProcessDetectsNodeBasedClaudeCode(t *testing.T) {
+	tests := []struct {
+		name        string
+		processName string
+		commandLine string
+		want        bool
+	}{
+		{
+			name:        "native claude executable",
+			processName: "claude.exe",
+			commandLine: "",
+			want:        true,
+		},
+		{
+			name:        "node claude code package",
+			processName: "node.exe",
+			commandLine: `C:\Program Files\nodejs\node.exe C:\Users\me\AppData\Roaming\npm\node_modules\@anthropic-ai\claude-code\cli.js`,
+			want:        true,
+		},
+		{
+			name:        "node claude shim",
+			processName: "node.exe",
+			commandLine: `C:\Program Files\nodejs\node.exe C:\Users\me\AppData\Roaming\npm\node_modules\claude\cli.js`,
+			want:        true,
+		},
+		{
+			name:        "unrelated node process",
+			processName: "node.exe",
+			commandLine: `C:\Program Files\nodejs\node.exe C:\repo\vite\bin\vite.js`,
+			want:        false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := isClaudeCodeProcess(tt.processName, tt.commandLine)
+			if got != tt.want {
+				t.Fatalf("isClaudeCodeProcess() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestWindowsProcessJSONHasClaudeCode(t *testing.T) {
+	jsonOut := []byte(`[
+		{"Name":"node.exe","CommandLine":"C:\\Program Files\\nodejs\\node.exe C:\\Users\\me\\AppData\\Roaming\\npm\\node_modules\\@anthropic-ai\\claude-code\\cli.js"},
+		{"Name":"node.exe","CommandLine":"C:\\Program Files\\nodejs\\node.exe C:\\repo\\vite\\bin\\vite.js"}
+	]`)
+
+	if !windowsProcessJSONHasClaudeCode(jsonOut) {
+		t.Fatal("expected node-based Claude Code process to be detected")
+	}
+
+	withoutClaude := []byte(`{"Name":"node.exe","CommandLine":"C:\\Program Files\\nodejs\\node.exe C:\\repo\\vite\\bin\\vite.js"}`)
+	if windowsProcessJSONHasClaudeCode(withoutClaude) {
+		t.Fatal("did not expect unrelated node process to be detected")
+	}
+}
+
 // TestAnthropicAgent_Run_PollsImmediately verifies the first poll happens immediately on startup,
 // not after waiting for the interval.
 func TestAnthropicAgent_Run_PollsImmediately(t *testing.T) {

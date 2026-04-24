@@ -3,11 +3,13 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
 	"os/exec"
 	"runtime"
+	"strings"
 	"time"
 
 	"github.com/Wh1te0ne/OneAuthWatch/server/internal/api"
@@ -35,18 +37,80 @@ const maxRateLimitFailures = 5
 // Claude Code's pending refresh, causing it to get invalid_grant and re-auth.
 // Exported as a package-level variable so tests can override it.
 //
-// Uses pattern matching (-f) instead of exact name matching (-x) because
-// Claude Code may run as a Node.js process where the process name is "node"
-// rather than "claude". This trades false positive risk for reliable detection.
+// Uses command-line matching because Claude Code often runs as a Node.js
+// process where the executable name is "node" rather than "claude".
 var IsClaudeCodeRunning = func() bool {
 	if runtime.GOOS == "darwin" || runtime.GOOS == "linux" {
 		cmd := exec.Command("pgrep", "-f", "claude")
 		return cmd.Run() == nil
 	}
-	// Windows: tasklist always returns exit 0, so pipe through findstr
-	// to verify the process actually exists in the output.
-	cmd := exec.Command("cmd", "/C", `tasklist /FI "IMAGENAME eq claude.exe" /NH 2>nul | findstr /I "claude.exe"`)
-	return cmd.Run() == nil
+
+	if runtime.GOOS == "windows" && isClaudeCodeRunningWindows() {
+		return true
+	}
+
+	// Fallback for minimal Windows environments where PowerShell/CIM is
+	// unavailable. tasklist only catches a native claude.exe process.
+	out, err := exec.Command("tasklist", "/FI", "IMAGENAME eq claude.exe", "/NH").Output()
+	return err == nil && strings.Contains(strings.ToLower(string(out)), "claude.exe")
+}
+
+type windowsProcessInfo struct {
+	Name        string `json:"Name"`
+	CommandLine string `json:"CommandLine"`
+}
+
+func isClaudeCodeRunningWindows() bool {
+	script := `Get-CimInstance Win32_Process | Where-Object { $_.Name -in @('claude.exe','node.exe') } | Select-Object Name,CommandLine | ConvertTo-Json -Compress`
+	out, err := exec.Command("powershell", "-NoProfile", "-NonInteractive", "-Command", script).Output()
+	if err != nil {
+		return false
+	}
+	return windowsProcessJSONHasClaudeCode(out)
+}
+
+func windowsProcessJSONHasClaudeCode(out []byte) bool {
+	text := strings.TrimSpace(string(out))
+	if text == "" {
+		return false
+	}
+
+	var processes []windowsProcessInfo
+	if strings.HasPrefix(text, "[") {
+		if err := json.Unmarshal([]byte(text), &processes); err != nil {
+			return false
+		}
+	} else {
+		var process windowsProcessInfo
+		if err := json.Unmarshal([]byte(text), &process); err != nil {
+			return false
+		}
+		processes = []windowsProcessInfo{process}
+	}
+
+	for _, process := range processes {
+		if isClaudeCodeProcess(process.Name, process.CommandLine) {
+			return true
+		}
+	}
+	return false
+}
+
+func isClaudeCodeProcess(name, commandLine string) bool {
+	processName := strings.ToLower(strings.TrimSpace(name))
+	if processName == "claude" || processName == "claude.exe" {
+		return true
+	}
+	if processName != "node" && processName != "node.exe" {
+		return false
+	}
+
+	cmd := strings.ToLower(commandLine)
+	return strings.Contains(cmd, "claude-code") ||
+		strings.Contains(cmd, "@anthropic-ai") ||
+		strings.Contains(cmd, `\claude`) ||
+		strings.Contains(cmd, `/claude`) ||
+		strings.Contains(cmd, " claude")
 }
 
 // rateLimitBaseBackoff is the initial backoff duration after an OAuth 429.
