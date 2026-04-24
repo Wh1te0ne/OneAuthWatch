@@ -183,6 +183,32 @@ func codexProfilesDir() string {
 	return filepath.Join(home, ".oneauthwatch", "data", "codex-profiles")
 }
 
+func listCodexProfilesInDir(profilesDir string) ([]CodexProfile, error) {
+	if profilesDir == "" {
+		return nil, fmt.Errorf("could not determine profiles directory")
+	}
+	entries, err := os.ReadDir(profilesDir)
+	if os.IsNotExist(err) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("failed to read profiles directory: %w", err)
+	}
+	var profiles []CodexProfile
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
+			continue
+		}
+		profilePath := filepath.Join(profilesDir, entry.Name())
+		profile, err := loadCodexProfile(profilePath)
+		if err != nil {
+			continue
+		}
+		profiles = append(profiles, *profile)
+	}
+	return profiles, nil
+}
+
 // codexAuthRefreshPath returns the path to the Codex auth.json file.
 func codexAuthRefreshPath() string {
 	if codexHome := strings.TrimSpace(os.Getenv("CODEX_HOME")); codexHome != "" {
@@ -257,30 +283,7 @@ func codexProfileCompositeExternalID(profile CodexProfile) string {
 
 // listCodexProfiles returns all saved Codex profiles from disk.
 func listCodexProfiles() ([]CodexProfile, error) {
-	profilesDir := codexProfilesDir()
-	if profilesDir == "" {
-		return nil, fmt.Errorf("could not determine profiles directory")
-	}
-	entries, err := os.ReadDir(profilesDir)
-	if os.IsNotExist(err) {
-		return nil, nil
-	}
-	if err != nil {
-		return nil, fmt.Errorf("failed to read profiles directory: %w", err)
-	}
-	var profiles []CodexProfile
-	for _, entry := range entries {
-		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
-			continue
-		}
-		profilePath := filepath.Join(profilesDir, entry.Name())
-		profile, err := loadCodexProfile(profilePath)
-		if err != nil {
-			continue
-		}
-		profiles = append(profiles, *profile)
-	}
-	return profiles, nil
+	return listCodexProfilesInDir(codexProfilesDir())
 }
 
 // loadCodexProfile loads a single Codex profile from disk.
@@ -520,10 +523,32 @@ func (h *Handler) persistClientStateSnapshot(raw json.RawMessage) error {
 }
 
 func (h *Handler) codexProfilesStorageDir() string {
+	if h.store != nil {
+		if provJSON, err := h.store.GetSetting("provider_settings"); err == nil && strings.TrimSpace(provJSON) != "" {
+			var provSettings map[string]map[string]interface{}
+			if json.Unmarshal([]byte(provJSON), &provSettings) == nil {
+				if s := provSettings["codex"]; s != nil {
+					if dir, _ := s["profiles_dir"].(string); strings.TrimSpace(dir) != "" {
+						return strings.TrimSpace(dir)
+					}
+				}
+			}
+		}
+	}
 	if h.config != nil && strings.TrimSpace(h.config.DBPath) != "" {
 		return filepath.Join(filepath.Dir(h.config.DBPath), "codex-profiles")
 	}
 	return codexProfilesDir()
+}
+
+func (h *Handler) restartCodexPolling() {
+	if h == nil || h.agentManager == nil {
+		return
+	}
+	h.agentManager.Stop("codex")
+	if err := h.agentManager.Start("codex"); err != nil {
+		h.logger.Warn("failed to restart codex agent after profile update", "error", err)
+	}
 }
 
 func sanitizeSyncedProfileName(value string) string {
@@ -719,6 +744,8 @@ func (h *Handler) syncDesktopCodexProfiles(accountAuths []SyncedAccountAuth) err
 	if err := h.writeSyncedCodexProfileNames(nextNames); err != nil {
 		return fmt.Errorf("failed to persist synced profile names: %w", err)
 	}
+
+	h.restartCodexPolling()
 
 	return nil
 }
@@ -1299,6 +1326,7 @@ func (h *Handler) overlayServerSnapshotsOnClientState(payload string) (string, e
 	byAlias := make(map[string]store.ProviderAccount, len(providerAccounts))
 	byExternalID := make(map[string]store.ProviderAccount, len(providerAccounts))
 	byClientAccountID := make(map[string]store.ProviderAccount, len(providerAccounts))
+	matchedCodexProviderAccountIDs := make(map[int64]struct{}, len(providerAccounts))
 	for _, account := range providerAccounts {
 		if name := strings.TrimSpace(account.Name); name != "" {
 			byName[name] = account
@@ -1350,6 +1378,7 @@ func (h *Handler) overlayServerSnapshotsOnClientState(payload string) (string, e
 			continue
 		}
 
+		matchedCodexProviderAccountIDs[providerAccount.ID] = struct{}{}
 		account.UsageInfo = buildUsageInfoFromCodexSnapshot(latest)
 		if strings.TrimSpace(latest.PlanType) != "" {
 			account.AccountInfo.PlanType = latest.PlanType
@@ -1366,6 +1395,28 @@ func (h *Handler) overlayServerSnapshotsOnClientState(payload string) (string, e
 			}
 		}
 		state.Accounts = append(state.Accounts, next)
+	}
+
+	for _, providerAccount := range providerAccounts {
+		if _, matched := matchedCodexProviderAccountIDs[providerAccount.ID]; matched {
+			continue
+		}
+
+		latest, err := h.store.QueryLatestCodex(providerAccount.ID)
+		if err != nil {
+			return "", err
+		}
+		if latest == nil {
+			continue
+		}
+
+		usageInfo := buildUsageInfoFromCodexSnapshot(latest)
+		updatedAt := latest.CapturedAt.UTC().Format(time.RFC3339)
+		account := buildSyntheticProviderAccount("codex", providerAccount, usageInfo, updatedAt)
+		if strings.TrimSpace(latest.PlanType) != "" {
+			account.AccountInfo.PlanType = latest.PlanType
+		}
+		upsertSyntheticAccount(account)
 	}
 
 	appendProviderSnapshot := func(storeProvider, uiProvider string, buildUsage func() (*clientStateUsageInfo, string, error)) error {
@@ -1549,7 +1600,7 @@ func (h *Handler) codexProfileSave(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Determine profiles directory
-	profilesDir := codexProfilesDir()
+	profilesDir := h.codexProfilesStorageDir()
 	if profilesDir == "" {
 		respondError(w, http.StatusInternalServerError, "could not determine profiles directory")
 		return
@@ -1566,7 +1617,7 @@ func (h *Handler) codexProfileSave(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Check for duplicate accounts
-	existingProfiles, err := listCodexProfiles()
+	existingProfiles, err := listCodexProfilesInDir(profilesDir)
 	if err != nil {
 		h.logger.Warn("failed to list existing profiles for duplicate check", "error", err)
 	}
@@ -1607,6 +1658,8 @@ func (h *Handler) codexProfileSave(w http.ResponseWriter, r *http.Request) {
 		h.store.GetOrCreateProviderAccountByExternalID("codex", req.Name, externalID)
 	}
 
+	h.restartCodexPolling()
+
 	respondJSON(w, http.StatusCreated, map[string]interface{}{
 		"message":   "profile saved",
 		"name":      req.Name,
@@ -1626,7 +1679,7 @@ func (h *Handler) codexProfileDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	profilesDir := codexProfilesDir()
+	profilesDir := h.codexProfilesStorageDir()
 	if profilesDir == "" {
 		respondError(w, http.StatusInternalServerError, "could not determine profiles directory")
 		return
@@ -1647,6 +1700,8 @@ func (h *Handler) codexProfileDelete(w http.ResponseWriter, r *http.Request) {
 	if h.store != nil {
 		h.store.MarkProviderAccountDeleted("codex", name)
 	}
+
+	h.restartCodexPolling()
 
 	respondJSON(w, http.StatusOK, map[string]interface{}{
 		"message": "profile deleted",
@@ -1670,7 +1725,7 @@ func (h *Handler) codexProfileRefresh(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	profilesDir := codexProfilesDir()
+	profilesDir := h.codexProfilesStorageDir()
 	if profilesDir == "" {
 		respondError(w, http.StatusInternalServerError, "could not determine profiles directory")
 		return
@@ -1769,6 +1824,8 @@ func (h *Handler) codexProfileRefresh(w http.ResponseWriter, r *http.Request) {
 		}
 		h.store.GetOrCreateProviderAccountByExternalID("codex", name, externalID)
 	}
+
+	h.restartCodexPolling()
 
 	respondJSON(w, http.StatusOK, map[string]interface{}{
 		"message":   "profile refreshed",

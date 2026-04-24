@@ -347,6 +347,125 @@ func TestHandler_CodexProfilesAndUsage(t *testing.T) {
 	}
 }
 
+func TestHandler_ClientStateAddsServerPolledCodexAccount(t *testing.T) {
+	s, err := store.New(":memory:")
+	if err != nil {
+		t.Fatalf("store.New: %v", err)
+	}
+	defer s.Close()
+
+	workAcc, err := s.GetOrCreateProviderAccount("codex", "work")
+	if err != nil {
+		t.Fatalf("GetOrCreateProviderAccount(work): %v", err)
+	}
+	insertCodexWebSnapshot(t, s, workAcc.ID, "pro")
+
+	h := NewHandler(s, nil, nil, nil, createTestConfigWithSynthetic())
+
+	payload, err := h.overlayServerSnapshotsOnClientState(defaultClientStateSnapshot())
+	if err != nil {
+		t.Fatalf("overlayServerSnapshotsOnClientState: %v", err)
+	}
+
+	var state clientStateStore
+	if err := json.Unmarshal([]byte(payload), &state); err != nil {
+		t.Fatalf("unmarshal client state: %v", err)
+	}
+	var account *clientStateAccount
+	for idx := range state.Accounts {
+		if state.Accounts[idx].Provider == "codex" {
+			account = &state.Accounts[idx]
+			break
+		}
+	}
+	if account == nil {
+		t.Fatalf("expected server-polled Codex account, got %+v", state.Accounts)
+	}
+
+	if account.Provider != "codex" || account.Alias != "work" {
+		t.Fatalf("unexpected account identity: %+v", *account)
+	}
+	if account.UsageInfo == nil || account.UsageInfo.Status != "ok" {
+		t.Fatalf("expected usage info from server snapshot, got %+v", account.UsageInfo)
+	}
+	if account.UsageInfo.FiveHourLimit == nil || account.UsageInfo.FiveHourLimit.PercentLeft != 65 {
+		t.Fatalf("expected five-hour percent left 65, got %+v", account.UsageInfo.FiveHourLimit)
+	}
+	if account.AccountInfo.PlanType != "pro" {
+		t.Fatalf("expected plan pro, got %q", account.AccountInfo.PlanType)
+	}
+}
+
+func TestHandler_CodexProfilesStorageDir_UsesProviderSettingsOverride(t *testing.T) {
+	s, err := store.New(":memory:")
+	if err != nil {
+		t.Fatalf("store.New: %v", err)
+	}
+	defer s.Close()
+
+	customDir := filepath.ToSlash(filepath.Join(t.TempDir(), "custom-codex-profiles"))
+	if err := s.SetSetting("provider_settings", `{"codex":{"profiles_dir":"`+customDir+`"}}`); err != nil {
+		t.Fatalf("SetSetting(provider_settings): %v", err)
+	}
+
+	cfg := createTestConfigWithSynthetic()
+	cfg.DBPath = filepath.Join(t.TempDir(), "oneauthwatch.db")
+	h := NewHandler(s, nil, nil, nil, cfg)
+
+	if got := h.codexProfilesStorageDir(); got != customDir {
+		t.Fatalf("codexProfilesStorageDir() = %q, want %q", got, customDir)
+	}
+}
+
+func TestHandler_SyncDesktopCodexProfiles_UsesConfiguredDirAndRestartsAgent(t *testing.T) {
+	s, err := store.New(":memory:")
+	if err != nil {
+		t.Fatalf("store.New: %v", err)
+	}
+	defer s.Close()
+
+	customDir := filepath.ToSlash(filepath.Join(t.TempDir(), "custom-codex-profiles"))
+	if err := s.SetSetting("provider_settings", `{"codex":{"profiles_dir":"`+customDir+`"}}`); err != nil {
+		t.Fatalf("SetSetting(provider_settings): %v", err)
+	}
+
+	cfg := createTestConfigWithSynthetic()
+	cfg.DBPath = filepath.Join(t.TempDir(), "oneauthwatch.db")
+	controller := &mockProviderAgentController{running: map[string]bool{"codex": true}}
+	h := NewHandler(s, nil, nil, nil, cfg)
+	h.SetAgentManager(controller)
+
+	accountAuths := []SyncedAccountAuth{
+		{
+			AccountID: "work",
+			Alias:     "Work",
+			AuthConfig: json.RawMessage(`{
+				"tokens": {
+					"access_token": "access-token",
+					"refresh_token": "refresh-token",
+					"id_token": "id-token",
+					"account_id": "acct-work"
+				},
+				"OPENAI_API_KEY": "sk-test"
+			}`),
+		},
+	}
+
+	if err := h.syncDesktopCodexProfiles(accountAuths); err != nil {
+		t.Fatalf("syncDesktopCodexProfiles: %v", err)
+	}
+
+	if _, err := os.Stat(filepath.Join(filepath.FromSlash(customDir), "work.json")); err != nil {
+		t.Fatalf("expected synced profile in custom dir: %v", err)
+	}
+	if len(controller.stopped) != 1 || controller.stopped[0] != "codex" {
+		t.Fatalf("expected codex stop on sync, got %v", controller.stopped)
+	}
+	if len(controller.started) != 1 || controller.started[0] != "codex" {
+		t.Fatalf("expected codex start on sync, got %v", controller.started)
+	}
+}
+
 func TestCodexParsingAndUsageHelpers(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/?account=3", nil)
 	if parseCodexAccountID(req) != 3 {

@@ -935,27 +935,23 @@ func run() error {
 		copilotAg = agent.NewCopilotAgent(copilotClient, db, copilotTr, cfg.PollInterval, logger, copilotSm)
 	}
 
-	// Create Codex tracker
+	// Keep the Codex watcher alive even before credentials exist so a later
+	// desktop sync can bootstrap server-side polling without requiring restart.
 	var codexTr *tracker.CodexTracker
-	if cfg.HasProvider("codex") {
-		codexTr = tracker.NewCodexTracker(db, logger)
-	}
+	codexTr = tracker.NewCodexTracker(db, logger)
 
-	// Create Codex agent manager for multi-account support
 	var codexMgr *agent.CodexAgentManager
-	if cfg.HasProvider("codex") {
-		codexMgr = agent.NewCodexAgentManager(db, codexTr, cfg.PollInterval, logger)
-		codexMgr.SetProfilesDir(codexProfilesDirWithDataDir(filepath.Dir(cfg.DBPath)))
-		// Override profiles dir from DB if configured via UI
-		if db != nil {
-			if provJSON, _ := db.GetSetting("provider_settings"); provJSON != "" {
-				var provSettings map[string]map[string]interface{}
-				if json.Unmarshal([]byte(provJSON), &provSettings) == nil {
-					if s := provSettings["codex"]; s != nil {
-						if dir, _ := s["profiles_dir"].(string); dir != "" {
-							codexMgr.SetProfilesDir(dir)
-							logger.Info("Codex profiles directory overridden from UI", "dir", dir)
-						}
+	codexMgr = agent.NewCodexAgentManager(db, codexTr, cfg.PollInterval, logger)
+	codexMgr.SetProfilesDir(codexProfilesDirWithDataDir(filepath.Dir(cfg.DBPath)))
+	// Override profiles dir from DB if configured via UI
+	if db != nil {
+		if provJSON, _ := db.GetSetting("provider_settings"); provJSON != "" {
+			var provSettings map[string]map[string]interface{}
+			if json.Unmarshal([]byte(provJSON), &provSettings) == nil {
+				if s := provSettings["codex"]; s != nil {
+					if dir, _ := s["profiles_dir"].(string); dir != "" {
+						codexMgr.SetProfilesDir(dir)
+						logger.Info("Codex profiles directory overridden from UI", "dir", dir)
 					}
 				}
 			}

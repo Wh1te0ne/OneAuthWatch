@@ -182,17 +182,26 @@ export const useAccountStore = create<AccountState>((set, get) => ({
 
     try {
       const matchedId = await syncCurrent();
-      
-      // 更新本地状态（包括未登录时清除所有激活状态）
-      const { accounts } = get();
-      const updatedAccounts = accounts.map(a => ({
-        ...a,
-        isActive: matchedId ? a.id === matchedId : false,
+
+      // 账号状态未变化时不重复 setState，避免 30 秒轮询带来无意义重渲染。
+      const { accounts, activeAccountId } = get();
+      const nextActiveAccountId = matchedId ?? null;
+      const hasActiveFlagChanged = accounts.some(
+        (account) => account.isActive !== (nextActiveAccountId ? account.id === nextActiveAccountId : false)
+      );
+
+      if (!hasActiveFlagChanged && activeAccountId === nextActiveAccountId) {
+        return;
+      }
+
+      const updatedAccounts = accounts.map((account) => ({
+        ...account,
+        isActive: nextActiveAccountId ? account.id === nextActiveAccountId : false,
       }));
-      
-      set({ 
-        accounts: updatedAccounts, 
-        activeAccountId: matchedId,
+
+      set({
+        accounts: updatedAccounts,
+        activeAccountId: nextActiveAccountId,
       });
     } catch (error) {
       console.error('Failed to sync current account:', error);

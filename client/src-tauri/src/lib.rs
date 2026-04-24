@@ -176,6 +176,8 @@ struct TrayAppConfig {
     close_behavior: Option<String>,
     theme: Option<String>,
     has_initialized: Option<bool>,
+    server_url: Option<String>,
+    server_token: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -231,6 +233,8 @@ fn load_accounts_store_data() -> Result<TrayAccountsStore, String> {
                 close_behavior: Some("ask".to_string()),
                 theme: Some("dark".to_string()),
                 has_initialized: Some(false),
+                server_url: Some("http://127.0.0.1:9211".to_string()),
+                server_token: None,
             },
         });
     }
@@ -525,6 +529,12 @@ fn now_epoch_ms_u64() -> u64 {
         .unwrap_or_default()
 }
 
+fn is_main_window_visible<R: Runtime>(app: &AppHandle<R>) -> bool {
+    app.get_webview_window("main")
+        .and_then(|window| window.is_visible().ok())
+        .unwrap_or(false)
+}
+
 fn should_run_background_auto_refresh(
     interval_minutes: u64,
     last_refresh_ms: u64,
@@ -597,6 +607,12 @@ async fn maybe_run_background_auto_refresh<R: Runtime>(app: &AppHandle<R>) {
     }
 
     let result = async {
+        // 主窗口可见时，前端已经在驱动交互和刷新；这里继续做整批后台刷新
+        // 会和前端的状态同步、托盘重建、磁盘写入叠加，长期运行后容易把桌面端拖慢。
+        if is_main_window_visible(app) {
+            return Ok::<(), String>(());
+        }
+
         let store = load_accounts_store_data()?;
         let interval_minutes = store.config.auto_refresh_interval.unwrap_or(30);
         if interval_minutes == 0 || store.accounts.is_empty() {
